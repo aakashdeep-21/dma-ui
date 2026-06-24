@@ -81,6 +81,19 @@
     </section>
 
     <div class="side-col admin-only">
+      <section class="panel token-panel">
+        <div class="panel-head">
+          <h2>Trade Token</h2>
+          <span id="token-status" class="token-status locked">LOCKED</span>
+        </div>
+        <div class="form-grid">
+          <label>Required for every write operation
+            <input id="trade-token" type="password" placeholder="Paste trade token to unlock trading" autocomplete="off" />
+          </label>
+          <p class="muted token-help">Trading actions are disabled until a valid token is entered. The token is held only in this browser tab and sent with each write request.</p>
+        </div>
+      </section>
+
       <section class="panel">
         <div class="panel-head"><h2>Place Order</h2></div>
         <form id="order-form" class="form-grid">
@@ -129,8 +142,72 @@
         </form>
         <div id="leverage-result" class="result-msg"></div>
       </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>Set Margin Mode</h2></div>
+        <form id="margin-form" class="form-grid">
+          <label>Margin mode
+            <select name="setMarginMode">
+              <option value="REGULAR_MARGIN">REGULAR_MARGIN</option>
+              <option value="ISOLATED_MARGIN">ISOLATED_MARGIN</option>
+              <option value="PORTFOLIO_MARGIN">PORTFOLIO_MARGIN</option>
+            </select>
+          </label>
+          <button type="submit" class="btn-primary">Apply margin mode</button>
+        </form>
+        <div id="margin-result" class="result-msg"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>Transfer Funds</h2></div>
+        <form id="transfer-form" class="form-grid">
+          <label>Direction
+            <select name="direction">
+              <option value="OUT">OUT (to spot/wallet)</option>
+              <option value="IN">IN (to futures)</option>
+            </select>
+          </label>
+          <label>Amount
+            <input name="amount" type="number" step="any" placeholder="40000" required />
+          </label>
+          <label>Quote asset
+            <select name="quote_asset">
+              <option value="INR">INR</option>
+              <option value="USDT">USDT</option>
+            </select>
+          </label>
+          <button type="submit" class="btn-danger">Transfer funds</button>
+        </form>
+        <div id="transfer-result" class="result-msg"></div>
+      </section>
     </div>
+
+    <section class="panel explorer-panel">
+      <div class="panel-head">
+        <h2>API Explorer</h2>
+        <span class="muted">read-only queries</span>
+      </div>
+      <div class="explorer-controls">
+        <input id="explorer-symbol" placeholder="Symbol (e.g. SOLUSDT) — used where applicable" />
+        <div id="explorer-buttons" class="explorer-buttons"></div>
+      </div>
+      <pre id="explorer-result" class="json-view">Pick a query above…</pre>
+    </section>
   </main>
+
+  <!-- Typed-confirm modal for write operations -->
+  <div id="confirm-overlay" class="modal-overlay" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+      <h3 id="confirm-title">Confirm action</h3>
+      <p id="confirm-message" class="confirm-message"></p>
+      <p class="muted">Type <strong>confirm</strong> below to proceed:</p>
+      <input id="confirm-input" type="text" autocomplete="off" placeholder="confirm" />
+      <div class="modal-actions">
+        <button id="confirm-cancel" class="btn-ghost" type="button">Cancel</button>
+        <button id="confirm-proceed" class="btn-danger" type="button" disabled>Proceed</button>
+      </div>
+    </div>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>

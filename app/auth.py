@@ -51,3 +51,16 @@ def verify_session_token(token: str | None) -> dict | None:
         return _serializer().loads(token, max_age=settings.SESSION_MAX_AGE)
     except (BadSignature, SignatureExpired):
         return None
+
+
+def verify_trade_token(provided: str | None) -> bool:
+    """Constant-time check of the per-write trade token.
+
+    Fail-closed: if no TRADE_TOKEN is configured on the server, this always
+    returns False so that no write operation can proceed.
+    """
+    if not settings.TRADE_TOKEN:
+        return False
+    if not provided:
+        return False
+    return hmac.compare_digest(provided, settings.TRADE_TOKEN)

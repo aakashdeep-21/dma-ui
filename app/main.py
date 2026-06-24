@@ -5,19 +5,20 @@ Security model:
   * API key/secret live only in the backend (env vars) and are used to sign
     every upstream request. The browser never sees them.
   * Two login roles: 'admin' may trade; 'viewer' is read-only.
-  * All write endpoints require the admin role.
+  * Every write endpoint requires BOTH the admin role AND a valid per-request
+    trade token (the X-Trade-Token header), checked against TRADE_TOKEN.
+    Writes are fail-closed: no token configured -> no writes possible.
 """
 import asyncio
 import logging
+import math
 
 from fastapi import (
     Body,
-    Cookie,
     Depends,
     FastAPI,
     HTTPException,
     Request,
-    Response,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -34,6 +35,17 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="DMA Trading UI")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# Fail fast: refuse to start if any required secret is missing. Critically,
+# an empty SESSION_SECRET would let itsdangerous sign cookies with a known
+# empty key, allowing anyone to forge an admin session. Better to crash the
+# deploy loudly than to serve a forgeable, real-money app.
+_missing_env = settings.missing_required()
+if _missing_env:
+    raise RuntimeError(
+        "Refusing to start — missing required environment variables: "
+        + ", ".join(_missing_env)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -53,14 +65,44 @@ def require_admin(user: dict = Depends(current_user)) -> dict:
     return user
 
 
+TRADE_TOKEN_HEADER = "X-Trade-Token"
+
+
+def require_trade_token(request: Request, user: dict = Depends(require_admin)) -> dict:
+    """Gate for ALL write operations.
+
+    Requires (a) a valid admin session AND (b) a correct trade token supplied
+    in the X-Trade-Token header on this specific request. Fail-closed: if the
+    server has no TRADE_TOKEN configured, every write is rejected.
+
+    The custom header also doubles as CSRF protection: a cross-site page cannot
+    set custom headers without a CORS preflight that this server never grants.
+    """
+    if not settings.TRADE_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Trade token is not configured on the server; writes are disabled",
+        )
+    provided = request.headers.get(TRADE_TOKEN_HEADER, "")
+    if not auth.verify_trade_token(provided):
+        raise HTTPException(
+            status_code=403, detail="Invalid or missing trade token"
+        )
+    return user
+
+
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
 def _safe_float(value) -> float:
+    # Reject inf/nan: float("inf")/float("nan") parse fine, but json.dumps emits
+    # Infinity/NaN (invalid JSON) which makes the browser's JSON.parse throw and
+    # drops the entire WebSocket frame. Coerce non-finite values to 0.0.
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return 0.0
+    return result if math.isfinite(result) else 0.0
 
 
 def _extract_list(payload) -> list:
@@ -138,7 +180,11 @@ def index(request: Request):
 @app.get("/healthz")
 def healthz():
     missing = settings.missing_required()
-    return {"status": "ok", "configured": not missing, "missing": missing}
+    code = 200 if not missing else 503
+    return JSONResponse(
+        status_code=code,
+        content={"status": "ok" if not missing else "unconfigured", "missing": missing},
+    )
 
 
 # --------------------------------------------------------------------------
@@ -210,16 +256,76 @@ async def api_closed_pnl(symbol: str | None = None, user: dict = Depends(current
     return await dma_client.get_closed_pnl(symbol)
 
 
+@app.get("/api/withdrawable")
+async def api_withdrawable(coin: str | None = None, user: dict = Depends(current_user)):
+    return await dma_client.get_withdrawable(coin)
+
+
+@app.get("/api/fiat-balance")
+async def api_fiat_balance(coin: str | None = None, user: dict = Depends(current_user)):
+    return await dma_client.get_fiat_balance(coin)
+
+
+@app.get("/api/risk-limit")
+async def api_risk_limit(symbol: str, user: dict = Depends(current_user)):
+    return await dma_client.get_risk_limit(symbol)
+
+
+@app.get("/api/executions")
+async def api_executions(
+    symbol: str | None = None,
+    limit: str | None = None,
+    startTime: str | None = None,
+    endTime: str | None = None,
+    user: dict = Depends(current_user),
+):
+    return await dma_client.get_executions(symbol, limit, startTime, endTime)
+
+
+@app.get("/api/account-info")
+async def api_account_info(user: dict = Depends(current_user)):
+    return await dma_client.get_account_info()
+
+
+@app.get("/api/server-time")
+async def api_server_time(user: dict = Depends(current_user)):
+    return await dma_client.get_server_time()
+
+
 # --------------------------------------------------------------------------
 # Write API (admin only)
 # --------------------------------------------------------------------------
 @app.post("/api/order/create")
-async def api_create_order(payload: dict = Body(...), user: dict = Depends(require_admin)):
+async def api_create_order(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
+    symbol = payload.get("symbol")
+    side = payload.get("side")
+    order_type = payload.get("orderType")
+    qty = payload.get("qty")
+    if not symbol or not side or not order_type or qty is None:
+        raise HTTPException(
+            status_code=400, detail="symbol, side, orderType and qty are required"
+        )
+    if str(side).lower() not in ("buy", "sell"):
+        raise HTTPException(status_code=400, detail="side must be Buy or Sell")
+    try:
+        if float(qty) <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="qty must be a number greater than 0")
+    if str(order_type).lower() == "limit":
+        price = payload.get("price")
+        try:
+            if price is None or float(price) <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400, detail="price must be greater than 0 for a Limit order"
+            )
     return await dma_client.create_order(payload)
 
 
 @app.post("/api/order/cancel")
-async def api_cancel_order(payload: dict = Body(...), user: dict = Depends(require_admin)):
+async def api_cancel_order(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
     symbol = payload.get("symbol")
     order_id = payload.get("orderId")
     if not symbol or not order_id:
@@ -228,13 +334,13 @@ async def api_cancel_order(payload: dict = Body(...), user: dict = Depends(requi
 
 
 @app.post("/api/order/cancel-all")
-async def api_cancel_all(payload: dict = Body(default={}), user: dict = Depends(require_admin)):
+async def api_cancel_all(payload: dict = Body(default={}), user: dict = Depends(require_trade_token)):
     symbol = (payload or {}).get("symbol")
     return await dma_client.cancel_all(symbol)
 
 
 @app.post("/api/position/set-leverage")
-async def api_set_leverage(payload: dict = Body(...), user: dict = Depends(require_admin)):
+async def api_set_leverage(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
     symbol = payload.get("symbol")
     buy = payload.get("buyLeverage")
     sell = payload.get("sellLeverage", buy)
@@ -244,23 +350,82 @@ async def api_set_leverage(payload: dict = Body(...), user: dict = Depends(requi
 
 
 @app.post("/api/position/close")
-async def api_close_position(payload: dict = Body(...), user: dict = Depends(require_admin)):
-    """Close a position with a reduce-only market order in the opposite side."""
+async def api_close_position(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
+    """Close a position with a reduce-only market order in the opposite side.
+
+    The side / size / positionIdx are re-derived from the LIVE exchange
+    position — never trusted from the client — so a stale or forged request
+    can't close the wrong size or side. reduceOnly guarantees this can only
+    ever reduce, never open or flip, a position.
+    """
     symbol = payload.get("symbol")
-    side = payload.get("side")  # current position side: Buy / Sell
-    qty = payload.get("qty")
-    if not symbol or not side or not qty:
-        raise HTTPException(status_code=400, detail="symbol, side and qty are required")
-    close_side = "Sell" if str(side).lower() == "buy" else "Buy"
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+
+    req_idx = payload.get("positionIdx")
+    positions = _extract_list(await dma_client.get_positions())
+    matches = [
+        p
+        for p in positions
+        if str(p.get("symbol", "")).upper() == str(symbol).upper()
+        and _safe_float(p.get("size")) > 0
+    ]
+    if req_idx is not None:
+        matches = [p for p in matches if str(p.get("positionIdx")) == str(req_idx)]
+
+    if not matches:
+        raise HTTPException(status_code=400, detail=f"No open position found for {symbol}")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Multiple open positions for {symbol}; specify positionIdx",
+        )
+
+    pos = matches[0]
+    size = _safe_float(pos.get("size"))
+    side = str(pos.get("side", ""))
+    if size <= 0 or side.lower() not in ("buy", "sell"):
+        raise HTTPException(status_code=400, detail="Position has no closable size")
+
     order = {
-        "symbol": symbol,
-        "side": close_side,
+        "symbol": pos.get("symbol"),
+        "side": "Sell" if side.lower() == "buy" else "Buy",
         "orderType": "Market",
-        "qty": str(qty),
+        "qty": str(pos.get("size")),
         "reduceOnly": True,
-        "positionIdx": payload.get("positionIdx", 0),
+        "positionIdx": pos.get("positionIdx", 0),
     }
     return await dma_client.create_order(order)
+
+
+@app.post("/api/account/set-margin-mode")
+async def api_set_margin_mode(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
+    mode = payload.get("setMarginMode") or payload.get("mode")
+    if not mode:
+        raise HTTPException(status_code=400, detail="setMarginMode is required")
+    return await dma_client.set_margin_mode(mode)
+
+
+@app.post("/api/funds/transfer")
+async def api_transfer_funds(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
+    direction = payload.get("direction")
+    amount = payload.get("amount")
+    quote_asset = payload.get("quote_asset") or payload.get("quoteAsset")
+    if not direction or amount is None or not quote_asset:
+        raise HTTPException(
+            status_code=400, detail="direction, amount and quote_asset are required"
+        )
+    if str(direction).upper() not in ("IN", "OUT"):
+        raise HTTPException(status_code=400, detail="direction must be IN or OUT")
+    try:
+        amount_val = float(amount)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="amount must be a number")
+    if amount_val <= 0:
+        raise HTTPException(status_code=400, detail="amount must be greater than 0")
+    return await dma_client.transfer_funds(
+        str(direction).upper(), amount, quote_asset, payload.get("client_txn_id")
+    )
 
 
 # --------------------------------------------------------------------------
@@ -282,8 +447,21 @@ async def dma_error_handler(request: Request, exc: dma_client.DMAError):
 # --------------------------------------------------------------------------
 # WebSocket live feed
 # --------------------------------------------------------------------------
+def _ws_origin_ok(websocket: WebSocket) -> bool:
+    """Reject cross-origin WebSocket handshakes (defense in depth)."""
+    origin = websocket.headers.get("origin")
+    if not origin:
+        return True  # non-browser client; still needs a valid session cookie
+    from urllib.parse import urlparse
+
+    return urlparse(origin).netloc == websocket.headers.get("host", "")
+
+
 @app.websocket("/ws")
 async def ws_feed(websocket: WebSocket):
+    if not _ws_origin_ok(websocket):
+        await websocket.close(code=1008)
+        return
     token = websocket.cookies.get(auth.COOKIE_NAME)
     user = auth.verify_session_token(token)
     if not user:

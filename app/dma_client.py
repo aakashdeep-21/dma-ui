@@ -5,6 +5,7 @@ the API key/secret never leave the backend. Convenience wrappers cover the
 endpoints used by the dashboard and the trading panel.
 """
 import json
+import uuid
 
 import httpx
 
@@ -54,6 +55,18 @@ async def _request(method: str, path: str, params: dict | None = None, body: dic
 
     if resp.status_code >= 400:
         raise DMAError(resp.status_code, data)
+
+    # CRITICAL for a money app: the v5 DMA/Bybit API returns HTTP 200 with a
+    # non-zero `retCode` for business-level rejections (insufficient balance,
+    # qty below min, reduce-only would increase, position-idx mismatch, etc.).
+    # Without this check those would be reported to the user as SUCCESS. We
+    # only treat an EXPLICIT non-zero retCode as an error, so endpoints that
+    # use a different envelope (e.g. the funds-transfer path) are unaffected.
+    if isinstance(data, dict):
+        ret_code = data.get("retCode")
+        if ret_code not in (None, 0, "0"):
+            detail = data.get("retMsg") or data
+            raise DMAError(400, detail)
     return data
 
 
@@ -101,6 +114,57 @@ async def get_closed_pnl(symbol: str | None = None):
     return await _request("GET", "/v5/position/closed-pnl", params=params)
 
 
+async def get_withdrawable(coin: str | None = None):
+    return await _request(
+        "GET",
+        "/v5/account/withdrawal",
+        params={"coinName": coin or settings.SETTLE_COIN},
+    )
+
+
+async def get_fiat_balance(coin: str | None = None):
+    return await _request(
+        "GET",
+        "/v5/fiat/balance-query",
+        params={"accountType": settings.ACCOUNT_TYPE, "coin": coin or settings.SETTLE_COIN},
+    )
+
+
+async def get_risk_limit(symbol: str):
+    return await _request(
+        "GET",
+        "/v5/position/risk-limit",
+        params={"category": settings.CATEGORY, "symbol": symbol},
+    )
+
+
+async def get_executions(
+    symbol: str | None = None,
+    limit: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+):
+    """Trades / execution history."""
+    params = {"category": settings.CATEGORY}
+    if symbol:
+        params["symbol"] = symbol
+    if limit:
+        params["limit"] = str(limit)
+    if start_time:
+        params["startTime"] = str(start_time)
+    if end_time:
+        params["endTime"] = str(end_time)
+    return await _request("GET", "/v5/execution/list", params=params)
+
+
+async def get_account_info():
+    return await _request("GET", "/v5/account/info")
+
+
+async def get_server_time():
+    return await _request("GET", "/v5/market/time")
+
+
 # --- Write endpoints (admin only at the route layer) ----------------------
 
 async def create_order(body: dict):
@@ -128,3 +192,19 @@ async def set_leverage(symbol: str, buy_leverage: str, sell_leverage: str):
         "sellLeverage": str(sell_leverage),
     }
     return await _request("POST", "/v5/position/set-leverage", body=body)
+
+
+async def set_margin_mode(mode: str):
+    return await _request(
+        "POST", "/v5/account/set-margin-mode", body={"setMarginMode": mode}
+    )
+
+
+async def transfer_funds(direction: str, amount, quote_asset: str, client_txn_id: str | None = None):
+    body = {
+        "client_txn_id": client_txn_id or str(uuid.uuid4()),
+        "direction": direction,
+        "amount": amount,
+        "quote_asset": quote_asset,
+    }
+    return await _request("POST", "/dma/api/v1/funds/transfer", body=body)

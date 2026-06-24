@@ -83,15 +83,57 @@ Open http://localhost:8000 and log in.
 > does), or temporarily flip `secure=False` in `app/main.py`'s `set_cookie`
 > call.
 
+## Trading safety controls
+
+Because real money is at stake, every write operation (place / cancel / close
+order, cancel-all, set leverage, set margin mode, transfer funds) is protected
+by **three independent gates**:
+
+1. **Admin session** — you must be logged in as the admin role.
+2. **Trade token** — a second secret (`TRADE_TOKEN`, separate from the admin
+   password) that you paste into the dashboard's *Trade Token* field. It is
+   sent as the `X-Trade-Token` header with each write and verified server-side
+   (constant-time). **Fail-closed:** if `TRADE_TOKEN` is unset on the server,
+   *no* write can happen. The token is held only in the browser tab's memory —
+   never stored — so it must be re-entered after a refresh.
+3. **Typed confirmation** — before any write executes, a modal requires you to
+   type the word **confirm**. Nothing is sent until you do.
+
+Submit buttons are also disabled while a write is in flight to prevent
+accidental double-submission.
+
 ## Security notes
 
-- API key/secret and login passwords are **only** read from env vars — nothing
-  is hard-coded.
-- Trading endpoints are gated to the `admin` role server-side; the viewer UI
-  also hides admin controls.
-- The original `sign_server.py` and `dma-api.json` had real third-party
-  secrets committed; those values were replaced with placeholders. **Rotate
-  any exposed keys**, as they remain in git history.
+- API key/secret, login passwords and the trade token are **only** read from
+  env vars — nothing is hard-coded.
+- Write endpoints require admin role **and** a valid trade token, server-side.
+  The custom `X-Trade-Token` header also blocks cross-site (CSRF) writes.
+- Session cookie is `HttpOnly` + `Secure` + `SameSite=Lax`; the WebSocket
+  rejects cross-origin handshakes.
+- The original `sign_server.py` and `dma-api.json` (kept out of git) had real
+  third-party secrets; those were replaced with placeholders. **Rotate any
+  exposed keys** regardless.
+
+## Integrated endpoints
+
+Every endpoint from the Postman collection is wired in. Reads are available to
+both roles; writes are **admin-only** (the viewer gets `403`).
+
+**Reads** (dashboard + API Explorer): wallet balance, fiat balance,
+withdrawable amount, account info, server time, open positions, open orders,
+instruments info, risk limit, closed PnL, trades/execution history.
+
+**Writes** (admin panel): create order (market/limit/TP via reduce-only +
+trigger fields), cancel order, cancel-all, close position, set leverage,
+set margin mode, transfer funds.
+
+The admin **API Explorer** panel can call any read endpoint ad-hoc (with an
+optional symbol) and shows the raw JSON response.
+
+> The two `loadtest.coinswitch.co/ledger/query-balance` items in the
+> collection were intentionally **not** integrated: they target a different
+> host and use a static `x-auth-token` (now redacted) rather than the
+> API-key/Ed25519 signing this app uses. Tell me if you actually need them.
 
 ## Notes on real-time PnL
 

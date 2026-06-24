@@ -30,6 +30,30 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        # Don't crash-loop the deploy on a typo'd env var; log-and-default.
+        print(f"[config] invalid int for {name}={raw!r}; using default {default}")
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"[config] invalid float for {name}={raw!r}; using default {default}")
+        return default
+    return value if value > 0 else default
+
+
 class Settings:
     def __init__(self) -> None:
         # --- CoinSwitch DMA credentials (NEVER hard-code) ---
@@ -47,8 +71,14 @@ class Settings:
 
         # --- Session signing ---
         self.SESSION_SECRET: str = os.environ.get("SESSION_SECRET", "")
+
+        # --- Trade token: a second secret that must accompany EVERY write
+        # (order/cancel/leverage/transfer/etc). The admin types it into the
+        # dashboard; it is sent per write request and checked here. Writes are
+        # fail-closed: if this is unset, no write can happen. ---
+        self.TRADE_TOKEN: str = os.environ.get("TRADE_TOKEN", "")
         # Session lifetime in seconds (default 12h).
-        self.SESSION_MAX_AGE: int = int(os.environ.get("SESSION_MAX_AGE", str(12 * 3600)))
+        self.SESSION_MAX_AGE: int = _int_env("SESSION_MAX_AGE", 12 * 3600)
 
         # --- Trading / market defaults ---
         self.CATEGORY: str = os.environ.get("CATEGORY", "linear")
@@ -56,7 +86,7 @@ class Settings:
         self.ACCOUNT_TYPE: str = os.environ.get("ACCOUNT_TYPE", "UNIFIED")
 
         # --- Live dashboard poll interval (seconds) ---
-        self.POLL_INTERVAL: float = float(os.environ.get("POLL_INTERVAL", "5"))
+        self.POLL_INTERVAL: float = _float_env("POLL_INTERVAL", 5.0)
 
     def missing_required(self) -> list[str]:
         """Return the names of required vars that are not set."""
@@ -68,6 +98,7 @@ class Settings:
             "VIEWER_USERNAME": self.VIEWER_USERNAME,
             "VIEWER_PASSWORD": self.VIEWER_PASSWORD,
             "SESSION_SECRET": self.SESSION_SECRET,
+            "TRADE_TOKEN": self.TRADE_TOKEN,
         }
         return [name for name, value in required.items() if not value]
 
