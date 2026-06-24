@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DMA Terminal — Sign in</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body class="login-body">
+  <form id="login-form" class="login-card" autocomplete="off">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <h1>DMA Terminal</h1>
+    </div>
+    <p class="muted">Sign in to access the trading dashboard.</p>
+
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" required autofocus />
+
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" required />
+
+    <button type="submit" id="login-btn">Sign in</button>
+    <div id="login-error" class="error-msg" role="alert"></div>
+  </form>
+
+  <script>
+    const form = document.getElementById("login-form");
+    const errBox = document.getElementById("login-error");
+    const btn = document.getElementById("login-btn");
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      errBox.textContent = "";
+      btn.disabled = true;
+      btn.textContent = "Signing in…";
+      try {
+        const res = await fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username: document.getElementById("username").value,
+            password: document.getElementById("password").value,
+          }),
+        });
+        if (res.ok) {
+          window.location.href = "/";
+          return;
+        }
+        const data = await res.json().catch(() => ({}));
+        errBox.textContent = data.detail || "Login failed";
+      } catch (err) {
+        errBox.textContent = "Network error. Please try again.";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Sign in";
+      }
+    });
+  </script>
+</body>
+</html>

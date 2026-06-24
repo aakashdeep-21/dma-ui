@@ -1,0 +1,25 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
+
+# Reference/source material — not part of the deployment, may contain secrets
+dma-api.json
+sign_server.py

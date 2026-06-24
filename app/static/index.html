@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DMA Terminal</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <strong>DMA Terminal</strong>
+    </div>
+    <div class="topbar-stats">
+      <div class="stat">
+        <span class="stat-label">Total Unrealised PnL</span>
+        <span class="stat-value" id="stat-pnl">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Open Positions</span>
+        <span class="stat-value" id="stat-positions">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Open Orders</span>
+        <span class="stat-value" id="stat-orders">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Wallet Equity</span>
+        <span class="stat-value" id="stat-equity">—</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span id="conn-status" class="conn conn-off">connecting…</span>
+      <span class="user-badge"><span id="user-name">—</span> <span id="user-role" class="role-pill"></span></span>
+      <button id="logout-btn" class="btn-ghost">Logout</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Open Positions</h2>
+        <span class="muted" id="positions-updated"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="positions-table">
+          <thead>
+            <tr>
+              <th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th>
+              <th>Mark</th><th>Lev</th><th>Value</th><th>Unrealised PnL</th>
+              <th class="admin-only">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="positions-body">
+            <tr><td colspan="9" class="muted center">Waiting for data…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Open Orders</h2>
+        <button id="cancel-all-btn" class="btn-danger admin-only">Cancel all</button>
+      </div>
+      <div class="table-wrap">
+        <table id="orders-table">
+          <thead>
+            <tr>
+              <th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th>
+              <th>Price</th><th>Trigger</th><th>Status</th>
+              <th class="admin-only">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="orders-body">
+            <tr><td colspan="8" class="muted center">Waiting for data…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="side-col admin-only">
+      <section class="panel">
+        <div class="panel-head"><h2>Place Order</h2></div>
+        <form id="order-form" class="form-grid">
+          <label>Symbol
+            <input name="symbol" placeholder="SOLUSDT" required />
+          </label>
+          <label>Side
+            <select name="side">
+              <option value="Buy">Buy</option>
+              <option value="Sell">Sell</option>
+            </select>
+          </label>
+          <label>Order type
+            <select name="orderType" id="order-type">
+              <option value="Market">Market</option>
+              <option value="Limit">Limit</option>
+            </select>
+          </label>
+          <label>Quantity
+            <input name="qty" placeholder="1" required />
+          </label>
+          <label class="limit-only">Price
+            <input name="price" placeholder="limit price" />
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="reduceOnly" /> Reduce only
+          </label>
+          <button type="submit" class="btn-primary">Submit order</button>
+        </form>
+        <div id="order-result" class="result-msg"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>Set Leverage</h2></div>
+        <form id="leverage-form" class="form-grid">
+          <label>Symbol
+            <input name="symbol" placeholder="SOLUSDT" required />
+          </label>
+          <label>Buy leverage
+            <input name="buyLeverage" placeholder="10" required />
+          </label>
+          <label>Sell leverage
+            <input name="sellLeverage" placeholder="10" required />
+          </label>
+          <button type="submit" class="btn-primary">Apply leverage</button>
+        </form>
+        <div id="leverage-result" class="result-msg"></div>
+      </section>
+    </div>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
