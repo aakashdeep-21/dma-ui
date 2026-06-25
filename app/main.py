@@ -12,6 +12,7 @@ Security model:
 import asyncio
 import logging
 import math
+from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
 from fastapi import (
@@ -33,7 +34,14 @@ from .config import settings
 logger = logging.getLogger("dma-ui")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="DMA Trading UI")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Cleanly close the shared upstream HTTP client on shutdown.
+    await dma_client.aclose()
+
+
+app = FastAPI(title="DMA Trading UI", lifespan=lifespan)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -260,16 +268,6 @@ async def api_closed_pnl(symbol: str | None = None, user: dict = Depends(current
 @app.get("/api/withdrawable")
 async def api_withdrawable(coin: str | None = None, user: dict = Depends(current_user)):
     return await dma_client.get_withdrawable(coin)
-
-
-@app.get("/api/fiat-balance")
-async def api_fiat_balance(coin: str | None = None, user: dict = Depends(current_user)):
-    return await dma_client.get_fiat_balance(coin)
-
-
-@app.get("/api/risk-limit")
-async def api_risk_limit(symbol: str, user: dict = Depends(current_user)):
-    return await dma_client.get_risk_limit(symbol)
 
 
 @app.get("/api/executions")

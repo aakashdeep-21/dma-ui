@@ -22,6 +22,15 @@ class DMAError(Exception):
         super().__init__(f"DMA error {status}: {detail}")
 
 
+# One shared async client reused across all calls (connection pooling / keep-alive)
+# instead of a new client + TLS handshake per request. Closed on app shutdown.
+_client = httpx.AsyncClient(timeout=20)
+
+
+async def aclose() -> None:
+    await _client.aclose()
+
+
 async def _request(method: str, path: str, params: dict | None = None, body: dict | None = None):
     if not settings.DMA_API_SECRET or not settings.DMA_API_KEY:
         raise DMAError(500, "DMA_API_KEY / DMA_API_SECRET are not configured")
@@ -38,13 +47,12 @@ async def _request(method: str, path: str, params: dict | None = None, body: dic
     }
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            if method.upper() == "GET":
-                resp = await client.get(url, headers=headers)
-            else:
-                # Body is sent compact and is NOT part of the signature.
-                content = json.dumps(body or {}, separators=(",", ":"))
-                resp = await client.post(url, headers=headers, content=content)
+        if method.upper() == "GET":
+            resp = await _client.get(url, headers=headers)
+        else:
+            # Body is sent compact and is NOT part of the signature.
+            content = json.dumps(body or {}, separators=(",", ":"))
+            resp = await _client.post(url, headers=headers, content=content)
     except httpx.HTTPError as exc:
         raise DMAError(502, f"upstream request failed: {exc}") from exc
 
@@ -119,22 +127,6 @@ async def get_withdrawable(coin: str | None = None):
         "GET",
         "/v5/account/withdrawal",
         params={"coinName": coin or settings.SETTLE_COIN},
-    )
-
-
-async def get_fiat_balance(coin: str | None = None):
-    return await _request(
-        "GET",
-        "/v5/fiat/balance-query",
-        params={"accountType": settings.ACCOUNT_TYPE, "coin": coin or settings.SETTLE_COIN},
-    )
-
-
-async def get_risk_limit(symbol: str):
-    return await _request(
-        "GET",
-        "/v5/position/risk-limit",
-        params={"category": settings.CATEGORY, "symbol": symbol},
     )
 
 

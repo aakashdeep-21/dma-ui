@@ -96,8 +96,10 @@ by **three independent gates**:
    (constant-time). **Fail-closed:** if `TRADE_TOKEN` is unset on the server,
    *no* write can happen. The token is held only in the browser tab's memory —
    never stored — so it must be re-entered after a refresh.
-3. **Typed confirmation** — before any write executes, a modal requires you to
-   type the word **confirm**. Nothing is sent until you do.
+3. **Typed confirmation** — before a write executes, a modal requires you to
+   type the word **confirm**. Nothing is sent until you do. (Exception: *Set
+   Leverage* skips this prompt for convenience — it still requires the admin
+   session **and** the trade token, and moves no funds itself.)
 
 Submit buttons are also disabled while a write is in flight to prevent
 accidental double-submission.
@@ -119,10 +121,9 @@ accidental double-submission.
 Every endpoint from the Postman collection is wired in. Reads are available to
 both roles; writes are **admin-only** (the viewer gets `403`).
 
-**Reads** (dashboard + API Explorer): wallet balance, fiat balance,
-withdrawable amount, account info, server time, open positions, open orders,
-instruments info, tickers, order book, risk limit, closed PnL,
-trades/execution history.
+**Reads** (dashboard + API Explorer): wallet balance, withdrawable amount,
+account info, server time, open positions, open orders, instruments info,
+tickers, order book, closed PnL, trades/execution history.
 
 **Writes** (admin panel): create order (market/limit/TP via reduce-only +
 trigger fields), cancel order, cancel-all, close position, set leverage,

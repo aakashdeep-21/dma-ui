@@ -328,8 +328,10 @@ document.addEventListener("click", async (e) => {
   }
 });
 
-// Run a token-gated, typed-confirmed write while disabling its submit button.
-// `gather` returns {body, confirmMsg, successMsg} or null to abort.
+// Run a token-gated write while disabling its submit button. The trade token
+// is always required; the typed-"confirm" modal is shown unless the spec sets
+// skipConfirm (used for lower-risk actions like set-leverage).
+// `gather` returns {body, confirmMsg, successMsg, skipConfirm?} or null to abort.
 async function runWrite(submitBtn, out, gather) {
   if (out) { out.textContent = ""; out.className = "result-msg"; }
   if (!ensureToken()) return;
@@ -342,7 +344,7 @@ async function runWrite(submitBtn, out, gather) {
       return;
     }
     if (!spec) return;
-    const ok = await typedConfirm(spec.confirmMsg);
+    const ok = spec.skipConfirm ? true : await typedConfirm(spec.confirmMsg);
     if (!ok) return;
     const prevLabel = submitBtn ? submitBtn.textContent : null;
     if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = "Working…"; }
@@ -432,7 +434,7 @@ function wireAdminForms() {
       return {
         path: "/api/position/set-leverage",
         body,
-        confirmMsg: `Set ${body.symbol} leverage to buy ${body.buyLeverage}x / sell ${body.sellLeverage}x.`,
+        skipConfirm: true, // trade token still required; no typed-confirm for leverage
         successMsg: () => `✓ Leverage set for ${body.symbol}`,
       };
     });
@@ -628,20 +630,6 @@ function renderInstruments(data) {
   ]);
 }
 
-function renderRiskLimit(data) {
-  const list = listOf(data);
-  if (!list.length) return emptyMsg("No risk-limit tiers");
-  return buildTable(list, [
-    { label: "ID", get: (r) => r.id },
-    { label: "Symbol", get: (r) => r.symbol },
-    { label: "Risk Limit Value", get: (r) => r.riskLimitValue },
-    { label: "Init Margin", get: (r) => r.initialMargin },
-    { label: "Maint Margin", get: (r) => r.maintenanceMargin },
-    { label: "Max Leverage", get: (r) => r.maxLeverage },
-    { label: "Lowest Risk", get: (r) => r.isLowestRisk },
-  ]);
-}
-
 function renderClosedPnl(data) {
   const list = listOf(data);
   if (!list.length) return emptyMsg("No closed PnL records");
@@ -747,7 +735,6 @@ function renderOrdersTable(data) {
 
 const EXPLORER_QUERIES = [
   { label: "Wallet Balance", path: "/api/balance", render: renderWallet },
-  { label: "Fiat Balance", path: "/api/fiat-balance", render: autoRender },
   { label: "Withdrawable", path: "/api/withdrawable", render: autoRender },
   { label: "Account Info", path: "/api/account-info", render: renderAccountInfo },
   { label: "Server Time", path: "/api/server-time", render: renderServerTime },
@@ -756,7 +743,6 @@ const EXPLORER_QUERIES = [
   { label: "Instruments", path: "/api/instruments", sym: true, render: renderInstruments },
   { label: "Tickers", path: "/api/tickers", sym: true, render: renderTickers },
   { label: "Order Book", path: "/api/orderbook", sym: true, symRequired: true, render: renderOrderBook },
-  { label: "Risk Limit", path: "/api/risk-limit", sym: true, symRequired: true, render: renderRiskLimit },
   { label: "Closed PnL", path: "/api/closed-pnl", sym: true, render: renderClosedPnl },
   { label: "Trades History", path: "/api/executions", sym: true, render: renderExecutions },
 ];
