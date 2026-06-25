@@ -165,6 +165,20 @@ async def get_server_time():
     return await _request("GET", "/v5/market/time")
 
 
+async def get_tickers(symbol: str | None = None):
+    params = {"category": settings.CATEGORY}
+    if symbol:
+        params["symbol"] = symbol
+    return await _request("GET", "/v5/market/tickers", params=params)
+
+
+async def get_orderbook(symbol: str, limit: str | None = None):
+    params = {"category": settings.CATEGORY, "symbol": symbol}
+    if limit:
+        params["limit"] = str(limit)
+    return await _request("GET", "/v5/market/orderbook", params=params)
+
+
 # --- Write endpoints (admin only at the route layer) ----------------------
 
 async def create_order(body: dict):
@@ -207,4 +221,16 @@ async def transfer_funds(direction: str, amount, quote_asset: str, client_txn_id
         "amount": amount,
         "quote_asset": quote_asset,
     }
-    return await _request("POST", "/dma/api/v1/funds/transfer", body=body)
+    data = await _request("POST", "/dma/api/v1/funds/transfer", body=body)
+    # This endpoint uses a non-v5 envelope (no retCode), so _request can't
+    # auto-detect a business rejection. Conservatively flag common failure
+    # shapes so a DECLINED transfer is never reported to the operator as
+    # success. (Unknown success shapes still pass through — see the softened
+    # "verify your balance" wording in the UI.)
+    if isinstance(data, dict):
+        if data.get("success") is False or data.get("error"):
+            raise DMAError(400, data.get("error") or data.get("message") or data)
+        status = str(data.get("status", "")).lower()
+        if status in ("failed", "failure", "error", "rejected", "declined", "cancelled"):
+            raise DMAError(400, data.get("message") or data.get("retMsg") or data)
+    return data

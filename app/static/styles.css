@@ -200,6 +200,27 @@ button:disabled { opacity: 0.5; cursor: default; }
 }
 .json-view.neg { color: var(--neg); }
 
+/* ---------- Explorer formatted results ---------- */
+.explorer-result { border-top: 1px solid var(--border); }
+.explorer-result .table-wrap { max-height: 420px; overflow: auto; }
+.explorer-summary {
+  padding: 12px 16px; font-size: 13px; color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.explorer-summary span { font-weight: 700; }
+table.kv th {
+  text-align: left; color: var(--muted); font-weight: 500;
+  text-transform: none; letter-spacing: 0; width: 45%; border-bottom: 1px solid rgba(35,43,58,0.5);
+}
+table.kv td { text-align: left; }
+.raw-json { border-top: 1px solid var(--border); }
+.raw-json summary {
+  padding: 10px 16px; cursor: pointer; font-size: 12px; color: var(--muted);
+  user-select: none;
+}
+.raw-json summary:hover { color: var(--text); }
+.raw-json .json-view { border-top: 1px solid var(--border); border-radius: 0; }
+
 /* ---------- Trade token panel ---------- */
 .token-panel { border-color: rgba(59,130,246,0.4); }
 .token-help { font-size: 11px; margin: 0; line-height: 1.5; }

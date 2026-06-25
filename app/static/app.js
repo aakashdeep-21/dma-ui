@@ -186,7 +186,9 @@ function renderSummary(d) {
         break;
       }
     }
-  } catch (e) {}
+  } catch (e) {
+    console.debug("equity parse failed", e);
+  }
   $("#stat-equity").textContent = equity;
 }
 
@@ -202,12 +204,12 @@ function renderPositions(positions) {
     .map((p) => {
       const pnl = p.unrealisedPnl;
       const actions = isAdmin
-        ? `<td><button class="btn-danger sm" data-close='${JSON.stringify({
+        ? `<td><button class="btn-danger sm" data-close='${esc(JSON.stringify({
             symbol: p.symbol,
             side: p.side,
             qty: p.size,
             positionIdx: p.positionIdx ?? 0,
-          }).replace(/'/g, "&#39;")}'>Close</button></td>`
+          }))}'>Close</button></td>`
         : "";
       return `<tr>
         <td class="mono">${esc(p.symbol)}</td>
@@ -235,10 +237,10 @@ function renderOrders(orders) {
   body.innerHTML = rows
     .map((o) => {
       const actions = isAdmin
-        ? `<td><button class="btn-danger sm" data-cancel='${JSON.stringify({
+        ? `<td><button class="btn-danger sm" data-cancel='${esc(JSON.stringify({
             symbol: o.symbol,
             orderId: o.orderId,
-          }).replace(/'/g, "&#39;")}'>Cancel</button></td>`
+          }))}'>Cancel</button></td>`
         : "";
       return `<tr>
         <td class="mono">${esc(o.symbol)}</td>
@@ -477,7 +479,7 @@ function wireAdminForms() {
         path: "/api/funds/transfer",
         body,
         confirmMsg: `Transfer ${body.amount} ${body.quote_asset} (${body.direction}). This moves real funds.`,
-        successMsg: () => "✓ Transfer submitted",
+        successMsg: () => "✓ Transfer request submitted — verify your balance to confirm it completed",
         onSuccess: () => f.reset(),
       };
     });
@@ -486,19 +488,277 @@ function wireAdminForms() {
 
 // ---------------------------------------------------------------------------
 // API Explorer (read-only queries, available to any logged-in user)
+// Each query renders a formatted table; raw JSON stays available via a toggle.
 // ---------------------------------------------------------------------------
+
+// --- formatting helpers ---
+function cell(v) {
+  return v === undefined || v === null || v === "" ? "—" : v;
+}
+function sideClass(side) {
+  return String(side || "").toLowerCase() === "buy" ? "pos" : "neg";
+}
+function fmtTime(ms) {
+  if (ms === undefined || ms === null || ms === "") return "—";
+  const n = Number(ms);
+  if (!isFinite(n)) return esc(String(ms));
+  const d = new Date(n > 1e12 ? n : n * 1000); // ms vs seconds
+  return d.toLocaleString();
+}
+function pct(v) {
+  const n = Number(v);
+  return isFinite(n) ? (n * 100).toFixed(2) + "%" : "—";
+}
+function emptyMsg(msg) {
+  return `<p class="muted center" style="padding:18px">${esc(msg || "No data")}</p>`;
+}
+function listOf(data) {
+  const r = data && data.result;
+  if (r && Array.isArray(r.list)) return r.list;
+  if (Array.isArray(r)) return r;
+  return [];
+}
+// Build a table. columns: [{label, get:(row)=>value, cls?:(row)=>className}]
+function buildTable(rows, columns) {
+  const head = columns.map((c) => `<th>${esc(c.label)}</th>`).join("");
+  const body = rows
+    .map(
+      (r) =>
+        "<tr>" +
+        columns
+          .map((c) => {
+            const extra = c.cls ? " " + c.cls(r) : "";
+            return `<td class="mono${extra}">${esc(cell(c.get(r)))}</td>`;
+          })
+          .join("") +
+        "</tr>"
+    )
+    .join("");
+  return `<div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+// Key/value table for a single object.
+function buildKV(obj, fields) {
+  const entries = fields
+    ? fields.map((f) => [f.label, obj ? obj[f.key] : undefined])
+    : Object.entries(obj || {});
+  if (!entries.length) return emptyMsg();
+  const rows = entries
+    .map(([k, v]) => {
+      const val = v && typeof v === "object" ? JSON.stringify(v) : v;
+      return `<tr><th>${esc(k)}</th><td class="mono">${esc(cell(val))}</td></tr>`;
+    })
+    .join("");
+  return `<div class="table-wrap"><table class="kv"><tbody>${rows}</tbody></table></div>`;
+}
+// Generic fallback: array-of-objects → table; object → kv; else raw.
+function autoRender(data) {
+  const list = listOf(data);
+  if (list.length) {
+    const keys = Object.keys(list[0]);
+    return buildTable(
+      list,
+      keys.map((k) => ({ label: k, get: (r) => (r[k] && typeof r[k] === "object" ? JSON.stringify(r[k]) : r[k]) }))
+    );
+  }
+  const r = data && data.result;
+  if (r && typeof r === "object" && !Array.isArray(r)) return buildKV(r);
+  return `<pre class="json-view">${esc(JSON.stringify(data, null, 2))}</pre>`;
+}
+
+// --- per-endpoint renderers ---
+function renderWallet(data) {
+  const acct = listOf(data)[0];
+  if (!acct) return autoRender(data);
+  const summary = buildKV(acct, [
+    { label: "Account Type", key: "accountType" },
+    { label: "Total Equity", key: "totalEquity" },
+    { label: "Wallet Balance", key: "totalWalletBalance" },
+    { label: "Available Balance", key: "totalAvailableBalance" },
+    { label: "Margin Balance", key: "totalMarginBalance" },
+    { label: "Unrealised PnL", key: "totalPerpUPL" },
+    { label: "Initial Margin", key: "totalInitialMargin" },
+    { label: "Maint. Margin", key: "totalMaintenanceMargin" },
+  ]);
+  const coins = acct.coin || [];
+  const coinTable = coins.length
+    ? buildTable(coins, [
+        { label: "Coin", get: (c) => c.coin },
+        { label: "Equity", get: (c) => c.equity },
+        { label: "Wallet Bal", get: (c) => c.walletBalance },
+        { label: "Available", get: (c) => c.availableToWithdraw ?? c.availableToBorrow },
+        { label: "Unreal PnL", get: (c) => c.unrealisedPnl, cls: (c) => pnlClass(c.unrealisedPnl) },
+        { label: "Realised PnL", get: (c) => c.cumRealisedPnl, cls: (c) => pnlClass(c.cumRealisedPnl) },
+        { label: "USD Value", get: (c) => c.usdValue },
+      ])
+    : "";
+  return summary + coinTable;
+}
+
+function renderAccountInfo(data) {
+  return data && data.result ? buildKV(data.result) : autoRender(data);
+}
+
+function renderServerTime(data) {
+  const r = (data && data.result) || {};
+  const sec = r.timeSecond ?? (data && data.time ? Number(data.time) / 1000 : null);
+  const dt = sec != null && isFinite(Number(sec)) ? new Date(Number(sec) * 1000) : null;
+  return buildKV({
+    "timeSecond": r.timeSecond,
+    "timeNano": r.timeNano,
+    "Parsed (UTC)": dt ? dt.toISOString() : "—",
+    "Local time": dt ? dt.toLocaleString() : "—",
+  });
+}
+
+function renderInstruments(data) {
+  const list = listOf(data);
+  if (!list.length) return emptyMsg("No instruments");
+  return buildTable(list, [
+    { label: "Symbol", get: (i) => i.symbol },
+    { label: "Status", get: (i) => i.status },
+    { label: "Type", get: (i) => i.contractType },
+    { label: "Base", get: (i) => i.baseCoin },
+    { label: "Quote", get: (i) => i.quoteCoin },
+    { label: "Settle", get: (i) => i.settleCoin },
+    { label: "Tick Size", get: (i) => i.priceFilter && i.priceFilter.tickSize },
+    { label: "Qty Step", get: (i) => i.lotSizeFilter && i.lotSizeFilter.qtyStep },
+    { label: "Min Qty", get: (i) => i.lotSizeFilter && i.lotSizeFilter.minOrderQty },
+    { label: "Max Qty", get: (i) => i.lotSizeFilter && i.lotSizeFilter.maxOrderQty },
+    { label: "Max Lev", get: (i) => i.leverageFilter && i.leverageFilter.maxLeverage },
+  ]);
+}
+
+function renderRiskLimit(data) {
+  const list = listOf(data);
+  if (!list.length) return emptyMsg("No risk-limit tiers");
+  return buildTable(list, [
+    { label: "ID", get: (r) => r.id },
+    { label: "Symbol", get: (r) => r.symbol },
+    { label: "Risk Limit Value", get: (r) => r.riskLimitValue },
+    { label: "Init Margin", get: (r) => r.initialMargin },
+    { label: "Maint Margin", get: (r) => r.maintenanceMargin },
+    { label: "Max Leverage", get: (r) => r.maxLeverage },
+    { label: "Lowest Risk", get: (r) => r.isLowestRisk },
+  ]);
+}
+
+function renderClosedPnl(data) {
+  const list = listOf(data);
+  if (!list.length) return emptyMsg("No closed PnL records");
+  const total = list.reduce((s, r) => s + (Number(r.closedPnl) || 0), 0);
+  const table = buildTable(list, [
+    { label: "Closed At", get: (r) => fmtTime(r.updatedTime ?? r.createdTime) },
+    { label: "Symbol", get: (r) => r.symbol },
+    { label: "Side", get: (r) => r.side, cls: (r) => sideClass(r.side) },
+    { label: "Qty", get: (r) => r.qty ?? r.closedSize },
+    { label: "Entry", get: (r) => r.avgEntryPrice },
+    { label: "Exit", get: (r) => r.avgExitPrice },
+    { label: "Closed PnL", get: (r) => r.closedPnl, cls: (r) => pnlClass(r.closedPnl) },
+    { label: "Leverage", get: (r) => r.leverage },
+  ]);
+  return (
+    `<div class="explorer-summary">Total closed PnL: <span class="${pnlClass(total)}">${fmtNum(total)}</span> · ${list.length} record(s)</div>` +
+    table
+  );
+}
+
+function renderExecutions(data) {
+  const list = listOf(data);
+  if (!list.length) return emptyMsg("No trades");
+  return buildTable(list, [
+    { label: "Time", get: (r) => fmtTime(r.execTime) },
+    { label: "Symbol", get: (r) => r.symbol },
+    { label: "Side", get: (r) => r.side, cls: (r) => sideClass(r.side) },
+    { label: "Type", get: (r) => r.orderType },
+    { label: "Exec Qty", get: (r) => r.execQty },
+    { label: "Exec Price", get: (r) => r.execPrice },
+    { label: "Exec Value", get: (r) => r.execValue },
+    { label: "Fee", get: (r) => r.execFee },
+    { label: "Maker", get: (r) => r.isMaker },
+  ]);
+}
+
+function renderTickers(data) {
+  const list = listOf(data);
+  if (!list.length) return emptyMsg("No tickers");
+  return buildTable(list, [
+    { label: "Symbol", get: (t) => t.symbol },
+    { label: "Last", get: (t) => t.lastPrice },
+    { label: "Mark", get: (t) => t.markPrice },
+    { label: "Index", get: (t) => t.indexPrice },
+    { label: "24h %", get: (t) => pct(t.price24hPcnt), cls: (t) => pnlClass(t.price24hPcnt) },
+    { label: "24h High", get: (t) => t.highPrice24h },
+    { label: "24h Low", get: (t) => t.lowPrice24h },
+    { label: "Bid", get: (t) => t.bid1Price },
+    { label: "Ask", get: (t) => t.ask1Price },
+    { label: "Funding", get: (t) => t.fundingRate },
+    { label: "Open Int", get: (t) => t.openInterest },
+  ]);
+}
+
+function renderOrderBook(data) {
+  const r = (data && data.result) || {};
+  const bids = r.b || [];
+  const asks = r.a || [];
+  const n = Math.max(bids.length, asks.length);
+  if (!n) return autoRender(data);
+  // Fall back to the generic renderer if the rows aren't [price, size] pairs.
+  if (!bids.every(Array.isArray) || !asks.every(Array.isArray)) return autoRender(data);
+  let body = "";
+  for (let i = 0; i < n; i++) {
+    const b = bids[i] || ["", ""];
+    const a = asks[i] || ["", ""];
+    body += `<tr><td class="mono pos">${esc(cell(b[1]))}</td><td class="mono pos">${esc(cell(b[0]))}</td><td class="mono neg">${esc(cell(a[0]))}</td><td class="mono neg">${esc(cell(a[1]))}</td></tr>`;
+  }
+  return (
+    `<div class="explorer-summary">${esc(cell(r.s))} — order book</div>` +
+    `<div class="table-wrap"><table><thead><tr><th>Bid Size</th><th>Bid Price</th><th>Ask Price</th><th>Ask Size</th></tr></thead><tbody>${body}</tbody></table></div>`
+  );
+}
+
+function renderPositionsTable(data) {
+  const list = listOf(data).filter((p) => Number(p.size) !== 0);
+  if (!list.length) return emptyMsg("No open positions");
+  return buildTable(list, [
+    { label: "Symbol", get: (p) => p.symbol },
+    { label: "Side", get: (p) => p.side, cls: (p) => sideClass(p.side) },
+    { label: "Size", get: (p) => p.size },
+    { label: "Entry", get: (p) => p.avgPrice },
+    { label: "Mark", get: (p) => p.markPrice },
+    { label: "Lev", get: (p) => (p.leverage ? p.leverage + "x" : "—") },
+    { label: "Value", get: (p) => p.positionValue },
+    { label: "Unreal PnL", get: (p) => p.unrealisedPnl, cls: (p) => pnlClass(p.unrealisedPnl) },
+  ]);
+}
+
+function renderOrdersTable(data) {
+  const list = listOf(data);
+  if (!list.length) return emptyMsg("No open orders");
+  return buildTable(list, [
+    { label: "Symbol", get: (o) => o.symbol },
+    { label: "Side", get: (o) => o.side, cls: (o) => sideClass(o.side) },
+    { label: "Type", get: (o) => o.orderType },
+    { label: "Qty", get: (o) => o.qty },
+    { label: "Price", get: (o) => o.price },
+    { label: "Trigger", get: (o) => o.triggerPrice },
+    { label: "Status", get: (o) => o.orderStatus },
+  ]);
+}
+
 const EXPLORER_QUERIES = [
-  { label: "Wallet Balance", path: "/api/balance" },
-  { label: "Fiat Balance", path: "/api/fiat-balance" },
-  { label: "Withdrawable", path: "/api/withdrawable" },
-  { label: "Account Info", path: "/api/account-info" },
-  { label: "Server Time", path: "/api/server-time" },
-  { label: "Positions", path: "/api/positions" },
-  { label: "Open Orders", path: "/api/orders" },
-  { label: "Instruments", path: "/api/instruments", sym: true },
-  { label: "Risk Limit", path: "/api/risk-limit", sym: true, symRequired: true },
-  { label: "Closed PnL", path: "/api/closed-pnl", sym: true },
-  { label: "Trades History", path: "/api/executions", sym: true },
+  { label: "Wallet Balance", path: "/api/balance", render: renderWallet },
+  { label: "Fiat Balance", path: "/api/fiat-balance", render: autoRender },
+  { label: "Withdrawable", path: "/api/withdrawable", render: autoRender },
+  { label: "Account Info", path: "/api/account-info", render: renderAccountInfo },
+  { label: "Server Time", path: "/api/server-time", render: renderServerTime },
+  { label: "Positions", path: "/api/positions", render: renderPositionsTable },
+  { label: "Open Orders", path: "/api/orders", render: renderOrdersTable },
+  { label: "Instruments", path: "/api/instruments", sym: true, render: renderInstruments },
+  { label: "Tickers", path: "/api/tickers", sym: true, render: renderTickers },
+  { label: "Order Book", path: "/api/orderbook", sym: true, symRequired: true, render: renderOrderBook },
+  { label: "Risk Limit", path: "/api/risk-limit", sym: true, symRequired: true, render: renderRiskLimit },
+  { label: "Closed PnL", path: "/api/closed-pnl", sym: true, render: renderClosedPnl },
+  { label: "Trades History", path: "/api/executions", sym: true, render: renderExecutions },
 ];
 
 function wireExplorer() {
@@ -513,20 +773,21 @@ function wireExplorer() {
     btn.addEventListener("click", async () => {
       const symbol = $("#explorer-symbol").value.trim().toUpperCase();
       if (q.symRequired && !symbol) {
-        out.textContent = `"${q.label}" requires a symbol.`;
-        out.className = "json-view neg";
+        out.innerHTML = `<p class="neg" style="padding:14px">"${esc(q.label)}" requires a symbol.</p>`;
         return;
       }
       let url = q.path;
       if (q.sym && symbol) url += `?symbol=${encodeURIComponent(symbol)}`;
-      out.textContent = `Loading ${q.label}…`;
-      out.className = "json-view";
+      out.innerHTML = `<p class="muted" style="padding:14px">Loading ${esc(q.label)}…</p>`;
       try {
         const data = await api(url);
-        out.textContent = JSON.stringify(data, null, 2);
+        const formatted = (q.render || autoRender)(data);
+        const raw = `<details class="raw-json"><summary>Raw JSON</summary><pre class="json-view">${esc(
+          JSON.stringify(data, null, 2)
+        )}</pre></details>`;
+        out.innerHTML = formatted + raw;
       } catch (err) {
-        out.textContent = "Error: " + err.message;
-        out.className = "json-view neg";
+        out.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(err.message)}</p>`;
       }
     });
     container.appendChild(btn);

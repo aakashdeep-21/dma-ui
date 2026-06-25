@@ -121,14 +121,20 @@ both roles; writes are **admin-only** (the viewer gets `403`).
 
 **Reads** (dashboard + API Explorer): wallet balance, fiat balance,
 withdrawable amount, account info, server time, open positions, open orders,
-instruments info, risk limit, closed PnL, trades/execution history.
+instruments info, tickers, order book, risk limit, closed PnL,
+trades/execution history.
 
 **Writes** (admin panel): create order (market/limit/TP via reduce-only +
 trigger fields), cancel order, cancel-all, close position, set leverage,
 set margin mode, transfer funds.
 
-The admin **API Explorer** panel can call any read endpoint ad-hoc (with an
-optional symbol) and shows the raw JSON response.
+The **API Explorer** panel calls any read endpoint ad-hoc (with an optional
+symbol) and renders the result as a **formatted table** (with a collapsible
+"Raw JSON" view underneath each result).
+
+> Not yet integrated: `POST /v5/position/switch-mode` (one-way ↔ hedge). It's a
+> real-money write and its exact params weren't confirmed, so it was left out
+> pending verification — easy to add on request.
 
 > The two `loadtest.coinswitch.co/ledger/query-balance` items in the
 > collection were intentionally **not** integrated: they target a different

@@ -12,6 +12,7 @@ Security model:
 import asyncio
 import logging
 import math
+from urllib.parse import urlparse
 
 from fastapi import (
     Body,
@@ -292,6 +293,16 @@ async def api_server_time(user: dict = Depends(current_user)):
     return await dma_client.get_server_time()
 
 
+@app.get("/api/tickers")
+async def api_tickers(symbol: str | None = None, user: dict = Depends(current_user)):
+    return await dma_client.get_tickers(symbol)
+
+
+@app.get("/api/orderbook")
+async def api_orderbook(symbol: str, user: dict = Depends(current_user)):
+    return await dma_client.get_orderbook(symbol)
+
+
 # --------------------------------------------------------------------------
 # Write API (admin only)
 # --------------------------------------------------------------------------
@@ -391,7 +402,9 @@ async def api_close_position(payload: dict = Body(...), user: dict = Depends(req
         "symbol": pos.get("symbol"),
         "side": "Sell" if side.lower() == "buy" else "Buy",
         "orderType": "Market",
-        "qty": str(pos.get("size")),
+        # Echo back the exchange's own size string (validated >0 above),
+        # stripped of stray whitespace — avoids any reformatting drift.
+        "qty": str(pos.get("size")).strip(),
         "reduceOnly": True,
         "positionIdx": pos.get("positionIdx", 0),
     }
@@ -452,8 +465,6 @@ def _ws_origin_ok(websocket: WebSocket) -> bool:
     origin = websocket.headers.get("origin")
     if not origin:
         return True  # non-browser client; still needs a valid session cookie
-    from urllib.parse import urlparse
-
     return urlparse(origin).netloc == websocket.headers.get("host", "")
 
 
