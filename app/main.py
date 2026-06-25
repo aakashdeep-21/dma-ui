@@ -12,6 +12,7 @@ Security model:
 import asyncio
 import logging
 import math
+import sys
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
@@ -31,8 +32,42 @@ from pathlib import Path
 from . import auth, dma_client
 from .config import settings
 
+def _configure_logging() -> None:
+    """Route normal logs to stdout and only warnings/errors to stderr.
+
+    Railway tags ANYTHING on stderr as level=error and colors it red. By
+    default uvicorn and httpx log INFO to stderr, so successful 200s and
+    startup messages show up as scary red "errors". This sends INFO->stdout
+    (normal) and WARNING+->stderr (genuinely red so real problems stand out),
+    and silences httpx's per-request chatter (3 lines every poll).
+    """
+    fmt = logging.Formatter("%(levelname)s %(name)s: %(message)s")
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(fmt)
+    stdout_handler.addFilter(lambda record: record.levelno < logging.WARNING)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(fmt)
+    stderr_handler.setLevel(logging.WARNING)
+
+    root = logging.getLogger()
+    root.handlers = [stdout_handler, stderr_handler]
+    root.setLevel(logging.INFO)
+
+    # uvicorn installs its own stderr handlers; clear them and let records flow
+    # to our root handlers so they're split by level (stdout vs stderr) too.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        lg = logging.getLogger(name)
+        lg.handlers = []
+        lg.propagate = True
+
+    # httpx logs every upstream request at INFO — pure noise. Keep warnings+.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+_configure_logging()
 logger = logging.getLogger("dma-ui")
-logging.basicConfig(level=logging.INFO)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
