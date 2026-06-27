@@ -365,6 +365,26 @@ async def api_create_order(payload: dict = Body(...), user: dict = Depends(requi
             raise HTTPException(
                 status_code=400, detail="price must be greater than 0 for a Limit order"
             )
+    # Optional TP/SL attached at order creation.
+    take_profit = payload.get("takeProfit")
+    stop_loss = payload.get("stopLoss")
+    has_tpsl = take_profit not in (None, "") or stop_loss not in (None, "")
+    if has_tpsl and payload.get("reduceOnly"):
+        # Bybit rejects TP/SL combined with reduceOnly; catch it early.
+        raise HTTPException(
+            status_code=400,
+            detail="takeProfit/stopLoss cannot be set on a reduce-only order",
+        )
+    for name, value in (("takeProfit", take_profit), ("stopLoss", stop_loss)):
+        if value in (None, ""):
+            continue
+        try:
+            if float(value) <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400, detail=f"{name} must be a number greater than 0"
+            )
     return await dma_client.create_order(payload)
 
 
@@ -393,20 +413,15 @@ async def api_set_leverage(payload: dict = Body(...), user: dict = Depends(requi
     return await dma_client.set_leverage(symbol, buy, sell)
 
 
-@app.post("/api/position/close")
-async def api_close_position(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
-    """Close a position with a reduce-only market order in the opposite side.
+async def _resolve_open_position(symbol, req_idx=None) -> dict:
+    """Return the single LIVE open position for a symbol (optionally a specific
+    positionIdx). Raises HTTPException(400) if none or ambiguous.
 
-    The side / size / positionIdx are re-derived from the LIVE exchange
-    position — never trusted from the client — so a stale or forged request
-    can't close the wrong size or side. reduceOnly guarantees this can only
-    ever reduce, never open or flip, a position.
+    Callers use the returned authoritative positionIdx/side/size — never the
+    client's — so a stale or forged request can't target the wrong leg.
     """
-    symbol = payload.get("symbol")
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol is required")
-
-    req_idx = payload.get("positionIdx")
     positions = _extract_list(await dma_client.get_positions())
     matches = [
         p
@@ -416,7 +431,6 @@ async def api_close_position(payload: dict = Body(...), user: dict = Depends(req
     ]
     if req_idx is not None:
         matches = [p for p in matches if str(p.get("positionIdx")) == str(req_idx)]
-
     if not matches:
         raise HTTPException(status_code=400, detail=f"No open position found for {symbol}")
     if len(matches) > 1:
@@ -424,8 +438,19 @@ async def api_close_position(payload: dict = Body(...), user: dict = Depends(req
             status_code=400,
             detail=f"Multiple open positions for {symbol}; specify positionIdx",
         )
+    return matches[0]
 
-    pos = matches[0]
+
+@app.post("/api/position/close")
+async def api_close_position(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
+    """Close a position with a reduce-only market order in the opposite side.
+
+    The side / size / positionIdx are re-derived from the LIVE exchange
+    position — never trusted from the client — so a stale or forged request
+    can't close the wrong size or side. reduceOnly guarantees this can only
+    ever reduce, never open or flip, a position.
+    """
+    pos = await _resolve_open_position(payload.get("symbol"), payload.get("positionIdx"))
     size = _safe_float(pos.get("size"))
     side = str(pos.get("side", ""))
     if size <= 0 or side.lower() not in ("buy", "sell"):
@@ -442,6 +467,54 @@ async def api_close_position(payload: dict = Body(...), user: dict = Depends(req
         "positionIdx": pos.get("positionIdx", 0),
     }
     return await dma_client.create_order(order)
+
+
+@app.post("/api/position/trading-stop")
+async def api_trading_stop(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
+    """Set or cancel TP/SL on an existing position (Full mode, market exit).
+
+    positionIdx is re-derived from the LIVE position so the stop always attaches
+    to the correct leg (critical in hedge mode). A value of "0" cancels that
+    leg; at least one of takeProfit/stopLoss must be supplied.
+    """
+    take_profit = payload.get("takeProfit")
+    stop_loss = payload.get("stopLoss")
+
+    def _validate(name, value):
+        # Empty/None => not supplied (leave that leg untouched). "0" => cancel.
+        if value in (None, ""):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{name} must be a number")
+        if number < 0:
+            raise HTTPException(status_code=400, detail=f"{name} must be >= 0 (0 cancels)")
+        return str(value).strip()
+
+    tp = _validate("takeProfit", take_profit)
+    sl = _validate("stopLoss", stop_loss)
+    if tp is None and sl is None:
+        raise HTTPException(
+            status_code=400, detail="at least one of takeProfit or stopLoss is required"
+        )
+
+    pos = await _resolve_open_position(payload.get("symbol"), payload.get("positionIdx"))
+
+    body = {
+        "symbol": pos.get("symbol"),
+        "tpslMode": "Full",
+        "positionIdx": pos.get("positionIdx", 0),
+    }
+    if tp is not None:
+        body["takeProfit"] = tp
+    if sl is not None:
+        body["stopLoss"] = sl
+    trigger_by = payload.get("triggerBy")
+    if trigger_by:
+        body["tpTriggerBy"] = trigger_by
+        body["slTriggerBy"] = trigger_by
+    return await dma_client.set_trading_stop(body)
 
 
 @app.post("/api/account/set-margin-mode")

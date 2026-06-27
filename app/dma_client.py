@@ -206,6 +206,17 @@ async def set_margin_mode(mode: str):
     )
 
 
+async def set_trading_stop(body: dict):
+    """Passthrough to /v5/position/trading-stop (set/cancel TP/SL).
+
+    This is a thin passthrough; the route layer owns the policy (tpslMode,
+    re-derived positionIdx, validated takeProfit/stopLoss where "0" cancels)
+    and builds the body. `category` is injected here.
+    """
+    payload = {"category": settings.CATEGORY, **body}
+    return await _request("POST", "/v5/position/trading-stop", body=payload)
+
+
 async def transfer_funds(direction: str, amount, quote_asset: str, client_txn_id: str | None = None):
     body = {
         "client_txn_id": client_txn_id or str(uuid.uuid4()),

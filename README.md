@@ -125,9 +125,11 @@ both roles; writes are **admin-only** (the viewer gets `403`).
 account info, server time, open positions, open orders, instruments info,
 tickers, order book, closed PnL, trades/execution history.
 
-**Writes** (admin panel): create order (market/limit/TP via reduce-only +
-trigger fields), cancel order, cancel-all, close position, set leverage,
-set margin mode, transfer funds.
+**Writes** (admin panel): create order (market/limit, with optional attached
+take-profit / stop-loss), set TP/SL on an existing position
+(`/v5/position/trading-stop`, Full mode, positionIdx re-derived from the live
+position), cancel order, cancel-all, close position, set leverage, set margin
+mode, transfer funds.
 
 The **API Explorer** panel calls any read endpoint ad-hoc (with an optional
 symbol) and renders the result as a **formatted table** (with a collapsible

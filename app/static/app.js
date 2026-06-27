@@ -196,20 +196,32 @@ function renderPositions(positions) {
   const body = $("#positions-body");
   const rows = (positions || []).filter((p) => Number(p.size) !== 0);
   if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="9" class="muted center">No open positions</td></tr>`;
+    body.innerHTML = `<tr><td colspan="11" class="muted center">No open positions</td></tr>`;
     return;
   }
   const isAdmin = state.role === "admin";
+  const hasVal = (v) => v !== undefined && v !== null && v !== "" && Number(v) !== 0;
   body.innerHTML = rows
     .map((p) => {
       const pnl = p.unrealisedPnl;
       const actions = isAdmin
-        ? `<td><button class="btn-danger sm" data-close='${esc(JSON.stringify({
-            symbol: p.symbol,
-            side: p.side,
-            qty: p.size,
-            positionIdx: p.positionIdx ?? 0,
-          }))}'>Close</button></td>`
+        ? `<td class="row-actions">
+            <button class="btn-ghost sm" data-tpsl='${esc(JSON.stringify({
+              symbol: p.symbol,
+              positionIdx: p.positionIdx ?? 0,
+              side: p.side,
+              avgPrice: p.avgPrice,
+              markPrice: p.markPrice,
+              takeProfit: p.takeProfit,
+              stopLoss: p.stopLoss,
+            }))}'>TP/SL</button>
+            <button class="btn-danger sm" data-close='${esc(JSON.stringify({
+              symbol: p.symbol,
+              side: p.side,
+              qty: p.size,
+              positionIdx: p.positionIdx ?? 0,
+            }))}'>Close</button>
+          </td>`
         : "";
       return `<tr>
         <td class="mono">${esc(p.symbol)}</td>
@@ -220,6 +232,8 @@ function renderPositions(positions) {
         <td class="mono">${esc(p.leverage ?? "—")}x</td>
         <td class="mono">${fmtNum(p.positionValue)}</td>
         <td class="mono ${pnlClass(pnl)}">${fmtNum(pnl)}</td>
+        <td class="mono pos">${hasVal(p.takeProfit) ? fmtNum(p.takeProfit, 4) : "—"}</td>
+        <td class="mono neg">${hasVal(p.stopLoss) ? fmtNum(p.stopLoss, 4) : "—"}</td>
         ${actions}
       </tr>`;
     })
@@ -287,10 +301,32 @@ function ensureToken() {
   return true;
 }
 
+// Safely read a JSON payload embedded in a row button's data-* attribute.
+// A malformed attribute must never throw an uncaught error inside the delegated
+// click handler (which would make the button silently do nothing).
+function parseRowData(el, attr) {
+  try {
+    return JSON.parse(el.getAttribute(attr));
+  } catch (err) {
+    alert("Could not read position/order data — please refresh and retry.");
+    return null;
+  }
+}
+
 document.addEventListener("click", async (e) => {
+  const tpslBtn = e.target.closest("[data-tpsl]");
+  if (tpslBtn) {
+    const payload = parseRowData(tpslBtn, "data-tpsl");
+    if (!payload) return;
+    if (!ensureToken()) return;
+    openTpslModal(payload);
+    return;
+  }
+
   const closeBtn = e.target.closest("[data-close]");
   if (closeBtn) {
-    const payload = JSON.parse(closeBtn.getAttribute("data-close"));
+    const payload = parseRowData(closeBtn, "data-close");
+    if (!payload) return;
     if (!ensureToken()) return;
     await withWriteLock(async () => {
       const ok = await typedConfirm(
@@ -311,7 +347,8 @@ document.addEventListener("click", async (e) => {
 
   const cancelBtn = e.target.closest("[data-cancel]");
   if (cancelBtn) {
-    const payload = JSON.parse(cancelBtn.getAttribute("data-cancel"));
+    const payload = parseRowData(cancelBtn, "data-cancel");
+    if (!payload) return;
     if (!ensureToken()) return;
     await withWriteLock(async () => {
       const ok = await typedConfirm(`Cancel order ${payload.orderId} (${payload.symbol})?`);
@@ -327,6 +364,91 @@ document.addEventListener("click", async (e) => {
     });
   }
 });
+
+// ---------------------------------------------------------------------------
+// TP/SL modal for an existing position (Full mode, market exit). The trade
+// token is required; positionIdx is sent and re-verified server-side.
+// ---------------------------------------------------------------------------
+let _tpslOpen = false;
+function openTpslModal(pos) {
+  if (_tpslOpen) return;
+  _tpslOpen = true;
+
+  const overlay = $("#tpsl-overlay");
+  const tpInput = $("#tpsl-tp");
+  const slInput = $("#tpsl-sl");
+  const trigger = $("#tpsl-trigger");
+  const out = $("#tpsl-result");
+  const applyBtn = $("#tpsl-apply");
+  const cancelBtn = $("#tpsl-cancel");
+
+  const cur = (v) =>
+    v !== undefined && v !== null && v !== "" && Number(v) !== 0 ? String(v) : "";
+
+  $("#tpsl-title").textContent = `Set TP / SL — ${pos.symbol}`;
+  $("#tpsl-context").textContent = `${pos.side} · entry ${fmtNum(pos.avgPrice, 4)} · mark ${fmtNum(pos.markPrice, 4)}`;
+  tpInput.value = cur(pos.takeProfit);
+  slInput.value = cur(pos.stopLoss);
+  trigger.value = "LastPrice";
+  out.textContent = "";
+  out.className = "result-msg";
+  overlay.hidden = false;
+  tpInput.focus();
+
+  const cleanup = () => {
+    overlay.hidden = true;
+    applyBtn.removeEventListener("click", onApply);
+    cancelBtn.removeEventListener("click", onCancel);
+    overlay.removeEventListener("click", onOverlay);
+    document.removeEventListener("keydown", onKey);
+    _tpslOpen = false;
+  };
+  const onCancel = () => cleanup();
+  const onOverlay = (ev) => { if (ev.target === overlay) cleanup(); };
+  const onKey = (ev) => { if (ev.key === "Escape") cleanup(); };
+
+  const onApply = () => {
+    const tp = tpInput.value.trim();
+    const sl = slInput.value.trim();
+    if (!tp && !sl) {
+      out.textContent = "Enter a Take Profit and/or Stop Loss (0 to cancel).";
+      out.className = "result-msg neg";
+      return;
+    }
+    for (const [name, v] of [["Take Profit", tp], ["Stop Loss", sl]]) {
+      if (v && !(Number(v) >= 0)) {
+        out.textContent = `${name} must be a number ≥ 0 (0 cancels).`;
+        out.className = "result-msg neg";
+        return;
+      }
+    }
+    const body = { symbol: pos.symbol, positionIdx: pos.positionIdx, triggerBy: trigger.value };
+    if (tp) body.takeProfit = tp;
+    if (sl) body.stopLoss = sl;
+
+    out.textContent = "Applying…";
+    out.className = "result-msg";
+    applyBtn.disabled = true;
+    withWriteLock(async () => {
+      try {
+        await writeApi("/api/position/trading-stop", body);
+        out.textContent = "✓ TP/SL applied";
+        out.className = "result-msg pos";
+        setTimeout(cleanup, 800);
+      } catch (err) {
+        out.textContent = "✗ " + err.message;
+        out.className = "result-msg neg";
+      } finally {
+        applyBtn.disabled = false;
+      }
+    });
+  };
+
+  applyBtn.addEventListener("click", onApply);
+  cancelBtn.addEventListener("click", onCancel);
+  overlay.addEventListener("click", onOverlay);
+  document.addEventListener("keydown", onKey);
+}
 
 // Run a token-gated write while disabling its submit button. The trade token
 // is always required; the typed-"confirm" modal is shown unless the spec sets
@@ -409,11 +531,30 @@ function wireAdminForms() {
         if (!body.price) throw new Error("limit price is required for a Limit order");
       }
       if (f.reduceOnly.checked) body.reduceOnly = true;
+
+      // Optional TP/SL attached at order creation.
+      const tp = f.takeProfit.value.trim();
+      const sl = f.stopLoss.value.trim();
+      if ((tp || sl) && body.reduceOnly) {
+        throw new Error("Take Profit / Stop Loss cannot be set on a reduce-only order");
+      }
+      if (tp) {
+        if (!(Number(tp) > 0)) throw new Error("Take Profit must be greater than 0");
+        body.takeProfit = tp;
+      }
+      if (sl) {
+        if (!(Number(sl) > 0)) throw new Error("Stop Loss must be greater than 0");
+        body.stopLoss = sl;
+      }
+
       const priceTxt = body.price ? ` @ ${body.price}` : "";
+      const tpslTxt =
+        (body.takeProfit ? ` TP ${body.takeProfit}` : "") +
+        (body.stopLoss ? ` SL ${body.stopLoss}` : "");
       return {
         path: "/api/order/create",
         body,
-        confirmMsg: `Submit ${body.side} ${body.orderType} order: ${body.qty} ${body.symbol}${priceTxt}${body.reduceOnly ? " (reduce-only)" : ""}.`,
+        confirmMsg: `Submit ${body.side} ${body.orderType} order: ${body.qty} ${body.symbol}${priceTxt}${body.reduceOnly ? " (reduce-only)" : ""}${tpslTxt}.`,
         successMsg: (res) => "✓ Order submitted" + (res.result?.orderId ? ` (${res.result.orderId})` : ""),
         onSuccess: () => { f.reset(); syncLimit(); },
       };

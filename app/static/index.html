@@ -49,11 +49,12 @@
             <tr>
               <th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th>
               <th>Mark</th><th>Lev</th><th>Value</th><th>Unrealised PnL</th>
+              <th>TP</th><th>SL</th>
               <th class="admin-only">Actions</th>
             </tr>
           </thead>
           <tbody id="positions-body">
-            <tr><td colspan="9" class="muted center">Waiting for data…</td></tr>
+            <tr><td colspan="11" class="muted center">Waiting for data…</td></tr>
           </tbody>
         </table>
       </div>
@@ -117,6 +118,12 @@
           </label>
           <label class="limit-only">Price
             <input name="price" placeholder="limit price" />
+          </label>
+          <label>Take Profit <span class="muted">(optional)</span>
+            <input name="takeProfit" placeholder="TP trigger price" />
+          </label>
+          <label>Stop Loss <span class="muted">(optional)</span>
+            <input name="stopLoss" placeholder="SL trigger price" />
           </label>
           <label class="checkbox">
             <input type="checkbox" name="reduceOnly" /> Reduce only
@@ -205,6 +212,34 @@
       <div class="modal-actions">
         <button id="confirm-cancel" class="btn-ghost" type="button">Cancel</button>
         <button id="confirm-proceed" class="btn-danger" type="button" disabled>Proceed</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TP/SL modal for an existing position -->
+  <div id="tpsl-overlay" class="modal-overlay" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="tpsl-title">
+      <h3 id="tpsl-title">Set TP / SL</h3>
+      <p id="tpsl-context" class="muted"></p>
+      <label>Take Profit price
+        <input id="tpsl-tp" type="text" inputmode="decimal" autocomplete="off"
+               placeholder="blank = leave unchanged · 0 = cancel" />
+      </label>
+      <label>Stop Loss price
+        <input id="tpsl-sl" type="text" inputmode="decimal" autocomplete="off"
+               placeholder="blank = leave unchanged · 0 = cancel" />
+      </label>
+      <label>Trigger by
+        <select id="tpsl-trigger">
+          <option value="LastPrice">LastPrice</option>
+          <option value="MarkPrice">MarkPrice</option>
+          <option value="IndexPrice">IndexPrice</option>
+        </select>
+      </label>
+      <div id="tpsl-result" class="result-msg"></div>
+      <div class="modal-actions">
+        <button id="tpsl-cancel" class="btn-ghost" type="button">Cancel</button>
+        <button id="tpsl-apply" class="btn-primary" type="button">Apply TP/SL</button>
       </div>
     </div>
   </div>
