@@ -250,7 +250,7 @@ function renderPositions(positions) {
   const body = $("#positions-body");
   const rows = (positions || []).filter((p) => Number(p.size) !== 0);
   if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="11" class="muted center">No open positions</td></tr>`;
+    body.innerHTML = `<tr><td colspan="12" class="muted center">No open positions</td></tr>`;
     return;
   }
   const isAdmin = state.role === "admin";
@@ -291,6 +291,7 @@ function renderPositions(positions) {
         <td class="mono">${fmtNum(p.size, 4)}</td>
         <td class="mono">${fmtNum(p.avgPrice, 4)}</td>
         <td class="mono">${fmtNum(p.markPrice, 4)}</td>
+        <td class="mono">${hasVal(p.liqPrice) ? fmtNum(p.liqPrice, 4) : "—"}</td>
         <td class="mono">${esc(p.leverage ?? "—")}x</td>
         <td class="mono">${fmtNum(p.positionValue)}</td>
         <td class="mono ${pnlClass(pnl)}">${fmtNum(pnl)}</td>
