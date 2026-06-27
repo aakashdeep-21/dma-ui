@@ -111,25 +111,6 @@ body {
 }
 .btn-ghost:hover { border-color: var(--accent); }
 
-/* ---------- Layout ---------- */
-.layout {
-  display: grid;
-  grid-template-columns: 1fr 360px;
-  gap: 16px;
-  padding: 16px 20px;
-  align-items: start;
-}
-.layout > .panel { grid-column: 1; }
-.side-col { grid-column: 2; grid-row: 1 / span 99; display: flex; flex-direction: column; gap: 16px; }
-
-/* Viewers have no admin side column — use the full width. */
-body.viewer .layout { grid-template-columns: 1fr; }
-
-@media (max-width: 980px) {
-  .layout { grid-template-columns: 1fr; }
-  .side-col { grid-column: 1; grid-row: auto; }
-}
-
 /* ---------- Panels ---------- */
 .panel {
   background: var(--panel);
@@ -320,3 +301,86 @@ td.flash-down { animation: flashDown .8s ease-out; }
 
 /* Tooltipped headers */
 th[title] { cursor: help; text-decoration: underline dotted rgba(139,151,167,0.45); text-underline-offset: 3px; }
+
+/* ===== Batch 2/3 — tabs, panes, toasts, expandable rows, markets/history ===== */
+
+/* Sticky top region (account-health bar + tabs stay visible while scrolling) */
+.sticky-top { position: sticky; top: 0; z-index: 50; }
+
+/* Tabs */
+.tabs {
+  display: flex; gap: 2px; padding: 0 12px; background: var(--panel);
+  border-bottom: 1px solid var(--border); overflow-x: auto;
+}
+.tab {
+  background: transparent; border: none; color: var(--muted);
+  padding: 12px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+  border-bottom: 2px solid transparent; white-space: nowrap;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+/* Panes */
+main { display: block; }
+.pane { padding: 16px 20px; display: flex; flex-direction: column; gap: 16px; }
+.pane[hidden] { display: none; }
+
+/* Trade pane: responsive grid of form cards */
+.trade-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; align-items: start; }
+.trade-grid .token-panel { grid-column: 1 / -1; }
+
+/* Panel head action controls (filters, refresh) */
+.panel-head-actions { display: flex; gap: 8px; align-items: center; }
+.panel-head-actions input {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 6px 10px; border-radius: 8px; font-size: 13px;
+}
+.panel-head-actions input:focus { outline: none; border-color: var(--accent); }
+
+/* Toasts */
+.toasts { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 2000; }
+.toast {
+  background: var(--panel-2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  color: var(--text); padding: 10px 14px; border-radius: 8px; font-size: 13px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.45); max-width: 340px; animation: toastIn .2s ease;
+}
+.toast.pos { border-left-color: var(--pos); }
+.toast.neg { border-left-color: var(--neg); }
+.toast.warn { border-left-color: #f5a623; }
+.toast.out { opacity: 0; transform: translateX(24px); transition: .3s ease; }
+@keyframes toastIn { from { opacity: 0; transform: translateX(24px); } to { opacity: 1; transform: none; } }
+
+/* Sortable headers */
+table.sortable thead th[data-sortkey] { cursor: pointer; user-select: none; }
+table.sortable thead th[data-sortkey]:hover { color: var(--text); }
+table.sortable thead th[data-dir="asc"]::after { content: " ▲"; font-size: 9px; color: var(--accent); }
+table.sortable thead th[data-dir="desc"]::after { content: " ▼"; font-size: 9px; color: var(--accent); }
+
+/* Expandable rows */
+tr.exp-row { cursor: pointer; }
+tr.exp-row:hover { background: var(--panel-2); }
+tr.exp-row.expanded { background: var(--panel-2); }
+.caret { display: inline-block; width: 14px; color: var(--muted); }
+.detail-row > td { background: var(--bg); padding: 0; }
+.detail-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 2px 20px; padding: 12px 16px; }
+.detail-grid > div { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; padding: 4px 0; border-bottom: 1px solid rgba(35,43,58,0.4); }
+.dt-k { color: var(--muted); }
+.dt-v { color: var(--text); text-align: right; }
+
+/* Order badges */
+.badge {
+  display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 10px;
+  font-size: 10px; font-weight: 600; background: var(--border); color: var(--muted);
+}
+
+/* Sticky headers inside scrollable result tables (explorer, markets, history) */
+.explorer-result table thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+
+/* ===== Responsive ===== */
+@media (max-width: 760px) {
+  .topbar { gap: 14px; padding: 10px 14px; }
+  .topbar-stats { gap: 16px; }
+  .stat-value { font-size: 15px; }
+  .pane { padding: 12px; }
+  .trade-grid { grid-template-columns: 1fr; }
+}

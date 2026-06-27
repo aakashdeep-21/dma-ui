@@ -8,226 +8,288 @@
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="brand-dot"></span>
-      <strong>DMA Terminal</strong>
-    </div>
-    <div class="topbar-stats">
-      <div class="stat">
-        <span class="stat-label">Unrealised PnL</span>
-        <span class="stat-value" id="stat-pnl">—</span>
-        <span class="stat-sub" id="stat-pnl-pct"></span>
+  <div class="sticky-top">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <strong>DMA Terminal</strong>
       </div>
-      <div class="stat">
-        <span class="stat-label">Equity</span>
-        <span class="stat-value" id="stat-equity">—</span>
-        <span class="stat-sub" id="stat-available"></span>
+      <div class="topbar-stats">
+        <div class="stat">
+          <span class="stat-label">Unrealised PnL</span>
+          <span class="stat-value" id="stat-pnl">—</span>
+          <span class="stat-sub" id="stat-pnl-pct"></span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Equity</span>
+          <span class="stat-value" id="stat-equity">—</span>
+          <span class="stat-sub" id="stat-available"></span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Margin Used</span>
+          <span class="stat-value" id="stat-margin-used">—</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label" title="Maintenance margin ÷ margin balance. Higher = closer to liquidation.">Margin Ratio</span>
+          <span class="stat-value" id="stat-margin-ratio">—</span>
+          <span class="meter" id="margin-meter"><span style="width:0%"></span></span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Positions</span>
+          <span class="stat-value" id="stat-positions">—</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Open Orders</span>
+          <span class="stat-value" id="stat-orders">—</span>
+        </div>
       </div>
-      <div class="stat">
-        <span class="stat-label">Margin Used</span>
-        <span class="stat-value" id="stat-margin-used">—</span>
+      <div class="topbar-right">
+        <span id="conn-status" class="conn conn-off">connecting…</span>
+        <span class="user-badge"><span id="user-name">—</span> <span id="user-role" class="role-pill"></span></span>
+        <button id="logout-btn" class="btn-ghost">Logout</button>
       </div>
-      <div class="stat">
-        <span class="stat-label" title="Maintenance margin ÷ equity. Higher = closer to liquidation.">Margin Ratio</span>
-        <span class="stat-value" id="stat-margin-ratio">—</span>
-        <span class="meter" id="margin-meter"><span style="width:0%"></span></span>
-      </div>
-      <div class="stat">
-        <span class="stat-label">Positions</span>
-        <span class="stat-value" id="stat-positions">—</span>
-      </div>
-      <div class="stat">
-        <span class="stat-label">Open Orders</span>
-        <span class="stat-value" id="stat-orders">—</span>
-      </div>
-    </div>
-    <div class="topbar-right">
-      <span id="conn-status" class="conn conn-off">connecting…</span>
-      <span class="user-badge"><span id="user-name">—</span> <span id="user-role" class="role-pill"></span></span>
-      <button id="logout-btn" class="btn-ghost">Logout</button>
-    </div>
-  </header>
+    </header>
 
-  <main class="layout">
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Open Positions</h2>
-        <span class="muted" id="positions-updated"></span>
-      </div>
-      <div class="table-wrap">
-        <table id="positions-table">
-          <thead>
-            <tr>
-              <th>Symbol</th><th>Side</th><th>Size</th>
-              <th title="Average entry price · break-even (incl. fees) below">Entry</th>
-              <th title="Current mark price">Mark</th>
-              <th title="Liquidation price · % distance from mark below">Liq.</th>
-              <th>Lev</th><th title="Position notional value">Value</th>
-              <th title="Unrealised PnL · ROE % (PnL ÷ initial margin) below">Unrealised PnL</th>
-              <th title="Take Profit · projected net PnL below">TP</th>
-              <th title="Stop Loss · projected net PnL below">SL</th>
-              <th class="admin-only">Actions</th>
-            </tr>
-          </thead>
-          <tbody id="positions-body">
-            <tr><td colspan="12" class="muted center">Waiting for data…</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="dashboard">Dashboard</button>
+      <button class="tab admin-only" data-tab="trade">Trade</button>
+      <button class="tab" data-tab="markets">Markets</button>
+      <button class="tab" data-tab="history">History</button>
+      <button class="tab" data-tab="tools">Tools</button>
+    </nav>
+  </div>
 
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Open Orders</h2>
-        <button id="cancel-all-btn" class="btn-danger admin-only">Cancel all</button>
-      </div>
-      <div class="table-wrap">
-        <table id="orders-table">
-          <thead>
-            <tr>
-              <th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th>
-              <th>Price</th><th>Trigger</th><th>Status</th>
-              <th class="admin-only">Actions</th>
-            </tr>
-          </thead>
-          <tbody id="orders-body">
-            <tr><td colspan="8" class="muted center">Waiting for data…</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <div class="side-col admin-only">
-      <section class="panel token-panel">
+  <main>
+    <!-- ============ DASHBOARD ============ -->
+    <div class="pane" data-pane="dashboard">
+      <section class="panel">
         <div class="panel-head">
-          <h2>Trade Token</h2>
-          <span id="token-status" class="token-status locked">LOCKED</span>
+          <h2>Open Positions</h2>
+          <span class="muted" id="positions-updated"></span>
         </div>
-        <div class="form-grid">
-          <label>Required for every write operation
-            <input id="trade-token" type="password" placeholder="Paste trade token to unlock trading" autocomplete="off" />
-          </label>
-          <p class="muted token-help">Trading actions are disabled until a valid token is entered. The token is held only in this browser tab and sent with each write request.</p>
+        <div class="table-wrap">
+          <table id="positions-table" class="sortable">
+            <thead>
+              <tr>
+                <th data-sortkey="symbol" data-type="str">Symbol</th>
+                <th data-sortkey="side" data-type="str">Side</th>
+                <th data-sortkey="size" data-type="num">Size</th>
+                <th data-sortkey="avgPrice" data-type="num" title="Average entry price · break-even (incl. fees) below">Entry</th>
+                <th data-sortkey="markPrice" data-type="num" title="Current mark price">Mark</th>
+                <th data-sortkey="liqPrice" data-type="num" title="Liquidation price · % distance from mark below">Liq.</th>
+                <th data-sortkey="leverage" data-type="num">Lev</th>
+                <th data-sortkey="positionValue" data-type="num" title="Position notional value">Value</th>
+                <th data-sortkey="unrealisedPnl" data-type="num" title="Unrealised PnL · ROE % (PnL ÷ initial margin) below">Unrealised PnL</th>
+                <th data-sortkey="takeProfit" data-type="num" title="Take Profit · projected net PnL below">TP</th>
+                <th data-sortkey="stopLoss" data-type="num" title="Stop Loss · projected net PnL below">SL</th>
+                <th class="admin-only">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="positions-body">
+              <tr><td colspan="12" class="muted center">Waiting for data…</td></tr>
+            </tbody>
+          </table>
         </div>
       </section>
 
       <section class="panel">
-        <div class="panel-head"><h2>Place Order</h2></div>
-        <form id="order-form" class="form-grid">
-          <label>Symbol
-            <input name="symbol" placeholder="SOLUSDT" required />
-          </label>
-          <label>Side
-            <div class="segment" id="seg-side" role="group" aria-label="Order side">
-              <button type="button" data-val="Buy" class="seg-buy" aria-pressed="true">Buy</button>
-              <button type="button" data-val="Sell" class="seg-sell" aria-pressed="false">Sell</button>
-            </div>
-            <select name="side" class="sr-only" tabindex="-1">
-              <option value="Buy">Buy</option>
-              <option value="Sell">Sell</option>
-            </select>
-          </label>
-          <label>Order type
-            <div class="segment" id="seg-type" role="group" aria-label="Order type">
-              <button type="button" data-val="Market" class="seg-neutral" aria-pressed="true">Market</button>
-              <button type="button" data-val="Limit" class="seg-neutral" aria-pressed="false">Limit</button>
-            </div>
-            <select name="orderType" id="order-type" class="sr-only" tabindex="-1">
-              <option value="Market">Market</option>
-              <option value="Limit">Limit</option>
-            </select>
-          </label>
-          <label>Quantity
-            <input name="qty" placeholder="1" required />
-          </label>
-          <div class="notional-hint" id="order-notional"></div>
-          <label class="limit-only">Price
-            <input name="price" placeholder="limit price" />
-          </label>
-          <label>Take Profit <span class="muted">(optional)</span>
-            <input name="takeProfit" placeholder="TP trigger price" />
-          </label>
-          <label>Stop Loss <span class="muted">(optional)</span>
-            <input name="stopLoss" placeholder="SL trigger price" />
-          </label>
-          <label class="checkbox">
-            <input type="checkbox" name="reduceOnly" /> Reduce only
-          </label>
-          <div id="order-pnl-preview" class="pnl-preview"></div>
-          <button type="submit" class="btn-primary">Submit order</button>
-        </form>
-        <div id="order-result" class="result-msg"></div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head"><h2>Set Leverage</h2></div>
-        <form id="leverage-form" class="form-grid">
-          <label>Symbol
-            <input name="symbol" placeholder="SOLUSDT" required />
-          </label>
-          <label>Buy leverage
-            <input name="buyLeverage" placeholder="10" required />
-          </label>
-          <label>Sell leverage
-            <input name="sellLeverage" placeholder="10" required />
-          </label>
-          <button type="submit" class="btn-primary">Apply leverage</button>
-        </form>
-        <div id="leverage-result" class="result-msg"></div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head"><h2>Set Margin Mode</h2></div>
-        <form id="margin-form" class="form-grid">
-          <label>Margin mode
-            <select name="setMarginMode">
-              <option value="REGULAR_MARGIN">REGULAR_MARGIN</option>
-              <option value="ISOLATED_MARGIN">ISOLATED_MARGIN</option>
-              <option value="PORTFOLIO_MARGIN">PORTFOLIO_MARGIN</option>
-            </select>
-          </label>
-          <button type="submit" class="btn-primary">Apply margin mode</button>
-        </form>
-        <div id="margin-result" class="result-msg"></div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head"><h2>Transfer Funds</h2></div>
-        <form id="transfer-form" class="form-grid">
-          <label>Direction
-            <select name="direction">
-              <option value="OUT">OUT (to spot/wallet)</option>
-              <option value="IN">IN (to futures)</option>
-            </select>
-          </label>
-          <label>Amount
-            <input name="amount" type="number" step="any" placeholder="40000" required />
-          </label>
-          <label>Quote asset
-            <select name="quote_asset">
-              <option value="INR">INR</option>
-              <option value="USDT">USDT</option>
-            </select>
-          </label>
-          <button type="submit" class="btn-danger">Transfer funds</button>
-        </form>
-        <div id="transfer-result" class="result-msg"></div>
+        <div class="panel-head">
+          <h2>Open Orders</h2>
+          <button id="cancel-all-btn" class="btn-danger admin-only">Cancel all</button>
+        </div>
+        <div class="table-wrap">
+          <table id="orders-table" class="sortable">
+            <thead>
+              <tr>
+                <th data-sortkey="symbol" data-type="str">Symbol</th>
+                <th data-sortkey="side" data-type="str">Side</th>
+                <th data-sortkey="orderType" data-type="str">Type</th>
+                <th data-sortkey="qty" data-type="num">Qty</th>
+                <th data-sortkey="price" data-type="num">Price</th>
+                <th data-sortkey="triggerPrice" data-type="num">Trigger</th>
+                <th data-sortkey="orderStatus" data-type="str">Status</th>
+                <th class="admin-only">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="orders-body">
+              <tr><td colspan="8" class="muted center">Waiting for data…</td></tr>
+            </tbody>
+          </table>
+        </div>
       </section>
     </div>
 
-    <section class="panel explorer-panel">
-      <div class="panel-head">
-        <h2>API Explorer</h2>
-        <span class="muted">read-only queries</span>
+    <!-- ============ TRADE (admin) ============ -->
+    <div class="pane admin-only" data-pane="trade" hidden>
+      <div class="trade-grid">
+        <section class="panel token-panel">
+          <div class="panel-head">
+            <h2>Trade Token</h2>
+            <span id="token-status" class="token-status locked">LOCKED</span>
+          </div>
+          <div class="form-grid">
+            <label>Required for every write operation
+              <input id="trade-token" type="password" placeholder="Paste trade token to unlock trading" autocomplete="off" />
+            </label>
+            <p class="muted token-help">Trading actions are disabled until a valid token is entered. The token is held only in this browser tab and sent with each write request.</p>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><h2>Place Order</h2></div>
+          <form id="order-form" class="form-grid">
+            <label>Symbol
+              <input name="symbol" placeholder="SOLUSDT" required />
+            </label>
+            <label>Side
+              <div class="segment" id="seg-side" role="group" aria-label="Order side">
+                <button type="button" data-val="Buy" class="seg-buy" aria-pressed="true">Buy</button>
+                <button type="button" data-val="Sell" class="seg-sell" aria-pressed="false">Sell</button>
+              </div>
+              <select name="side" class="sr-only" tabindex="-1">
+                <option value="Buy">Buy</option>
+                <option value="Sell">Sell</option>
+              </select>
+            </label>
+            <label>Order type
+              <div class="segment" id="seg-type" role="group" aria-label="Order type">
+                <button type="button" data-val="Market" class="seg-neutral" aria-pressed="true">Market</button>
+                <button type="button" data-val="Limit" class="seg-neutral" aria-pressed="false">Limit</button>
+              </div>
+              <select name="orderType" id="order-type" class="sr-only" tabindex="-1">
+                <option value="Market">Market</option>
+                <option value="Limit">Limit</option>
+              </select>
+            </label>
+            <label>Quantity
+              <input name="qty" placeholder="1" required />
+            </label>
+            <div class="notional-hint" id="order-notional"></div>
+            <label class="limit-only">Price
+              <input name="price" placeholder="limit price" />
+            </label>
+            <label>Take Profit <span class="muted">(optional)</span>
+              <input name="takeProfit" placeholder="TP trigger price" />
+            </label>
+            <label>Stop Loss <span class="muted">(optional)</span>
+              <input name="stopLoss" placeholder="SL trigger price" />
+            </label>
+            <label class="checkbox">
+              <input type="checkbox" name="reduceOnly" /> Reduce only
+            </label>
+            <div id="order-pnl-preview" class="pnl-preview"></div>
+            <button type="submit" class="btn-primary">Submit order</button>
+          </form>
+          <div id="order-result" class="result-msg"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><h2>Set Leverage</h2></div>
+          <form id="leverage-form" class="form-grid">
+            <label>Symbol
+              <input name="symbol" placeholder="SOLUSDT" required />
+            </label>
+            <label>Buy leverage
+              <input name="buyLeverage" placeholder="10" required />
+            </label>
+            <label>Sell leverage
+              <input name="sellLeverage" placeholder="10" required />
+            </label>
+            <button type="submit" class="btn-primary">Apply leverage</button>
+          </form>
+          <div id="leverage-result" class="result-msg"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><h2>Set Margin Mode</h2></div>
+          <form id="margin-form" class="form-grid">
+            <label>Margin mode
+              <select name="setMarginMode">
+                <option value="REGULAR_MARGIN">REGULAR_MARGIN</option>
+                <option value="ISOLATED_MARGIN">ISOLATED_MARGIN</option>
+                <option value="PORTFOLIO_MARGIN">PORTFOLIO_MARGIN</option>
+              </select>
+            </label>
+            <button type="submit" class="btn-primary">Apply margin mode</button>
+          </form>
+          <div id="margin-result" class="result-msg"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><h2>Transfer Funds</h2></div>
+          <form id="transfer-form" class="form-grid">
+            <label>Direction
+              <select name="direction">
+                <option value="OUT">OUT (to spot/wallet)</option>
+                <option value="IN">IN (to futures)</option>
+              </select>
+            </label>
+            <label>Amount
+              <input name="amount" type="number" step="any" placeholder="40000" required />
+            </label>
+            <label>Quote asset
+              <select name="quote_asset">
+                <option value="INR">INR</option>
+                <option value="USDT">USDT</option>
+              </select>
+            </label>
+            <button type="submit" class="btn-danger">Transfer funds</button>
+          </form>
+          <div id="transfer-result" class="result-msg"></div>
+        </section>
       </div>
-      <div class="explorer-controls">
-        <input id="explorer-symbol" placeholder="Symbol (e.g. SOLUSDT) — used where applicable" />
-        <div id="explorer-buttons" class="explorer-buttons"></div>
-      </div>
-      <div id="explorer-result" class="explorer-result"><p class="muted" style="padding:14px">Pick a query above…</p></div>
-    </section>
+    </div>
+
+    <!-- ============ MARKETS ============ -->
+    <div class="pane" data-pane="markets" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Markets</h2>
+          <div class="panel-head-actions">
+            <input id="markets-filter" placeholder="Filter symbol…" />
+            <button id="markets-refresh" class="btn-ghost sm">Refresh</button>
+          </div>
+        </div>
+        <div id="markets-body" class="explorer-result"><p class="muted" style="padding:14px">Loading markets…</p></div>
+      </section>
+    </div>
+
+    <!-- ============ HISTORY ============ -->
+    <div class="pane" data-pane="history" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Closed PnL</h2>
+          <div class="panel-head-actions">
+            <input id="history-filter" placeholder="Filter symbol…" />
+            <button id="history-refresh" class="btn-ghost sm">Refresh</button>
+          </div>
+        </div>
+        <div id="history-summary" class="explorer-summary" hidden></div>
+        <div id="history-closed" class="explorer-result"><p class="muted" style="padding:14px">Open this tab to load history…</p></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Recent Trades</h2></div>
+        <div id="history-exec" class="explorer-result"><p class="muted" style="padding:14px">—</p></div>
+      </section>
+    </div>
+
+    <!-- ============ TOOLS (API Explorer) ============ -->
+    <div class="pane" data-pane="tools" hidden>
+      <section class="panel explorer-panel">
+        <div class="panel-head">
+          <h2>API Explorer</h2>
+          <span class="muted">read-only queries</span>
+        </div>
+        <div class="explorer-controls">
+          <input id="explorer-symbol" placeholder="Symbol (e.g. SOLUSDT) — used where applicable" />
+          <div id="explorer-buttons" class="explorer-buttons"></div>
+        </div>
+        <div id="explorer-result" class="explorer-result"><p class="muted" style="padding:14px">Pick a query above…</p></div>
+      </section>
+    </div>
   </main>
+
+  <div id="toasts" class="toasts"></div>
 
   <!-- Typed-confirm modal for write operations -->
   <div id="confirm-overlay" class="modal-overlay" hidden>

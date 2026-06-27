@@ -6,7 +6,84 @@
 const $ = (sel) => document.querySelector(sel);
 const settleCoin = () => state.settleCoin || "USDT";
 // tradeToken is held ONLY in memory for this tab — never persisted.
-const state = { role: null, settleCoin: "USDT", tradeToken: "", writeInFlight: false, orderLastPrice: null, prevPos: {} };
+const state = {
+  role: null,
+  settleCoin: "USDT",
+  tradeToken: "",
+  writeInFlight: false,
+  orderLastPrice: null,
+  prevPos: {},
+  lastPositions: [],
+  lastOrders: [],
+  expandedPos: new Set(),
+  expandedOrders: new Set(),
+  sortPos: { key: null, dir: 1 },
+  sortOrders: { key: null, dir: 1 },
+};
+
+// Non-blocking toast notifications for action outcomes.
+function toast(msg, type = "info", ms = 4500) {
+  const wrap = document.getElementById("toasts");
+  if (!wrap || !msg) return;
+  const el = document.createElement("div");
+  el.className = "toast " + (type || "");
+  el.textContent = msg;
+  wrap.appendChild(el);
+  setTimeout(() => {
+    el.classList.add("out");
+    setTimeout(() => el.remove(), 300);
+  }, ms);
+}
+
+// Client-side sort of an array of objects by a key (auto numeric vs string).
+function applySort(rows, sortState) {
+  if (!sortState || !sortState.key) return rows;
+  const k = sortState.key;
+  const dir = sortState.dir;
+  return rows.slice().sort((a, b) => {
+    const av = a[k];
+    const bv = b[k];
+    const an = Number(av);
+    const bn = Number(bv);
+    const numeric = av !== "" && bv !== "" && isFinite(an) && isFinite(bn);
+    if (numeric) return (an - bn) * dir;
+    return String(av ?? "").localeCompare(String(bv ?? "")) * dir;
+  });
+}
+
+// Reflect the active sort column/direction on the (static) table headers.
+function updateSortIndicators() {
+  [["#positions-table", state.sortPos], ["#orders-table", state.sortOrders]].forEach(([sel, st]) => {
+    const tbl = document.querySelector(sel);
+    if (!tbl) return;
+    tbl.querySelectorAll("thead th[data-sortkey]").forEach((th) => {
+      const active = th.dataset.sortkey === st.key;
+      th.setAttribute("data-dir", active ? (st.dir > 0 ? "asc" : "desc") : "");
+    });
+  });
+}
+
+// Small key/value detail grid for an expanded row. Skips empty values.
+function detailGrid(pairs) {
+  const items = pairs
+    .filter(([, v]) => v !== undefined && v !== null && v !== "" && v !== "—")
+    .map(([k, v]) => `<div><span class="dt-k">${esc(k)}</span><span class="dt-v mono">${esc(v)}</span></div>`)
+    .join("");
+  return `<div class="detail-grid">${items || '<span class="muted">No extra detail.</span>'}</div>`;
+}
+
+// Skeleton shimmer rows for the initial loading state.
+function renderLoading() {
+  const skel = (cols) =>
+    Array.from({ length: 5 }, () =>
+      "<tr>" + Array.from({ length: cols }, () => '<td><span class="skel"></span></td>').join("") + "</tr>"
+    ).join("");
+  const admin = state.role === "admin";
+  const pb = document.getElementById("positions-body");
+  const ob = document.getElementById("orders-body");
+  if (pb) pb.innerHTML = skel(admin ? 12 : 11);
+  if (ob) ob.innerHTML = skel(admin ? 8 : 7);
+}
 
 // Pick the account object from a wallet-balance payload that actually carries
 // the totals we need (defensive — never assume list[0]).
@@ -25,7 +102,7 @@ function walletAccount(balance) {
 // lifecycle, so only one write can ever be in progress at a time.
 async function withWriteLock(fn) {
   if (state.writeInFlight) {
-    alert("Another trading action is in progress — please wait for it to finish.");
+    toast("Another trading action is in progress — please wait.", "warn");
     return;
   }
   state.writeInFlight = true;
@@ -301,7 +378,8 @@ function renderSummary(d) {
 
 function renderPositions(positions) {
   const body = $("#positions-body");
-  const rows = (positions || []).filter((p) => Number(p.size) !== 0);
+  state.lastPositions = positions || [];
+  const rows = state.lastPositions.filter((p) => Number(p.size) !== 0);
   if (!rows.length) {
     body.innerHTML = `<tr><td colspan="12" class="muted center">No open positions</td></tr>`;
     return;
@@ -309,9 +387,12 @@ function renderPositions(positions) {
   const isAdmin = state.role === "admin";
   const hasVal = (v) => v !== undefined && v !== null && v !== "" && Number(v) !== 0;
   const nextPrev = {};
-  body.innerHTML = rows
+  const sorted = applySort(rows, state.sortPos);
+  body.innerHTML = sorted
     .map((p) => {
       const pnl = p.unrealisedPnl;
+      const key = `${p.symbol}/${p.positionIdx ?? 0}`;
+      const expanded = state.expandedPos.has(key);
       const actions = isAdmin
         ? `<td class="row-actions">
             <button class="btn-ghost sm" data-tpsl='${esc(JSON.stringify({
@@ -367,7 +448,6 @@ function renderPositions(positions) {
 
       // Change-flash on the PnL cell — only on a MEANINGFUL move, otherwise it
       // would flash every tick (PnL drifts constantly) and become pure noise.
-      const key = `${p.symbol}/${p.positionIdx ?? 0}`;
       const cur = Number(pnl);
       const prev = state.prevPos[key];
       let flash = "";
@@ -380,8 +460,21 @@ function renderPositions(positions) {
       }
       if (isFinite(cur)) nextPrev[key] = cur;
 
-      return `<tr>
-        <td class="mono">${esc(p.symbol)}</td>
+      const detail = detailGrid([
+        ["Break-even", hasVal(p.breakEvenPrice) ? fmtNum(p.breakEvenPrice, 4) : ""],
+        ["Initial margin", p.positionIM ? fmtNum(p.positionIM) : ""],
+        ["Maint. margin", p.positionMM ? fmtNum(p.positionMM) : ""],
+        ["Realized PnL", p.curRealisedPnl !== undefined && p.curRealisedPnl !== "" ? fmtNum(p.curRealisedPnl) : ""],
+        ["Cum. realized", p.cumRealisedPnl ? fmtNum(p.cumRealisedPnl) : ""],
+        ["Position value", fmtNum(p.positionValue)],
+        ["TP/SL mode", p.tpslMode],
+        ["Position idx", p.positionIdx],
+        ["Opened", fmtTime(p.createdTime)],
+        ["Updated", fmtTime(p.updatedTime)],
+      ]);
+
+      return `<tr class="exp-row${expanded ? " expanded" : ""}" data-pkey="${esc(key)}">
+        <td class="mono"><span class="caret">${expanded ? "▾" : "▸"}</span>${esc(p.symbol)}</td>
         <td class="${(p.side || "").toLowerCase() === "buy" ? "pos" : "neg"}">${esc(p.side)}</td>
         <td class="mono">${fmtNum(p.size, 4)}</td>
         <td class="mono">${fmtNum(p.avgPrice, 4)}${beSub}</td>
@@ -393,40 +486,81 @@ function renderPositions(positions) {
         <td class="mono">${tpCell}</td>
         <td class="mono">${slCell}</td>
         ${actions}
-      </tr>`;
+      </tr>
+      <tr class="detail-row"${expanded ? "" : " hidden"}><td colspan="99">${detail}</td></tr>`;
     })
     .join("");
   state.prevPos = nextPrev;
+  // Drop expanded-state for positions that no longer exist (avoid unbounded growth).
+  const liveKeys = new Set(sorted.map((p) => `${p.symbol}/${p.positionIdx ?? 0}`));
+  state.expandedPos.forEach((k) => { if (!liveKeys.has(k)) state.expandedPos.delete(k); });
+  updateSortIndicators();
 }
 
 function renderOrders(orders) {
   const body = $("#orders-body");
-  const rows = orders || [];
+  state.lastOrders = orders || [];
+  const rows = state.lastOrders;
   if (!rows.length) {
     body.innerHTML = `<tr><td colspan="8" class="muted center">No open orders</td></tr>`;
+    updateSortIndicators();
     return;
   }
   const isAdmin = state.role === "admin";
-  body.innerHTML = rows
+  const sorted = applySort(rows, state.sortOrders);
+  body.innerHTML = sorted
     .map((o) => {
+      const key = o.orderId || `${o.symbol}/${o.orderLinkId || ""}`;
+      const expanded = state.expandedOrders.has(key);
       const actions = isAdmin
         ? `<td><button class="btn-danger sm" data-cancel='${esc(JSON.stringify({
             symbol: o.symbol,
             orderId: o.orderId,
           }))}'>Cancel</button></td>`
         : "";
-      return `<tr>
-        <td class="mono">${esc(o.symbol)}</td>
+
+      // Fill progress + flags as small badges under the type cell.
+      const filled = Number(o.cumExecQty);
+      const total = Number(o.qty);
+      const fillSub =
+        isFinite(filled) && isFinite(total) && total > 0 && filled > 0
+          ? `<span class="cell-sub">${fmtNum(filled, 4)}/${fmtNum(total, 4)} filled</span>`
+          : "";
+      const badges =
+        (o.reduceOnly ? '<span class="badge">reduce</span>' : "") +
+        (o.closeOnTrigger ? '<span class="badge">close</span>' : "") +
+        (o.stopOrderType ? `<span class="badge">${esc(o.stopOrderType)}</span>` : "");
+
+      const detail = detailGrid([
+        ["Order ID", o.orderId],
+        ["Order link ID", o.orderLinkId],
+        ["Time in force", o.timeInForce],
+        ["Reduce only", o.reduceOnly === undefined ? "" : String(o.reduceOnly)],
+        ["Close on trigger", o.closeOnTrigger === undefined ? "" : String(o.closeOnTrigger)],
+        ["Stop order type", o.stopOrderType],
+        ["Trigger by", o.triggerBy],
+        ["Cum. exec qty", o.cumExecQty],
+        ["Leaves qty", o.leavesQty],
+        ["Created", fmtTime(o.createdTime)],
+        ["Updated", fmtTime(o.updatedTime)],
+      ]);
+
+      return `<tr class="exp-row${expanded ? " expanded" : ""}" data-okey="${esc(key)}">
+        <td class="mono"><span class="caret">${expanded ? "▾" : "▸"}</span>${esc(o.symbol)}</td>
         <td class="${(o.side || "").toLowerCase() === "buy" ? "pos" : "neg"}">${esc(o.side)}</td>
-        <td>${esc(o.orderType)}</td>
-        <td class="mono">${fmtNum(o.qty, 4)}</td>
+        <td>${esc(o.orderType)}${badges}</td>
+        <td class="mono">${fmtNum(o.qty, 4)}${fillSub}</td>
         <td class="mono">${o.price && Number(o.price) ? fmtNum(o.price, 4) : "—"}</td>
         <td class="mono">${o.triggerPrice && Number(o.triggerPrice) ? fmtNum(o.triggerPrice, 4) : "—"}</td>
         <td>${esc(o.orderStatus)}</td>
         ${actions}
-      </tr>`;
+      </tr>
+      <tr class="detail-row"${expanded ? "" : " hidden"}><td colspan="99">${detail}</td></tr>`;
     })
     .join("");
+  const liveKeys = new Set(sorted.map((o) => o.orderId || `${o.symbol}/${o.orderLinkId || ""}`));
+  state.expandedOrders.forEach((k) => { if (!liveKeys.has(k)) state.expandedOrders.delete(k); });
+  updateSortIndicators();
 }
 
 function renderErrors(errors) {
@@ -454,7 +588,7 @@ function renderDashboard(d) {
 // ---------------------------------------------------------------------------
 function ensureToken() {
   if (!state.tradeToken) {
-    alert("Enter the trade token (top of the admin panel) to unlock trading.");
+    toast("Enter the trade token (Trade tab) to unlock trading.", "warn");
     return false;
   }
   return true;
@@ -467,7 +601,7 @@ function parseRowData(el, attr) {
   try {
     return JSON.parse(el.getAttribute(attr));
   } catch (err) {
-    alert("Could not read position/order data — please refresh and retry.");
+    toast("Could not read position/order data — please refresh and retry.", "neg");
     return null;
   }
 }
@@ -495,8 +629,9 @@ document.addEventListener("click", async (e) => {
       closeBtn.disabled = true;
       try {
         await writeApi("/api/position/close", payload);
+        toast(`✓ Close order sent for ${payload.symbol}`, "pos");
       } catch (err) {
-        alert("Close failed: " + err.message);
+        toast("Close failed: " + err.message, "neg");
       } finally {
         closeBtn.disabled = false;
       }
@@ -515,13 +650,45 @@ document.addEventListener("click", async (e) => {
       cancelBtn.disabled = true;
       try {
         await writeApi("/api/order/cancel", payload);
+        toast(`✓ Cancel sent for ${payload.symbol}`, "pos");
       } catch (err) {
-        alert("Cancel failed: " + err.message);
+        toast("Cancel failed: " + err.message, "neg");
       } finally {
         cancelBtn.disabled = false;
       }
     });
   }
+});
+
+// Expand/collapse a position or order row (ignore clicks on the action buttons).
+document.addEventListener("click", (e) => {
+  if (e.target.closest("button, a, input, select")) return;
+  const posRow = e.target.closest("#positions-body tr.exp-row");
+  if (posRow) {
+    const key = posRow.dataset.pkey;
+    state.expandedPos.has(key) ? state.expandedPos.delete(key) : state.expandedPos.add(key);
+    renderPositions(state.lastPositions);
+    return;
+  }
+  const ordRow = e.target.closest("#orders-body tr.exp-row");
+  if (ordRow) {
+    const key = ordRow.dataset.okey;
+    state.expandedOrders.has(key) ? state.expandedOrders.delete(key) : state.expandedOrders.add(key);
+    renderOrders(state.lastOrders);
+  }
+});
+
+// Click a sortable column header to sort that table (toggles asc/desc).
+document.addEventListener("click", (e) => {
+  const th = e.target.closest("table.sortable thead th[data-sortkey]");
+  if (!th) return;
+  const table = th.closest("table");
+  const st = table.id === "positions-table" ? state.sortPos : state.sortOrders;
+  const key = th.dataset.sortkey;
+  if (st.key === key) st.dir *= -1;
+  else { st.key = key; st.dir = 1; }
+  if (table.id === "positions-table") renderPositions(state.lastPositions);
+  else renderOrders(state.lastOrders);
 });
 
 // ---------------------------------------------------------------------------
@@ -614,6 +781,7 @@ function openTpslModal(pos) {
         await writeApi("/api/position/trading-stop", body);
         out.textContent = "✓ TP/SL applied";
         out.className = "result-msg pos";
+        toast(`✓ TP/SL applied for ${pos.symbol}`, "pos");
         setTimeout(cleanup, 800);
       } catch (err) {
         out.textContent = "✗ " + err.message;
@@ -654,10 +822,13 @@ async function runWrite(submitBtn, out, gather) {
     if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = "Working…"; }
     try {
       const res = await writeApi(spec.path, spec.body);
-      if (out) { out.textContent = spec.successMsg(res); out.classList.add("pos"); }
+      const msg = spec.successMsg(res);
+      if (out) { out.textContent = msg; out.classList.add("pos"); }
+      if (msg) toast(msg, "pos");
       if (spec.onSuccess) spec.onSuccess();
     } catch (err) {
       if (out) { out.textContent = "✗ " + err.message; out.classList.add("neg"); }
+      toast(err.message, "neg");
     } finally {
       if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = prevLabel; }
     }
@@ -911,8 +1082,8 @@ function wireAdminForms() {
         path: "/api/order/cancel-all",
         body: {},
         confirmMsg: `Cancel ALL open orders for ${settleCoin()}.`,
-        successMsg: () => "",
-      })).catch((err) => alert("Cancel-all failed: " + err.message));
+        successMsg: () => "✓ Cancel-all sent",
+      })).catch((err) => toast("Cancel-all failed: " + err.message, "neg"));
     });
   }
 
@@ -1245,6 +1416,117 @@ function wireExplorer() {
 }
 
 // ---------------------------------------------------------------------------
+// Tabs + Markets + History (read-only, available to both roles)
+// ---------------------------------------------------------------------------
+function wireTabs() {
+  const tabs = document.getElementById("tabs");
+  if (!tabs) return;
+  const panes = document.querySelectorAll("main .pane");
+  const show = (name) => {
+    tabs.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+    panes.forEach((p) => { p.hidden = p.dataset.pane !== name; });
+    if (name !== "markets") clearInterval(_marketsTimer); // stop polling when away
+    if (name === "markets") onMarketsActive();
+    if (name === "history") onHistoryActive();
+  };
+  tabs.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => show(b.dataset.tab)));
+}
+
+let _marketsData = null;
+let _marketsTimer = null;
+async function fetchMarkets() {
+  const body = document.getElementById("markets-body");
+  try {
+    _marketsData = await api("/api/tickers");
+    renderMarkets();
+  } catch (e) {
+    if (body) body.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(e.message)}</p>`;
+  }
+}
+function renderMarkets() {
+  const body = document.getElementById("markets-body");
+  if (!body) return;
+  const filter = (document.getElementById("markets-filter").value || "").trim().toUpperCase();
+  let list = listOf(_marketsData);
+  if (filter) list = list.filter((t) => String(t.symbol || "").toUpperCase().includes(filter));
+  if (!list.length) { body.innerHTML = emptyMsg("No matching symbols"); return; }
+  list = list.slice().sort((a, b) => (Number(b.turnover24h) || 0) - (Number(a.turnover24h) || 0));
+  body.innerHTML = buildTable(list.slice(0, 200), [
+    { label: "Symbol", get: (t) => t.symbol },
+    { label: "Last", get: (t) => t.lastPrice },
+    { label: "Mark", get: (t) => t.markPrice },
+    { label: "24h %", get: (t) => pct(t.price24hPcnt), cls: (t) => pnlClass(t.price24hPcnt) },
+    { label: "24h High", get: (t) => t.highPrice24h },
+    { label: "24h Low", get: (t) => t.lowPrice24h },
+    { label: "Funding", get: (t) => t.fundingRate },
+    { label: "Open Int", get: (t) => t.openInterest },
+    { label: "Turnover 24h", get: (t) => t.turnover24h },
+  ]) + (list.length > 200 ? `<p class="muted" style="padding:8px 16px">Showing top 200 by turnover. Filter to narrow.</p>` : "");
+}
+function onMarketsActive() {
+  if (!_marketsData) fetchMarkets();
+  clearInterval(_marketsTimer);
+  _marketsTimer = setInterval(() => {
+    const pane = document.querySelector('[data-pane="markets"]');
+    if (pane && !pane.hidden) fetchMarkets();
+    else clearInterval(_marketsTimer);
+  }, 15000);
+}
+
+let _historyLoaded = false;
+async function fetchHistory() {
+  const filter = (document.getElementById("history-filter").value || "").trim().toUpperCase();
+  const symParam = filter ? `?symbol=${encodeURIComponent(filter)}` : "";
+  const closedEl = document.getElementById("history-closed");
+  const execEl = document.getElementById("history-exec");
+  const sumEl = document.getElementById("history-summary");
+  closedEl.innerHTML = `<p class="muted" style="padding:14px">Loading…</p>`;
+  try {
+    const closed = await api("/api/closed-pnl" + symParam);
+    const list = listOf(closed);
+    const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
+    const todayMs = startOfDay.getTime();
+    let total = 0, today = 0, wins = 0;
+    list.forEach((r) => {
+      const v = Number(r.closedPnl) || 0;
+      total += v;
+      if (v > 0) wins++;
+      const t = Number(r.updatedTime ?? r.createdTime);
+      if (isFinite(t) && t >= todayMs) today += v;
+    });
+    sumEl.hidden = false;
+    sumEl.innerHTML =
+      `Realized today: <span class="${pnlClass(today)}">${fmtNum(today)} ${esc(settleCoin())}</span> · ` +
+      `Total (recent ${list.length}): <span class="${pnlClass(total)}">${fmtNum(total)}</span> · ` +
+      `Win rate: ${list.length ? Math.round((wins / list.length) * 100) : 0}%`;
+    closedEl.innerHTML = renderClosedPnl(closed);
+  } catch (e) {
+    sumEl.hidden = true;
+    closedEl.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(e.message)}</p>`;
+  }
+  try {
+    const exec = await api("/api/executions" + symParam);
+    execEl.innerHTML = renderExecutions(exec);
+  } catch (e) {
+    execEl.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(e.message)}</p>`;
+  }
+}
+function onHistoryActive() {
+  if (!_historyLoaded) { _historyLoaded = true; fetchHistory(); }
+}
+
+function wireMarketsHistory() {
+  const mf = document.getElementById("markets-filter");
+  if (mf) mf.addEventListener("input", () => { if (_marketsData) renderMarkets(); });
+  const mr = document.getElementById("markets-refresh");
+  if (mr) mr.addEventListener("click", fetchMarkets);
+  const hr = document.getElementById("history-refresh");
+  if (hr) hr.addEventListener("click", fetchHistory);
+  const hf = document.getElementById("history-filter");
+  if (hf) hf.addEventListener("keydown", (e) => { if (e.key === "Enter") fetchHistory(); });
+}
+
+// ---------------------------------------------------------------------------
 // Live WebSocket feed (with auto-reconnect)
 // ---------------------------------------------------------------------------
 function setConn(stateName) {
@@ -1323,6 +1605,9 @@ function connectWS() {
   }
   wireAdminForms();
   wireExplorer();
+  wireTabs();
+  wireMarketsHistory();
+  renderLoading(); // skeleton rows until the first snapshot lands
   // Render an immediate snapshot, then rely on the WS for live updates.
   try {
     const d = await api("/api/dashboard");
