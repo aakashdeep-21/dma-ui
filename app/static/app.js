@@ -6,7 +6,7 @@
 const $ = (sel) => document.querySelector(sel);
 const settleCoin = () => state.settleCoin || "USDT";
 // tradeToken is held ONLY in memory for this tab — never persisted.
-const state = { role: null, settleCoin: "USDT", tradeToken: "", writeInFlight: false };
+const state = { role: null, settleCoin: "USDT", tradeToken: "", writeInFlight: false, orderLastPrice: null };
 
 // Global single-flight lock for ALL write actions. The live tables are rebuilt
 // via innerHTML every few seconds, which destroys the button nodes a per-button
@@ -43,6 +43,60 @@ function fmtNum(value, digits = 2) {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
   });
+}
+
+// --- Projected PnL at a TP/SL price ---------------------------------------
+// Bybit exposes no projected-PnL field, so we compute it. For LINEAR (USDT)
+// contracts the gross result of exiting `size` at `exitPrice` is
+// (exit - entry) * size for a long (sign-flipped for a short) — this is exactly
+// Bybit's documented closedPnl = cumExitValue - cumEntryValue (minus fees),
+// where cumValue = price * qty for linear.
+//
+// Fee policy (per account): taker 0.035%, maker 0.014%. TP/SL in Full mode
+// trigger MARKET exits, so the exit fee is the TAKER fee. We subtract ONLY the
+// exit fee (the entry fee is already reflected in an existing position's
+// realised PnL, and is excluded for new orders by request).
+// Account fee rate confirmed 2026-06 (taker tier). TP/SL in Full mode are
+// MARKET exits, so the exit leg always pays the TAKER fee. This rate affects
+// ONLY the displayed projected-PnL estimate — never an order/TP/SL we send.
+// If the account's fee tier changes, update this value.
+const TAKER_FEE_RATE = 0.00035; // 0.035%
+
+// Returns { net, gross, exitFee, roi } or null if inputs are incomplete.
+// roi is null when leverage is unknown (e.g. the order form).
+function projectedPnl({ side, entry, exitPrice, size, leverage }) {
+  const e = Number(entry);
+  const x = Number(exitPrice);
+  const q = Number(size);
+  if (!(e > 0) || !(x > 0) || !(q > 0)) return null;
+  const isLong = String(side).toLowerCase() === "buy";
+  const gross = isLong ? (x - e) * q : (e - x) * q;
+  const exitFee = x * q * TAKER_FEE_RATE; // market exit => taker
+  const net = gross - exitFee;
+  let roi = null;
+  const lev = Number(leverage);
+  if (lev > 0) {
+    const margin = (e * q) / lev;
+    if (margin > 0) roi = (net / margin) * 100;
+  }
+  return { net, gross, exitFee, roi };
+}
+
+// Single source of truth for the colored "<net> (<roi>%)" markup, shared by the
+// table badge, the TP/SL modal preview and the order-form preview so they can
+// never diverge. `r` is a projectedPnl() result.
+function projAmount(r, withRoi) {
+  if (!r) return "";
+  const roi =
+    withRoi && r.roi != null ? ` (${r.roi >= 0 ? "+" : ""}${r.roi.toFixed(2)}%)` : "";
+  return `<span class="${pnlClass(r.net)}">${fmtNum(r.net)}${roi}</span>`;
+}
+
+// Small projected net PnL (ROI%) badge for a table cell.
+function projHintHTML(args) {
+  const r = projectedPnl(args);
+  if (!r) return "";
+  return `<div class="pnl-hint">${projAmount(r, true)}</div>`;
 }
 
 function pnlClass(value) {
@@ -210,6 +264,8 @@ function renderPositions(positions) {
               symbol: p.symbol,
               positionIdx: p.positionIdx ?? 0,
               side: p.side,
+              size: p.size,
+              leverage: p.leverage,
               avgPrice: p.avgPrice,
               markPrice: p.markPrice,
               takeProfit: p.takeProfit,
@@ -223,6 +279,12 @@ function renderPositions(positions) {
             }))}'>Close</button>
           </td>`
         : "";
+      const tpCell = hasVal(p.takeProfit)
+        ? `${fmtNum(p.takeProfit, 4)}${projHintHTML({ side: p.side, entry: p.avgPrice, exitPrice: p.takeProfit, size: p.size, leverage: p.leverage })}`
+        : "—";
+      const slCell = hasVal(p.stopLoss)
+        ? `${fmtNum(p.stopLoss, 4)}${projHintHTML({ side: p.side, entry: p.avgPrice, exitPrice: p.stopLoss, size: p.size, leverage: p.leverage })}`
+        : "—";
       return `<tr>
         <td class="mono">${esc(p.symbol)}</td>
         <td class="${(p.side || "").toLowerCase() === "buy" ? "pos" : "neg"}">${esc(p.side)}</td>
@@ -232,8 +294,8 @@ function renderPositions(positions) {
         <td class="mono">${esc(p.leverage ?? "—")}x</td>
         <td class="mono">${fmtNum(p.positionValue)}</td>
         <td class="mono ${pnlClass(pnl)}">${fmtNum(pnl)}</td>
-        <td class="mono pos">${hasVal(p.takeProfit) ? fmtNum(p.takeProfit, 4) : "—"}</td>
-        <td class="mono neg">${hasVal(p.stopLoss) ? fmtNum(p.stopLoss, 4) : "—"}</td>
+        <td class="mono">${tpCell}</td>
+        <td class="mono">${slCell}</td>
         ${actions}
       </tr>`;
     })
@@ -379,11 +441,29 @@ function openTpslModal(pos) {
   const slInput = $("#tpsl-sl");
   const trigger = $("#tpsl-trigger");
   const out = $("#tpsl-result");
+  const preview = $("#tpsl-preview");
   const applyBtn = $("#tpsl-apply");
   const cancelBtn = $("#tpsl-cancel");
 
   const cur = (v) =>
     v !== undefined && v !== null && v !== "" && Number(v) !== 0 ? String(v) : "";
+
+  // Live "projected net PnL (ROI%)" preview as the user types a TP/SL price.
+  const previewLine = (label, price) => {
+    const r = projectedPnl({
+      side: pos.side, entry: pos.avgPrice, exitPrice: price, size: pos.size, leverage: pos.leverage,
+    });
+    if (!r) return "";
+    return `<div>${label} @ ${esc(price)}: ${projAmount(r, true)} ${esc(settleCoin())} <span class="muted">net of exit fee</span></div>`;
+  };
+  const updatePreview = () => {
+    const tp = tpInput.value.trim();
+    const sl = slInput.value.trim();
+    let html = "";
+    if (tp && Number(tp) > 0) html += previewLine("TP", tp);
+    if (sl && Number(sl) > 0) html += previewLine("SL", sl);
+    preview.innerHTML = html;
+  };
 
   $("#tpsl-title").textContent = `Set TP / SL — ${pos.symbol}`;
   $("#tpsl-context").textContent = `${pos.side} · entry ${fmtNum(pos.avgPrice, 4)} · mark ${fmtNum(pos.markPrice, 4)}`;
@@ -393,6 +473,7 @@ function openTpslModal(pos) {
   out.textContent = "";
   out.className = "result-msg";
   overlay.hidden = false;
+  updatePreview();
   tpInput.focus();
 
   const cleanup = () => {
@@ -401,6 +482,8 @@ function openTpslModal(pos) {
     cancelBtn.removeEventListener("click", onCancel);
     overlay.removeEventListener("click", onOverlay);
     document.removeEventListener("keydown", onKey);
+    tpInput.removeEventListener("input", updatePreview);
+    slInput.removeEventListener("input", updatePreview);
     _tpslOpen = false;
   };
   const onCancel = () => cleanup();
@@ -448,6 +531,8 @@ function openTpslModal(pos) {
   cancelBtn.addEventListener("click", onCancel);
   overlay.addEventListener("click", onOverlay);
   document.addEventListener("keydown", onKey);
+  tpInput.addEventListener("input", updatePreview);
+  slInput.addEventListener("input", updatePreview);
 }
 
 // Run a token-gated write while disabling its submit button. The trade token
@@ -486,15 +571,36 @@ function wireTradeToken() {
   const field = $("#trade-token");
   const status = $("#token-status");
   if (!field) return;
-  const sync = () => {
-    state.tradeToken = field.value.trim();
-    if (state.tradeToken) {
-      status.textContent = "READY";
-      status.className = "token-status ready";
-    } else {
-      status.textContent = "LOCKED";
-      status.className = "token-status locked";
+  let timer;
+  const setStatus = (text, cls) => {
+    status.textContent = text;
+    status.className = "token-status " + cls;
+  };
+  // Verify the token with the server (debounced) so the user sees VALID/INVALID
+  // the moment they enter it, not only when they first try to trade.
+  const verify = async (token) => {
+    try {
+      const res = await api("/api/verify-trade-token", {
+        method: "POST",
+        body: JSON.stringify({ token }),
+      });
+      if (field.value.trim() !== token) return; // field changed since request
+      setStatus(res.valid ? "VALID" : "INVALID", res.valid ? "ready" : "invalid");
+    } catch (e) {
+      if (field.value.trim() !== token) return;
+      setStatus("CHECK FAILED", "invalid");
     }
+  };
+  const sync = () => {
+    const token = field.value.trim();
+    state.tradeToken = token;
+    clearTimeout(timer);
+    if (!token) {
+      setStatus("LOCKED", "locked");
+      return;
+    }
+    setStatus("CHECKING…", "checking");
+    timer = setTimeout(() => verify(token), 400);
   };
   field.addEventListener("input", sync);
   sync();
@@ -556,10 +662,81 @@ function wireAdminForms() {
         body,
         confirmMsg: `Submit ${body.side} ${body.orderType} order: ${body.qty} ${body.symbol}${priceTxt}${body.reduceOnly ? " (reduce-only)" : ""}${tpslTxt}.`,
         successMsg: (res) => "✓ Order submitted" + (res.result?.orderId ? ` (${res.result.orderId})` : ""),
-        onSuccess: () => { f.reset(); syncLimit(); },
+        onSuccess: () => { f.reset(); syncLimit(); updateOrderPreview(); },
       };
     });
   });
+
+  // --- live projected-PnL preview for the order form ---
+  // Entry is the limit price for Limit orders; for Market orders we use the
+  // symbol's live last price (from the tickers API) as an estimate. ROI is
+  // omitted here because the form has no leverage input; $ only.
+  const orderForm = $("#order-form");
+  const orderPreview = $("#order-pnl-preview");
+  let _lastPriceTimer;
+
+  // Declared as hoisted functions (not const arrows) so the order-form
+  // onSuccess closure above can call updateOrderPreview regardless of source
+  // ordering — avoids any "before initialization" footgun on the trade path.
+  async function fetchMarketPrice(symbol) {
+    if (!symbol) return;
+    try {
+      const data = await api(`/api/tickers?symbol=${encodeURIComponent(symbol)}`);
+      const t = ((data.result && data.result.list) || [])[0];
+      if (t && t.lastPrice) state.orderLastPrice = { symbol, price: t.lastPrice };
+    } catch (e) {
+      /* preview simply won't render for market until a price is available */
+    }
+    updateOrderPreview();
+  }
+
+  function updateOrderPreview() {
+    const symbol = orderForm.symbol.value.trim().toUpperCase();
+    const side = orderForm.side.value;
+    const qty = orderForm.qty.value.trim();
+    const isLimit = orderForm.orderType.value === "Limit";
+    const tp = orderForm.takeProfit.value.trim();
+    const sl = orderForm.stopLoss.value.trim();
+    let entry = "";
+    let estimate = false;
+    if (isLimit) {
+      entry = orderForm.price.value.trim();
+    } else if (state.orderLastPrice && state.orderLastPrice.symbol === symbol) {
+      entry = state.orderLastPrice.price;
+      estimate = true;
+    }
+    if (!entry || !qty || (!tp && !sl) || orderForm.reduceOnly.checked) {
+      orderPreview.innerHTML = "";
+      return;
+    }
+    const line = (label, price) => {
+      if (!(Number(price) > 0)) return "";
+      const r = projectedPnl({ side, entry, exitPrice: price, size: qty });
+      if (!r) return "";
+      const note = estimate ? `net of exit fee · est. entry ${esc(entry)}` : "net of exit fee";
+      return `<div>${label} @ ${esc(price)}: ${projAmount(r, false)} ${esc(settleCoin())} <span class="muted">${note}</span></div>`;
+    };
+    orderPreview.innerHTML = line("TP", tp) + line("SL", sl);
+  }
+
+  // A preview must never interfere with typing into the order form: any error
+  // here is swallowed so it can't disrupt the (separate) submit handler.
+  ["input", "change"].forEach((ev) =>
+    orderForm.addEventListener(ev, (e) => {
+      try {
+        if (e.target.name === "symbol" || e.target.name === "orderType") {
+          if (orderForm.orderType.value === "Market") {
+            const sym = orderForm.symbol.value.trim().toUpperCase();
+            clearTimeout(_lastPriceTimer);
+            _lastPriceTimer = setTimeout(() => fetchMarketPrice(sym), 400);
+          }
+        }
+        updateOrderPreview();
+      } catch (err) {
+        console.debug("order preview update failed", err);
+      }
+    })
+  );
 
   $("#leverage-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -939,8 +1116,12 @@ function setConn(stateName) {
 function connectWS() {
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${window.location.host}/ws`);
+  let opened = false;
 
-  ws.onopen = () => setConn("live");
+  ws.onopen = () => {
+    opened = true;
+    setConn("live");
+  };
   ws.onmessage = (evt) => {
     let msg;
     try {
@@ -962,8 +1143,23 @@ function connectWS() {
       label.classList.add("neg");
     }
   };
-  ws.onclose = () => {
+  ws.onclose = (evt) => {
+    // 1008 = server explicitly revoked this (accepted) session — e.g. a newer
+    // login evicted us under the single-session rule. Redirect to login.
+    if (evt && evt.code === 1008) {
+      window.location.href = "/login";
+      return;
+    }
     setConn("off");
+    if (!opened) {
+      // The socket never upgraded. Browsers report an auth/handshake rejection
+      // as 1006 (indistinguishable from a network drop), so don't blindly
+      // reconnect-loop: probe /api/me — api() redirects to /login on 401, and
+      // otherwise we reconnect. finally() reconnects on success/network errors;
+      // on a 401 the redirect has already navigated away.
+      api("/api/me").finally(() => setTimeout(connectWS, 3000));
+      return;
+    }
     setTimeout(connectWS, 3000);
   };
   ws.onerror = () => ws.close();

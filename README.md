@@ -112,9 +112,23 @@ accidental double-submission.
   The custom `X-Trade-Token` header also blocks cross-site (CSRF) writes.
 - Session cookie is `HttpOnly` + `Secure` + `SameSite=Lax`; the WebSocket
   rejects cross-origin handshakes.
+- **Single active session (global):** only one login is active at a time across
+  the whole terminal. Any new login (any account, any tab, any device)
+  immediately evicts the previous one — the old tab is redirected to `/login`
+  (within one live-feed cycle, ~`POLL_INTERVAL`s, or on its next request). The
+  active session id is tracked **in memory**, which means: run exactly **one
+  Railway replica**, and a restart/redeploy logs everyone out (just log back
+  in). No security downside — the cookie itself stays cryptographically signed.
 - The original `sign_server.py` and `dma-api.json` (kept out of git) had real
   third-party secrets; those were replaced with placeholders. **Rotate any
   exposed keys** regardless.
+- **Brute force:** credential and trade-token checks are constant-time, but the
+  app does **not** rate-limit `/api/login` (an in-app limiter on Railway would
+  either key on the shared proxy IP or the spoofable `X-Forwarded-For`). Put
+  brute-force protection at the **edge** (Cloudflare / Railway) and use
+  **strong, high-entropy** values for `ADMIN_PASSWORD`, `VIEWER_PASSWORD` and
+  `TRADE_TOKEN` (the trade token in particular should stay a long random
+  string, e.g. `secrets.token_hex(24)`).
 
 ## Integrated endpoints
 
@@ -130,6 +144,14 @@ take-profit / stop-loss), set TP/SL on an existing position
 (`/v5/position/trading-stop`, Full mode, positionIdx re-derived from the live
 position), cancel order, cancel-all, close position, set leverage, set margin
 mode, transfer funds.
+
+**Projected PnL at TP/SL:** Bybit exposes no projected-PnL field, so it is
+computed client-side as `(exit − entry) × size` (linear; sign-flipped for
+shorts) **minus the exit fee** (taker 0.035%, since Full-mode TP/SL are market
+exits). The entry fee is excluded (it's already in an open position's realised
+PnL). Shown under the TP/SL columns, live in the TP/SL modal, and in the order
+form (with ROI% where leverage is known). Figures are net of the exit fee only;
+funding is not included.
 
 The **API Explorer** panel calls any read endpoint ad-hoc (with an optional
 symbol) and renders the result as a **formatted table** (with a collapsible

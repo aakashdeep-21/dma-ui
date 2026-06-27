@@ -99,7 +99,9 @@ if _missing_env:
 def current_user(request: Request) -> dict:
     token = request.cookies.get(auth.COOKIE_NAME)
     user = auth.verify_session_token(token)
-    if not user:
+    # Enforce the single active session: a valid-but-superseded cookie (an older
+    # tab/device after a newer login elsewhere) is rejected as not authenticated.
+    if not user or not auth.is_active_session(user.get("sid")):
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user
 
@@ -248,7 +250,11 @@ def api_login(payload: dict = Body(...)):
     if not role:
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    token = auth.create_session_token(username, role)
+    # Mint a new session id and make it THE active session — this evicts any
+    # other logged-in session (global single-session).
+    sid = auth.new_session_id()
+    auth.set_active_session(sid)
+    token = auth.create_session_token(username, role, sid)
     resp = JSONResponse({"username": username, "role": role})
     resp.set_cookie(
         key=auth.COOKIE_NAME,
@@ -262,7 +268,12 @@ def api_login(payload: dict = Body(...)):
 
 
 @app.post("/api/logout")
-def api_logout():
+def api_logout(request: Request):
+    # Only clear the active session if this cookie IS the active one (so a stale
+    # tab's logout can't evict a newer session).
+    data = auth.verify_session_token(request.cookies.get(auth.COOKIE_NAME))
+    if data:
+        auth.clear_active_session(data.get("sid"))
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(auth.COOKIE_NAME)
     return resp
@@ -271,6 +282,16 @@ def api_logout():
 @app.get("/api/me")
 def api_me(user: dict = Depends(current_user)):
     return {"username": user.get("u"), "role": user.get("r")}
+
+
+@app.post("/api/verify-trade-token")
+def api_verify_trade_token(payload: dict = Body(...), user: dict = Depends(require_admin)):
+    """Check whether a trade token is correct so the UI can give immediate
+    feedback when it's entered (instead of only failing on the first write).
+    Admin-only and constant-time; the token is high-entropy so this oracle is
+    not a practical brute-force risk.
+    """
+    return {"valid": auth.verify_trade_token(payload.get("token") or "")}
 
 
 # --------------------------------------------------------------------------
@@ -587,13 +608,18 @@ async def ws_feed(websocket: WebSocket):
         return
     token = websocket.cookies.get(auth.COOKIE_NAME)
     user = auth.verify_session_token(token)
-    if not user:
+    if not user or not auth.is_active_session(user.get("sid")):
         await websocket.close(code=1008)
         return
 
     await websocket.accept()
     try:
         while True:
+            # If this session was superseded by a newer login elsewhere, close
+            # with 1008 so the (now evicted) tab redirects itself to /login.
+            if not auth.is_active_session(user.get("sid")):
+                await websocket.close(code=1008)
+                return
             try:
                 data = await build_dashboard()
             except dma_client.DMAError as exc:

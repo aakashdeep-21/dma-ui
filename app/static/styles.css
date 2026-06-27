@@ -183,6 +183,18 @@ button:disabled { opacity: 0.5; cursor: default; }
 .result-msg { padding: 0 16px 16px; font-size: 13px; min-height: 16px; }
 .limit-only { display: none; }
 
+/* Projected PnL hint under a TP/SL table cell */
+.pnl-hint { font-size: 11px; font-weight: 600; margin-top: 2px; }
+
+/* Projected PnL preview block (TP/SL modal + order form) */
+.pnl-preview { font-size: 12.5px; line-height: 1.6; }
+.pnl-preview:not(:empty) {
+  margin: 4px 0 2px; padding: 10px 12px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+}
+.pnl-preview .muted { font-size: 11px; }
+.modal .pnl-preview:not(:empty) { margin-top: 12px; }
+
 /* ---------- API Explorer ---------- */
 .explorer-controls { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
 #explorer-symbol {
@@ -226,6 +238,8 @@ table.kv td { text-align: left; }
 .token-help { font-size: 11px; margin: 0; line-height: 1.5; }
 .token-status { font-size: 11px; padding: 3px 10px; border-radius: 20px; font-weight: 700; letter-spacing: 0.04em; }
 .token-status.locked { background: rgba(255,92,108,0.18); color: var(--neg); }
+.token-status.invalid { background: rgba(255,92,108,0.18); color: var(--neg); }
+.token-status.checking { background: rgba(245,166,35,0.15); color: #f5a623; }
 .token-status.ready { background: rgba(27,207,138,0.18); color: var(--pos); }
 
 /* ---------- Confirm modal ---------- */
