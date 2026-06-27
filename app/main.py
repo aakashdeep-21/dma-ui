@@ -28,6 +28,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
+from starlette.responses import Response as StarletteResponse
 
 from . import auth, dma_client
 from .config import settings
@@ -205,12 +206,17 @@ async def build_dashboard() -> dict:
     }
 
 
+# Force browsers to revalidate the HTML shell on every load so a deploy's new
+# markup is never paired with a stale cached app.js/styles.css.
+_NO_CACHE = {"Cache-Control": "no-cache"}
+
+
 # --------------------------------------------------------------------------
 # Page routes
 # --------------------------------------------------------------------------
 @app.get("/login")
 def login_page():
-    return FileResponse(STATIC_DIR / "login.html")
+    return FileResponse(STATIC_DIR / "login.html", headers=_NO_CACHE)
 
 
 @app.get("/")
@@ -218,7 +224,7 @@ def index(request: Request):
     token = request.cookies.get(auth.COOKIE_NAME)
     if not auth.verify_session_token(token):
         return RedirectResponse(url="/login", status_code=302)
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "index.html", headers=_NO_CACHE)
 
 
 @app.get("/healthz")
@@ -607,5 +613,18 @@ async def ws_feed(websocket: WebSocket):
             pass
 
 
+class NoCacheStaticFiles(StaticFiles):
+    """Serve static assets with Cache-Control: no-cache so browsers always
+    revalidate. The server still returns 304 when the file is unchanged (cheap),
+    but immediately after a deploy the browser fetches the new app.js/styles.css
+    instead of pairing fresh HTML with a stale cached script.
+    """
+
+    def file_response(self, *args, **kwargs) -> StarletteResponse:
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
 # Static assets (css/js). Mounted last so it doesn't shadow API routes.
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
