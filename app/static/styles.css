@@ -26,6 +26,7 @@ body {
 .center { text-align: center; }
 .pos { color: var(--pos); }
 .neg { color: var(--neg); }
+.warn { color: #f5a623; }
 .flat { color: var(--text); }
 
 /* ---------- Login ---------- */
@@ -273,3 +274,49 @@ table.kv td { text-align: left; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 .modal-actions button { padding: 9px 16px; }
 .modal-actions .btn-danger:disabled { opacity: 0.4; cursor: default; }
+
+/* ===== UI refresh — account health, richer cells, toggles, flash ===== */
+
+/* Top-bar account-health extras */
+.stat-sub { font-size: 11px; color: var(--muted); margin-top: 1px; font-variant-numeric: tabular-nums; }
+.stat-sub.pos { color: var(--pos); }
+.stat-sub.neg { color: var(--neg); }
+.meter { height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; margin-top: 5px; width: 96px; }
+.meter > span { display: block; height: 100%; border-radius: 3px; background: var(--pos); transition: width .4s ease, background .4s ease; }
+.meter.warn > span { background: #f5a623; }
+.meter.danger > span { background: var(--neg); }
+
+/* Sub-hints inside table cells (break-even, ROE%, liq distance) */
+.cell-sub { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; font-weight: 600; }
+.cell-sub.pos { color: var(--pos); }
+.cell-sub.neg { color: var(--neg); }
+.cell-sub.warn { color: #f5a623; }
+
+/* Segmented toggle (Buy/Sell, Market/Limit) — the real <select> is sr-only */
+.segment { display: flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.segment button {
+  flex: 1; background: var(--bg); color: var(--muted); border: none;
+  padding: 9px 0; font-size: 13px; font-weight: 600; cursor: pointer; transition: background .15s, color .15s;
+}
+.segment button + button { border-left: 1px solid var(--border); }
+.segment button.active { color: #fff; }
+.segment button.active.seg-buy { background: var(--pos); }
+.segment button.active.seg-sell { background: var(--neg); }
+.segment button.active.seg-neutral { background: var(--accent); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0; }
+
+/* Notional value hint under the quantity field */
+.notional-hint { font-size: 11px; color: var(--muted); margin-top: -4px; min-height: 14px; font-variant-numeric: tabular-nums; }
+
+/* Change-flash on live cell updates */
+@keyframes flashUp { from { background: rgba(27,207,138,0.28); } to { background: transparent; } }
+@keyframes flashDown { from { background: rgba(255,92,108,0.28); } to { background: transparent; } }
+td.flash-up { animation: flashUp .8s ease-out; }
+td.flash-down { animation: flashDown .8s ease-out; }
+
+/* Skeleton shimmer for loading rows */
+@keyframes shimmer { 0% { opacity: .35; } 50% { opacity: .75; } 100% { opacity: .35; } }
+.skel { display: inline-block; height: 10px; width: 64%; border-radius: 4px; background: var(--border); animation: shimmer 1.2s infinite; }
+
+/* Tooltipped headers */
+th[title] { cursor: help; text-decoration: underline dotted rgba(139,151,167,0.45); text-underline-offset: 3px; }

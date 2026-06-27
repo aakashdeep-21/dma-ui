@@ -6,7 +6,17 @@
 const $ = (sel) => document.querySelector(sel);
 const settleCoin = () => state.settleCoin || "USDT";
 // tradeToken is held ONLY in memory for this tab — never persisted.
-const state = { role: null, settleCoin: "USDT", tradeToken: "", writeInFlight: false, orderLastPrice: null };
+const state = { role: null, settleCoin: "USDT", tradeToken: "", writeInFlight: false, orderLastPrice: null, prevPos: {} };
+
+// Pick the account object from a wallet-balance payload that actually carries
+// the totals we need (defensive — never assume list[0]).
+function walletAccount(balance) {
+  const list = balance?.result?.list || [];
+  for (const acct of list) {
+    if (acct && (acct.totalEquity !== undefined || acct.totalWalletBalance !== undefined)) return acct;
+  }
+  return list[0] || null;
+}
 
 // Global single-flight lock for ALL write actions. The live tables are rebuilt
 // via innerHTML every few seconds, which destroys the button nodes a per-button
@@ -43,6 +53,12 @@ function fmtNum(value, digits = 2) {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
   });
+}
+
+// Consistent percent formatting (single source so sign/precision never drift).
+function fmtPct(n, withSign = true) {
+  if (!isFinite(n)) return "";
+  return `${withSign && n >= 0 ? "+" : ""}${n.toFixed(2)}%`;
 }
 
 // --- Projected PnL at a TP/SL price ---------------------------------------
@@ -214,36 +230,73 @@ $("#logout-btn").addEventListener("click", async () => {
 function renderSummary(d) {
   const summary = d.summary || {};
   state.settleCoin = summary.settleCoin || state.settleCoin;
+  const coin = settleCoin();
 
+  const upl = Number(summary.totalUnrealisedPnl);
   const pnlEl = $("#stat-pnl");
-  pnlEl.textContent = `${fmtNum(summary.totalUnrealisedPnl)} ${settleCoin()}`;
+  pnlEl.textContent = `${fmtNum(summary.totalUnrealisedPnl)} ${coin}`;
   pnlEl.className = "stat-value " + pnlClass(summary.totalUnrealisedPnl);
 
   $("#stat-positions").textContent = summary.openPositions ?? "—";
   $("#stat-orders").textContent = summary.openOrders ?? "—";
 
-  // Wallet equity (Bybit-style nested structure). Be defensive: never show a
-  // wrong number — fall back to the settle-coin entry, else show "—".
-  let equity = "—";
-  try {
-    const list = d.balance?.result?.list || [];
-    for (const acct of list) {
-      const top = acct.totalEquity ?? acct.totalWalletBalance;
-      if (top !== undefined && top !== "" && isFinite(Number(top))) {
-        equity = `${fmtNum(top)} ${settleCoin()}`;
-        break;
-      }
-      const coin = (acct.coin || []).find((c) => c.coin === settleCoin());
-      const ceq = coin?.equity ?? coin?.walletBalance;
-      if (ceq !== undefined && ceq !== "" && isFinite(Number(ceq))) {
-        equity = `${fmtNum(ceq)} ${settleCoin()}`;
-        break;
-      }
-    }
-  } catch (e) {
-    console.debug("equity parse failed", e);
+  // --- Account-health bar (all from the wallet-balance payload) ---
+  const acct = walletAccount(d.balance);
+  const num = (v) => (v !== undefined && v !== "" && isFinite(Number(v)) ? Number(v) : null);
+
+  let equity = acct ? num(acct.totalEquity) ?? num(acct.totalWalletBalance) : null;
+  if (equity == null && acct) {
+    const c = (acct.coin || []).find((x) => x.coin === coin);
+    equity = num(c?.equity) ?? num(c?.walletBalance);
   }
-  $("#stat-equity").textContent = equity;
+  const available = acct ? num(acct.totalAvailableBalance) : null;
+  const usedMargin = acct ? num(acct.totalInitialMargin) : null;
+  const maintMargin = acct ? num(acct.totalMaintenanceMargin) : null;
+
+  const setText = (id, txt) => { const el = $(id); if (el) el.textContent = txt; };
+  setText("#stat-equity", equity != null ? `${fmtNum(equity)} ${coin}` : "—");
+  setText("#stat-available", available != null ? `avail ${fmtNum(available)}` : "");
+  setText("#stat-margin-used", usedMargin != null ? `${fmtNum(usedMargin)} ${coin}` : "—");
+
+  // PnL % relative to used (initial) margin → ROE-style; fall back to equity.
+  const pnlPctEl = $("#stat-pnl-pct");
+  if (pnlPctEl) {
+    const base = usedMargin && usedMargin > 0 ? usedMargin : equity;
+    if (isFinite(upl) && base && base > 0) {
+      pnlPctEl.textContent = fmtPct((upl / base) * 100);
+      pnlPctEl.className = "stat-sub " + pnlClass(upl);
+    } else {
+      pnlPctEl.textContent = "";
+    }
+  }
+
+  // Margin ratio = maintenance margin ÷ margin balance (higher = closer to
+  // liquidation). Prefer the exchange's own accountMMRate when present so the
+  // figure matches Bybit's liquidation math exactly.
+  const ratioEl = $("#stat-margin-ratio");
+  const meter = $("#margin-meter");
+  if (ratioEl && meter) {
+    let ratio = null;
+    const mmRate = acct ? num(acct.accountMMRate) : null;
+    if (mmRate != null) {
+      ratio = mmRate * 100;
+    } else {
+      const marginBal = acct ? num(acct.totalMarginBalance) ?? equity : equity;
+      if (maintMargin != null && marginBal && marginBal > 0) ratio = (maintMargin / marginBal) * 100;
+    }
+    const bar = meter.querySelector("span");
+    if (ratio != null && isFinite(ratio)) {
+      ratioEl.textContent = fmtPct(ratio, false);
+      bar.style.width = Math.min(100, Math.max(0, ratio)).toFixed(1) + "%";
+      meter.className = "meter" + (ratio >= 80 ? " danger" : ratio >= 50 ? " warn" : "");
+      ratioEl.className = "stat-value" + (ratio >= 80 ? " neg" : ratio >= 50 ? " warn" : "");
+    } else {
+      ratioEl.textContent = "—";
+      ratioEl.className = "stat-value";
+      bar.style.width = "0%";
+      meter.className = "meter";
+    }
+  }
 }
 
 function renderPositions(positions) {
@@ -255,6 +308,7 @@ function renderPositions(positions) {
   }
   const isAdmin = state.role === "admin";
   const hasVal = (v) => v !== undefined && v !== null && v !== "" && Number(v) !== 0;
+  const nextPrev = {};
   body.innerHTML = rows
     .map((p) => {
       const pnl = p.unrealisedPnl;
@@ -285,22 +339,64 @@ function renderPositions(positions) {
       const slCell = hasVal(p.stopLoss)
         ? `${fmtNum(p.stopLoss, 4)}${projHintHTML({ side: p.side, entry: p.avgPrice, exitPrice: p.stopLoss, size: p.size, leverage: p.leverage })}`
         : "—";
+
+      // Break-even (incl. fees) under entry.
+      const beSub = hasVal(p.breakEvenPrice)
+        ? `<span class="cell-sub">BE ${fmtNum(p.breakEvenPrice, 4)}</span>`
+        : "";
+
+      // Liquidation distance % under the liq price.
+      let liqCell = "—";
+      if (hasVal(p.liqPrice)) {
+        liqCell = fmtNum(p.liqPrice, 4);
+        const mark = Number(p.markPrice);
+        const liq = Number(p.liqPrice);
+        if (isFinite(mark) && mark > 0 && isFinite(liq)) {
+          const dist = (Math.abs(mark - liq) / mark) * 100;
+          const cls = dist < 5 ? "neg" : dist < 10 ? "warn" : "";
+          liqCell += `<span class="cell-sub ${cls}">${dist.toFixed(2)}% away</span>`;
+        }
+      }
+
+      // ROE % (unrealised PnL ÷ position initial margin) under the PnL.
+      let roeSub = "";
+      const im = Number(p.positionIM);
+      if (isFinite(im) && im > 0 && isFinite(Number(pnl))) {
+        roeSub = `<span class="cell-sub ${pnlClass(pnl)}">${fmtPct((Number(pnl) / im) * 100)}</span>`;
+      }
+
+      // Change-flash on the PnL cell — only on a MEANINGFUL move, otherwise it
+      // would flash every tick (PnL drifts constantly) and become pure noise.
+      const key = `${p.symbol}/${p.positionIdx ?? 0}`;
+      const cur = Number(pnl);
+      const prev = state.prevPos[key];
+      let flash = "";
+      if (
+        prev !== undefined &&
+        isFinite(cur) &&
+        Math.abs(cur - prev) >= Math.max(0.01, Math.abs(prev) * 0.001)
+      ) {
+        flash = cur > prev ? " flash-up" : " flash-down";
+      }
+      if (isFinite(cur)) nextPrev[key] = cur;
+
       return `<tr>
         <td class="mono">${esc(p.symbol)}</td>
         <td class="${(p.side || "").toLowerCase() === "buy" ? "pos" : "neg"}">${esc(p.side)}</td>
         <td class="mono">${fmtNum(p.size, 4)}</td>
-        <td class="mono">${fmtNum(p.avgPrice, 4)}</td>
+        <td class="mono">${fmtNum(p.avgPrice, 4)}${beSub}</td>
         <td class="mono">${fmtNum(p.markPrice, 4)}</td>
-        <td class="mono">${hasVal(p.liqPrice) ? fmtNum(p.liqPrice, 4) : "—"}</td>
+        <td class="mono">${liqCell}</td>
         <td class="mono">${esc(p.leverage ?? "—")}x</td>
         <td class="mono">${fmtNum(p.positionValue)}</td>
-        <td class="mono ${pnlClass(pnl)}">${fmtNum(pnl)}</td>
+        <td class="mono ${pnlClass(pnl)}${flash}">${fmtNum(pnl)}${roeSub}</td>
         <td class="mono">${tpCell}</td>
         <td class="mono">${slCell}</td>
         ${actions}
       </tr>`;
     })
     .join("");
+  state.prevPos = nextPrev;
 }
 
 function renderOrders(orders) {
@@ -663,17 +759,26 @@ function wireAdminForms() {
         body,
         confirmMsg: `Submit ${body.side} ${body.orderType} order: ${body.qty} ${body.symbol}${priceTxt}${body.reduceOnly ? " (reduce-only)" : ""}${tpslTxt}.`,
         successMsg: (res) => "✓ Order submitted" + (res.result?.orderId ? ` (${res.result.orderId})` : ""),
-        onSuccess: () => { f.reset(); syncLimit(); updateOrderPreview(); },
+        onSuccess: () => {
+          f.reset();
+          // Re-sync segmented toggles + dependent UI to the reset select values.
+          f.side.dispatchEvent(new Event("change", { bubbles: true }));
+          f.orderType.dispatchEvent(new Event("change", { bubbles: true }));
+          syncLimit();
+          updateOrderPreview();
+        },
       };
     });
   });
 
-  // --- live projected-PnL preview for the order form ---
+  // --- live notional + projected-PnL preview for the order form ---
   // Entry is the limit price for Limit orders; for Market orders we use the
-  // symbol's live last price (from the tickers API) as an estimate. ROI is
-  // omitted here because the form has no leverage input; $ only.
+  // symbol's live last price (from the tickers API) as an estimate. Shows a
+  // notional (qty × price) hint always, and a projected-PnL preview when TP/SL
+  // are set. ROI is omitted here ($ only) because the form has no leverage input.
   const orderForm = $("#order-form");
   const orderPreview = $("#order-pnl-preview");
+  const orderNotional = $("#order-notional");
   let _lastPriceTimer;
 
   // Declared as hoisted functions (not const arrows) so the order-form
@@ -706,6 +811,17 @@ function wireAdminForms() {
       entry = state.orderLastPrice.price;
       estimate = true;
     }
+
+    // Notional value hint (qty × price) so position size is obvious — shows
+    // independently of TP/SL.
+    if (orderNotional) {
+      const notional = Number(qty) * Number(entry);
+      orderNotional.textContent =
+        Number(qty) > 0 && Number(entry) > 0
+          ? `≈ ${fmtNum(notional)} ${settleCoin()} notional${estimate ? " (at market price)" : ""}`
+          : "";
+    }
+
     if (!entry || !qty || (!tp && !sl) || orderForm.reduceOnly.checked) {
       orderPreview.innerHTML = "";
       return;
@@ -738,6 +854,35 @@ function wireAdminForms() {
       }
     })
   );
+
+  // Segmented Buy/Sell & Market/Limit toggles mirror the (sr-only) <select>s,
+  // which remain the source of truth — so every existing handler keeps working.
+  const wireSegment = (segId, selectEl) => {
+    const seg = document.querySelector(segId);
+    if (!seg || !selectEl) return;
+    const buttons = Array.from(seg.querySelectorAll("button"));
+    const paint = () =>
+      buttons.forEach((b) => {
+        const on = b.dataset.val === selectEl.value;
+        b.classList.toggle("active", on);
+        b.setAttribute("aria-pressed", String(on));
+      });
+    buttons.forEach((b) =>
+      b.addEventListener("click", () => {
+        if (selectEl.value === b.dataset.val) return;
+        selectEl.value = b.dataset.val;
+        selectEl.dispatchEvent(new Event("change", { bubbles: true }));
+        selectEl.dispatchEvent(new Event("input", { bubbles: true }));
+        paint();
+      })
+    );
+    // Keep the buttons in sync if the select is reset/changed programmatically
+    // (e.g. f.reset() after a successful order).
+    selectEl.addEventListener("change", paint);
+    paint();
+  };
+  wireSegment("#seg-side", orderForm.side);
+  wireSegment("#seg-type", orderForm.orderType);
 
   $("#leverage-form").addEventListener("submit", (e) => {
     e.preventDefault();

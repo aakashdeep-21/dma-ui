@@ -3,7 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DMA Terminal</title>
+  <title>DMA Terminal — Dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,&lt;svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'&gt;&lt;text y='.9em' font-size='90'&gt;📈&lt;/text&gt;&lt;/svg&gt;" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -14,20 +15,31 @@
     </div>
     <div class="topbar-stats">
       <div class="stat">
-        <span class="stat-label">Total Unrealised PnL</span>
+        <span class="stat-label">Unrealised PnL</span>
         <span class="stat-value" id="stat-pnl">—</span>
+        <span class="stat-sub" id="stat-pnl-pct"></span>
       </div>
       <div class="stat">
-        <span class="stat-label">Open Positions</span>
+        <span class="stat-label">Equity</span>
+        <span class="stat-value" id="stat-equity">—</span>
+        <span class="stat-sub" id="stat-available"></span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Margin Used</span>
+        <span class="stat-value" id="stat-margin-used">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label" title="Maintenance margin ÷ equity. Higher = closer to liquidation.">Margin Ratio</span>
+        <span class="stat-value" id="stat-margin-ratio">—</span>
+        <span class="meter" id="margin-meter"><span style="width:0%"></span></span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Positions</span>
         <span class="stat-value" id="stat-positions">—</span>
       </div>
       <div class="stat">
         <span class="stat-label">Open Orders</span>
         <span class="stat-value" id="stat-orders">—</span>
-      </div>
-      <div class="stat">
-        <span class="stat-label">Wallet Equity</span>
-        <span class="stat-value" id="stat-equity">—</span>
       </div>
     </div>
     <div class="topbar-right">
@@ -47,9 +59,14 @@
         <table id="positions-table">
           <thead>
             <tr>
-              <th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th>
-              <th>Mark</th><th>Liq.</th><th>Lev</th><th>Value</th><th>Unrealised PnL</th>
-              <th>TP</th><th>SL</th>
+              <th>Symbol</th><th>Side</th><th>Size</th>
+              <th title="Average entry price · break-even (incl. fees) below">Entry</th>
+              <th title="Current mark price">Mark</th>
+              <th title="Liquidation price · % distance from mark below">Liq.</th>
+              <th>Lev</th><th title="Position notional value">Value</th>
+              <th title="Unrealised PnL · ROE % (PnL ÷ initial margin) below">Unrealised PnL</th>
+              <th title="Take Profit · projected net PnL below">TP</th>
+              <th title="Stop Loss · projected net PnL below">SL</th>
               <th class="admin-only">Actions</th>
             </tr>
           </thead>
@@ -102,13 +119,21 @@
             <input name="symbol" placeholder="SOLUSDT" required />
           </label>
           <label>Side
-            <select name="side">
+            <div class="segment" id="seg-side" role="group" aria-label="Order side">
+              <button type="button" data-val="Buy" class="seg-buy" aria-pressed="true">Buy</button>
+              <button type="button" data-val="Sell" class="seg-sell" aria-pressed="false">Sell</button>
+            </div>
+            <select name="side" class="sr-only" tabindex="-1">
               <option value="Buy">Buy</option>
               <option value="Sell">Sell</option>
             </select>
           </label>
           <label>Order type
-            <select name="orderType" id="order-type">
+            <div class="segment" id="seg-type" role="group" aria-label="Order type">
+              <button type="button" data-val="Market" class="seg-neutral" aria-pressed="true">Market</button>
+              <button type="button" data-val="Limit" class="seg-neutral" aria-pressed="false">Limit</button>
+            </div>
+            <select name="orderType" id="order-type" class="sr-only" tabindex="-1">
               <option value="Market">Market</option>
               <option value="Limit">Limit</option>
             </select>
@@ -116,6 +141,7 @@
           <label>Quantity
             <input name="qty" placeholder="1" required />
           </label>
+          <div class="notional-hint" id="order-notional"></div>
           <label class="limit-only">Price
             <input name="price" placeholder="limit price" />
           </label>
