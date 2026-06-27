@@ -376,11 +376,61 @@ tr.exp-row.expanded { background: var(--panel-2); }
 /* Sticky headers inside scrollable result tables (explorer, markets, history) */
 .explorer-result table thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
 
-/* ===== Responsive ===== */
+/* ===== Accessibility ===== */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible,
+.tab:focus-visible, [tabindex]:focus-visible, .segment button:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  td.flash-up, td.flash-down, .toast, .skel, .meter > span { animation: none !important; transition: none !important; }
+}
+
+/* ===== Responsive (mobile) ===== */
 @media (max-width: 760px) {
   .topbar { gap: 14px; padding: 10px 14px; }
   .topbar-stats { gap: 16px; }
   .stat-value { font-size: 15px; }
   .pane { padding: 12px; }
   .trade-grid { grid-template-columns: 1fr; }
+  .tab { padding: 12px 14px; }
+  .btn-ghost.sm, .btn-danger.sm { padding: 7px 12px; } /* bigger tap targets */
+
+  /* Dashboard tables → stacked cards */
+  #positions-table, #orders-table,
+  #positions-table tbody, #orders-table tbody { display: block; }
+  #positions-table thead, #orders-table thead { display: none; }
+  #positions-table tbody tr, #orders-table tbody tr { display: block; }
+
+  #positions-table tr.exp-row, #orders-table tr.exp-row {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 2px 14px;
+    border: 1px solid var(--border); border-radius: 10px; margin: 10px 0; padding: 10px 12px;
+    background: var(--panel);
+  }
+  #positions-table tr.exp-row td, #orders-table tr.exp-row td {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+    text-align: right; white-space: normal; padding: 3px 0; border: none;
+  }
+  #positions-table tr.exp-row td[data-label]::before,
+  #orders-table tr.exp-row td[data-label]::before {
+    content: attr(data-label); color: var(--muted); font-size: 10px;
+    text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600;
+  }
+  #positions-table td.card-head, #orders-table td.card-head {
+    grid-column: 1 / -1; justify-content: flex-start; font-size: 15px; font-weight: 700;
+    border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 2px;
+  }
+  td.row-actions { grid-column: 1 / -1; justify-content: flex-end; padding-top: 8px; }
+
+  /* Keep sub-hints inline with the value on cards */
+  #positions-table .cell-sub, #positions-table .pnl-hint,
+  #orders-table .cell-sub { display: inline; margin: 0 0 0 6px; }
+
+  /* Detail row spans the full card width */
+  #positions-table tr.detail-row, #orders-table tr.detail-row { display: block; margin: -4px 0 10px; }
+  #positions-table tr.detail-row td, #orders-table tr.detail-row td { display: block; padding: 0; }
+
+  /* Empty-state / skeleton rows */
+  #positions-table tbody tr:not(.exp-row):not(.detail-row) td,
+  #orders-table tbody tr:not(.exp-row):not(.detail-row) td { display: block; text-align: center; }
 }

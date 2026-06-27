@@ -474,17 +474,17 @@ function renderPositions(positions) {
       ]);
 
       return `<tr class="exp-row${expanded ? " expanded" : ""}" data-pkey="${esc(key)}">
-        <td class="mono"><span class="caret">${expanded ? "▾" : "▸"}</span>${esc(p.symbol)}</td>
-        <td class="${(p.side || "").toLowerCase() === "buy" ? "pos" : "neg"}">${esc(p.side)}</td>
-        <td class="mono">${fmtNum(p.size, 4)}</td>
-        <td class="mono">${fmtNum(p.avgPrice, 4)}${beSub}</td>
-        <td class="mono">${fmtNum(p.markPrice, 4)}</td>
-        <td class="mono">${liqCell}</td>
-        <td class="mono">${esc(p.leverage ?? "—")}x</td>
-        <td class="mono">${fmtNum(p.positionValue)}</td>
-        <td class="mono ${pnlClass(pnl)}${flash}">${fmtNum(pnl)}${roeSub}</td>
-        <td class="mono">${tpCell}</td>
-        <td class="mono">${slCell}</td>
+        <td class="mono card-head"><span class="caret">${expanded ? "▾" : "▸"}</span>${esc(p.symbol)}</td>
+        <td data-label="Side" class="${(p.side || "").toLowerCase() === "buy" ? "pos" : "neg"}">${esc(p.side)}</td>
+        <td data-label="Size" class="mono">${fmtNum(p.size, 4)}</td>
+        <td data-label="Entry" class="mono">${fmtNum(p.avgPrice, 4)}${beSub}</td>
+        <td data-label="Mark" class="mono">${fmtNum(p.markPrice, 4)}</td>
+        <td data-label="Liq." class="mono">${liqCell}</td>
+        <td data-label="Lev" class="mono">${esc(p.leverage ?? "—")}x</td>
+        <td data-label="Value" class="mono">${fmtNum(p.positionValue)}</td>
+        <td data-label="Unrealised PnL" class="mono ${pnlClass(pnl)}${flash}">${fmtNum(pnl)}${roeSub}</td>
+        <td data-label="TP" class="mono">${tpCell}</td>
+        <td data-label="SL" class="mono">${slCell}</td>
         ${actions}
       </tr>
       <tr class="detail-row"${expanded ? "" : " hidden"}><td colspan="99">${detail}</td></tr>`;
@@ -513,7 +513,7 @@ function renderOrders(orders) {
       const key = o.orderId || `${o.symbol}/${o.orderLinkId || ""}`;
       const expanded = state.expandedOrders.has(key);
       const actions = isAdmin
-        ? `<td><button class="btn-danger sm" data-cancel='${esc(JSON.stringify({
+        ? `<td class="row-actions"><button class="btn-danger sm" data-cancel='${esc(JSON.stringify({
             symbol: o.symbol,
             orderId: o.orderId,
           }))}'>Cancel</button></td>`
@@ -546,13 +546,13 @@ function renderOrders(orders) {
       ]);
 
       return `<tr class="exp-row${expanded ? " expanded" : ""}" data-okey="${esc(key)}">
-        <td class="mono"><span class="caret">${expanded ? "▾" : "▸"}</span>${esc(o.symbol)}</td>
-        <td class="${(o.side || "").toLowerCase() === "buy" ? "pos" : "neg"}">${esc(o.side)}</td>
-        <td>${esc(o.orderType)}${badges}</td>
-        <td class="mono">${fmtNum(o.qty, 4)}${fillSub}</td>
-        <td class="mono">${o.price && Number(o.price) ? fmtNum(o.price, 4) : "—"}</td>
-        <td class="mono">${o.triggerPrice && Number(o.triggerPrice) ? fmtNum(o.triggerPrice, 4) : "—"}</td>
-        <td>${esc(o.orderStatus)}</td>
+        <td class="mono card-head"><span class="caret">${expanded ? "▾" : "▸"}</span>${esc(o.symbol)}</td>
+        <td data-label="Side" class="${(o.side || "").toLowerCase() === "buy" ? "pos" : "neg"}">${esc(o.side)}</td>
+        <td data-label="Type">${esc(o.orderType)}${badges}</td>
+        <td data-label="Qty" class="mono">${fmtNum(o.qty, 4)}${fillSub}</td>
+        <td data-label="Price" class="mono">${o.price && Number(o.price) ? fmtNum(o.price, 4) : "—"}</td>
+        <td data-label="Trigger" class="mono">${o.triggerPrice && Number(o.triggerPrice) ? fmtNum(o.triggerPrice, 4) : "—"}</td>
+        <td data-label="Status">${esc(o.orderStatus)}</td>
         ${actions}
       </tr>
       <tr class="detail-row"${expanded ? "" : " hidden"}><td colspan="99">${detail}</td></tr>`;
