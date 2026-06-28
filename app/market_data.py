@@ -155,10 +155,15 @@ async def get_kline(symbol: str, interval: str, limit=None) -> dict:
             return hit
         data = await _fetch_upstream(sym, code, lim)
         if ttl > 0:
-            # Bound cache/lock growth defensively (in practice only a handful of
-            # keys: whitelisted symbols × a few intervals × a few limit buckets).
+            # _cache and _locks are bounded by the whitelist (≤ symbols × intervals
+            # × limit-buckets ≈ 60 keys), so this 256 cap is a paranoid backstop
+            # that never trips in practice. Clear ONLY _cache — never _locks: the
+            # lock we currently hold must not be orphaned mid-flight (a new caller
+            # would otherwise mint a second lock and issue a redundant GET).
             if len(_cache) > 256:
                 _cache.clear()
-                _locks.clear()
+            # NOTE: the cached payload is SHARED by reference across concurrent
+            # callers; it is read-only here (the route only serializes it) and
+            # must never be mutated in place by a future consumer.
             _cache[key] = (now, data)
         return data
