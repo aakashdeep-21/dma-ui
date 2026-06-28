@@ -764,7 +764,7 @@ function renderDashboard(d) {
 // ---------------------------------------------------------------------------
 function ensureToken() {
   if (!state.tradeToken) {
-    toast("Enter the trade token (Trade tab) to unlock trading.", "warn");
+    toast("Enter the trade token (top of the order rail on the Dashboard) to unlock trading.", "warn");
     return false;
   }
   return true;
@@ -1579,15 +1579,20 @@ function renderWallet(data) {
     rows.map(([k, v]) => `<tr><th>${esc(k)}</th><td class="mono">${v}</td></tr>`).join("") +
     `</tbody></table></div>`;
   const coins = acct.coin || [];
+  // Per-coin balances (equity/wallet/available/PnL) are denominated in the
+  // COIN's own units (e.g. BTC), so the ×94 INR lens only applies to the settle
+  // coin (USDT). For other coins show the native amount unchanged. usdValue is a
+  // USD-equivalent, so it converts for every row.
+  const coinAmt = (c, v) => (c.coin === settleCoin() ? cvtCell(v, 2) : esc(cell(v)));
   const coinTable = coins.length
     ? buildTable(coins, [
         { label: "Coin", get: (c) => c.coin },
-        { label: "Equity", get: (c) => c.equity, money: true },
-        { label: "Wallet Bal", get: (c) => c.walletBalance, money: true },
-        { label: "Available", get: (c) => c.availableToWithdraw ?? c.availableToBorrow, money: true },
-        { label: "Unreal PnL", get: (c) => c.unrealisedPnl, cls: (c) => pnlClass(c.unrealisedPnl), money: true },
-        { label: "Realised PnL", get: (c) => c.cumRealisedPnl, cls: (c) => pnlClass(c.cumRealisedPnl), money: true },
-        { label: `Value (${curUnit()})`, get: (c) => c.usdValue, money: true },
+        { label: "Equity", raw: (c) => coinAmt(c, c.equity) },
+        { label: "Wallet Bal", raw: (c) => coinAmt(c, c.walletBalance) },
+        { label: "Available", raw: (c) => coinAmt(c, c.availableToWithdraw ?? c.availableToBorrow) },
+        { label: "Unreal PnL", raw: (c) => coinAmt(c, c.unrealisedPnl), cls: (c) => pnlClass(c.unrealisedPnl) },
+        { label: "Realised PnL", raw: (c) => coinAmt(c, c.cumRealisedPnl), cls: (c) => pnlClass(c.cumRealisedPnl) },
+        { label: `Value (${curUnit()})`, get: (c) => c.usdValue, money: true, digits: 2 },
       ])
     : "";
   return summary + coinTable;
@@ -1960,6 +1965,7 @@ function renderConn() {
     // consistent ("connecting…", neutral) until the first frame arrives.
     el.className = "conn conn-off";
     el.textContent = "connecting…";
+    document.body.classList.remove("stale-data");
     return;
   }
   const age = (Date.now() - state.lastFrameAt) / 1000;
@@ -2124,13 +2130,12 @@ async function fetchInstrumentSpec(symbol) {
 
 function renderSpecStrip(spec) {
   const el = document.getElementById("order-spec");
-  const form = document.getElementById("order-form");
   if (!el) return;
-  if (!spec) {
-    el.hidden = true; el.innerHTML = "";
-    if (form && form.qty) { form.qty.removeAttribute("step"); form.qty.removeAttribute("min"); }
-    return;
-  }
+  if (!spec) { el.hidden = true; el.innerHTML = ""; return; }
+  // Display only — show the instrument's filters as a reference strip. We do NOT
+  // set min/step on the inputs: they are type=text (so those attrs are inert),
+  // and the authoritative check is the non-blocking specWarnings shown in the
+  // confirm modal (the server stays authoritative on acceptance).
   const parts = [];
   if (spec.tickSize != null) parts.push(`tick <b>${esc(spec.tickSize)}</b>`);
   if (spec.qtyStep != null) parts.push(`step <b>${esc(spec.qtyStep)}</b>`);
@@ -2139,11 +2144,6 @@ function renderSpecStrip(spec) {
   if (spec.maxLeverage != null) parts.push(`maxLev <b>${esc(spec.maxLeverage)}x</b>`);
   el.innerHTML = parts.join("");
   el.hidden = parts.length === 0;
-  if (form && form.qty) {
-    if (spec.qtyStep) form.qty.setAttribute("step", spec.qtyStep);
-    if (spec.minOrderQty) form.qty.setAttribute("min", spec.minOrderQty);
-    if (spec.tickSize && form.price) form.price.setAttribute("step", spec.tickSize);
-  }
 }
 
 // --- active symbol + live order-book widget ---
@@ -2373,6 +2373,13 @@ function rerenderForCurrency() {
   }
 }
 
+// Keep the sticky order-rail's offset in sync with the ACTUAL header height, so
+// a taller/wrapped header (narrow window) never overlaps the rail. Display-only.
+function syncHeaderHeight() {
+  const el = document.querySelector(".sticky-top");
+  if (el) document.documentElement.style.setProperty("--header-h", el.offsetHeight + "px");
+}
+
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
@@ -2397,4 +2404,12 @@ function rerenderForCurrency() {
   } catch (e) {}
   connectWS();
   startConnWatchdog(); // escalate the pill to "stale" if frames stop arriving
+  syncHeaderHeight();
+  // Throttle to one measurement per frame so a resize drag doesn't thrash layout.
+  let _rhTick = false;
+  window.addEventListener("resize", () => {
+    if (_rhTick) return;
+    _rhTick = true;
+    requestAnimationFrame(() => { _rhTick = false; syncHeaderHeight(); });
+  });
 })();

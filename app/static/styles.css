@@ -12,6 +12,7 @@
   --accent: #3b82f6;
   --accent-hover: #2f6fe0;
   --text-secondary: #aab6c4; /* brighter than --muted for high-stakes sub-text */
+  --header-h: 104px; /* live-measured by JS (syncHeaderHeight); fallback for first paint */
 }
 
 * { box-sizing: border-box; }
@@ -481,12 +482,16 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 /* ---- Workspace: positions/orders left, docked order rail right ---- */
 .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; align-items: start; }
 .workspace-main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
-.workspace-rail { display: flex; flex-direction: column; gap: 16px; position: sticky; top: 104px;
-  max-height: calc(100vh - 120px); overflow-y: auto; }
+/* The rail flows at its natural height and the PAGE scrolls to reveal all of it
+   (Submit, full order book) — no captive inner scroll that hides controls. It
+   still pins below the header (top tracks the live header height) when there is
+   a long positions list to scroll past. */
+.workspace-rail { display: flex; flex-direction: column; gap: 16px;
+  position: sticky; top: calc(var(--header-h, 104px) + 12px); align-self: start; }
 body.viewer .workspace { grid-template-columns: 1fr; }
 @media (max-width: 1100px) {
   .workspace { grid-template-columns: 1fr; }
-  .workspace-rail { position: static; max-height: none; overflow: visible; }
+  .workspace-rail { position: static; } /* flows inline; whole page scrolls */
 }
 
 /* ---- Instrument spec strip under the order symbol ---- */
@@ -525,6 +530,10 @@ body.viewer .workspace { grid-template-columns: 1fr; }
 
 /* ---- Order book depth ladder (rail widget + explorer) ---- */
 .book-widget { padding: 6px 0 10px; }
+/* Rail order book: cap its own height so the long depth ladder scrolls within
+   itself and never pushes the order form / Submit out of reach. The explorer's
+   order book (class only, no id) is unaffected. */
+#book-widget { max-height: 340px; overflow-y: auto; }
 .book-empty { padding: 14px; }
 .book-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1px 0; padding: 1px 12px;
   font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
