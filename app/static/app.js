@@ -2423,6 +2423,13 @@ function intervalLabel(code) {
   const m = CHART_INTERVALS.find((i) => i.code === code);
   return m ? m.label : code;
 }
+// Compact HH:MM for the candle time axis (a candle's `start` is epoch-ms).
+function fmtClock(ms) {
+  const n = Number(ms);
+  if (!isFinite(n) || n <= 0) return "";
+  const d = new Date(n);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
 
 // Parse a Bybit kline payload into ascending {o,h,l,c,v} numbers. Bybit returns
 // result.list as [start, open, high, low, close, volume, turnover] strings,
@@ -2433,9 +2440,10 @@ function parseKline(data) {
   for (let i = list.length - 1; i >= 0; i--) {
     const k = list[i];
     if (!Array.isArray(k) || k.length < 5) continue;
+    const t = Number(k[0]);
     const o = Number(k[1]), h = Number(k[2]), l = Number(k[3]), c = Number(k[4]), v = Number(k[5]);
     if (!isFinite(o) || !isFinite(h) || !isFinite(l) || !isFinite(c)) continue;
-    out.push({ o, h, l, c, v: isFinite(v) ? v : 0 });
+    out.push({ t: isFinite(t) ? t : 0, o, h, l, c, v: isFinite(v) ? v : 0 });
   }
   return out;
 }
@@ -2443,11 +2451,12 @@ function parseKline(data) {
 // Hand-drawn candlestick SVG + right-hand price scale. Inputs are coerced
 // NUMBERS only — no exchange string ever reaches innerHTML here, so this is
 // XSS-safe by construction (the price-scale labels go through fmtNum).
-function renderCandles(svg, axisEl, candles, dp) {
+function renderCandles(svg, axisEl, timeEl, candles, dp) {
   if (!svg) return;
   if (!candles || !candles.length) {
     svg.innerHTML = "";
     if (axisEl) axisEl.innerHTML = "";
+    if (timeEl) timeEl.innerHTML = "";
     return;
   }
   // SVG geometry (user-space units; preserveAspectRatio="none" stretches X/Y to
@@ -2503,6 +2512,24 @@ function renderCandles(svg, axisEl, candles, dp) {
     a.push(`<span class="cc-ax-last ${last.c >= last.o ? "pos" : "neg"}" style="top:${ltop}%">${fmtNum(last.c, dp)}</span>`);
     axisEl.innerHTML = a.join("");
   }
+  if (timeEl) {
+    // Time axis: a few HH:MM labels under the plot. Labels are HTML (not SVG text)
+    // so they stay crisp under the stretched viewBox; the row is inset by the
+    // price gutter (CSS) to align with the plot. Interior labels sit centred on
+    // their candle's x; the first/last are pinned to the row edges instead (so
+    // they can't clip past the plot), which reads as the visible time range.
+    const t = [], seen = {};
+    [0, Math.floor(n / 3), Math.floor((2 * n) / 3), n - 1].forEach((i) => {
+      if (i < 0 || i >= n || seen[i]) return;
+      seen[i] = 1;
+      let style;
+      if (i === 0) style = "left:0";
+      else if (i === n - 1) style = "right:0";
+      else style = `left:${(((L + (i + 0.5) * step) / W) * 100).toFixed(1)}%;transform:translateX(-50%)`;
+      t.push(`<span class="cc-t" style="${style}">${fmtClock(candles[i].t)}</span>`);
+    });
+    timeEl.innerHTML = t.join("");
+  }
 }
 
 // Static card shell (built once). suffix = "BTCUSDT"… for grid cards, "single"
@@ -2517,6 +2544,7 @@ function chartCardHTML(sm, suffix) {
       `<svg class="cs" id="cs-${suffix}" viewBox="0 0 600 210" preserveAspectRatio="none" role="img" aria-label="${esc(sm.label)} candlesticks"></svg>` +
       `<div class="cc-axis" id="cax-${suffix}"></div>` +
     `</div>` +
+    `<div class="cc-times" id="ctime-${suffix}"></div>` +
     `<div class="cc-foot"><span id="cfoot-${suffix}">—</span><span class="muted" id="civ-${suffix}"></span></div>`
   );
 }
@@ -2580,7 +2608,7 @@ function renderCharts() {
     if (single) single.hidden = true;
     if (symSeg) symSeg.hidden = true;
     CHART_SYMBOLS.forEach((s) => {
-      renderCandles(document.getElementById(`cs-${s.id}`), document.getElementById(`cax-${s.id}`), chartState.data[s.id], s.dp);
+      renderCandles(document.getElementById(`cs-${s.id}`), document.getElementById(`cax-${s.id}`), document.getElementById(`ctime-${s.id}`), chartState.data[s.id], s.dp);
       updateChartHeader(s, s.id);
     });
   } else {
@@ -2590,7 +2618,7 @@ function renderCharts() {
     const s = chartSymById(chartState.single);
     const head = single && single.querySelector(".cc-sym");
     if (head) head.innerHTML = `<b>${esc(s.label)}</b><span>${esc(s.id)} · Perp</span>`;
-    renderCandles(document.getElementById("cs-single"), document.getElementById("cax-single"), chartState.data[s.id], s.dp);
+    renderCandles(document.getElementById("cs-single"), document.getElementById("cax-single"), document.getElementById("ctime-single"), chartState.data[s.id], s.dp);
     updateChartHeader(s, "single");
   }
 }

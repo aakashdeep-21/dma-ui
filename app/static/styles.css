@@ -632,7 +632,8 @@ body.viewer .workspace { grid-template-columns: 1fr; }
 /* .cc-card (not .chart-card) — the history-analytics panel already uses
    .chart-card, so this feature stays inside the .cc-*/.cs-* namespace. */
 .cc-card { background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
-  padding: 10px 12px 8px; display: flex; flex-direction: column; gap: 7px; }
+  padding: 10px 12px 8px; display: flex; flex-direction: column; gap: 7px;
+  --cc-gutter: 56px; /* price-scale width; shared by .cc-axis (width) + .cc-times (inset) */ }
 .cc-card.clickable { cursor: pointer; }
 .cc-card.clickable:hover { border-color: var(--accent); }
 .cc-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
@@ -647,7 +648,7 @@ body.viewer .workspace { grid-template-columns: 1fr; }
 .cc-chart { display: flex; align-items: stretch; height: 170px; }
 .cc-chart.lg { height: 360px; }
 .cc-chart svg.cs { flex: 1 1 auto; width: auto; min-width: 0; height: 100%; display: block; }
-.cc-axis { position: relative; flex: 0 0 56px; width: 56px; height: 100%;
+.cc-axis { position: relative; flex: 0 0 var(--cc-gutter); width: var(--cc-gutter); height: 100%;
   border-left: 1px solid var(--border); font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
   font-variant-numeric: tabular-nums; }
 .cc-ax-lbl { position: absolute; right: 5px; transform: translateY(-50%); font-size: 9px;
@@ -658,7 +659,11 @@ body.viewer .workspace { grid-template-columns: 1fr; }
 .cc-ax-last.neg { color: #fff; background: var(--neg); }
 .cc-foot { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--muted);
   font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; }
-.chart-empty { padding: 22px 16px; color: var(--muted); font-size: 13px; text-align: center; }
+/* Time axis under the plot. Inset by the price gutter (--cc-gutter) so the
+   absolutely-positioned HH:MM labels line up with the candles, not the scale. */
+.cc-times { position: relative; height: 13px; margin: 2px var(--cc-gutter) 0 0;
+  font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+.cc-t { position: absolute; bottom: 0; font-size: 9px; color: var(--muted); white-space: nowrap; }
 /* Candle colours via CSS vars so they track the theme (rect=fill, wick/line=stroke). */
 .cs-up { fill: var(--pos); stroke: var(--pos); }
 .cs-down { fill: var(--neg); stroke: var(--neg); }
