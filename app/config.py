@@ -54,6 +54,15 @@ def _float_env(name: str, default: float) -> float:
     return value if value > 0 else default
 
 
+def _csv_env(name: str, default: list[str]) -> list[str]:
+    """Parse a comma-separated env var into an upper-cased list, else default."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return list(default)
+    items = [part.strip().upper() for part in raw.split(",") if part.strip()]
+    return items or list(default)
+
+
 class Settings:
     def __init__(self) -> None:
         # --- CoinSwitch DMA credentials (NEVER hard-code) ---
@@ -87,6 +96,29 @@ class Settings:
 
         # --- Live dashboard poll interval (seconds) ---
         self.POLL_INTERVAL: float = _float_env("POLL_INTERVAL", 5.0)
+
+        # --- Public market-data for the dashboard charts (READ-ONLY) ---
+        # A SEPARATE, unauthenticated host used ONLY for public OHLC candles.
+        # It NEVER carries the DMA API key/secret and is isolated from the signed
+        # trading client (see app/market_data.py). Default is Bybit's public v5
+        # market API, which is shape-compatible with the DMA upstream.
+        self.MARKET_DATA_BASE_URL: str = os.environ.get(
+            "MARKET_DATA_BASE_URL", "https://api.bybit.com"
+        ).rstrip("/")
+        # Whitelist of symbols the chart endpoint may serve. The proxy refuses
+        # anything not on this list, so it can never be used to fetch arbitrary
+        # symbols/markets (defence-in-depth against an open relay). NOTE: the
+        # frontend keeps a matching display list (CHART_SYMBOLS in app.js, with
+        # per-symbol label/decimals) — keep the two in sync. A symbol added here
+        # but not there simply won't render; one removed here is rejected and its
+        # chart stays empty (handled gracefully, never a hard error).
+        self.CHART_SYMBOLS: list[str] = _csv_env(
+            "CHART_SYMBOLS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        )
+        # Seconds to cache a kline response in-process. The frontend polls ~1×/s
+        # for live candles; this coalesces that into at most one upstream call per
+        # (symbol, interval, limit) per interval, shielding the public API.
+        self.CHART_CACHE_TTL: float = _float_env("CHART_CACHE_TTL", 1.0)
 
     def missing_required(self) -> list[str]:
         """Return the names of required vars that are not set."""
