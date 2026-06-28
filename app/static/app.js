@@ -1818,6 +1818,9 @@ function wireTabs() {
     // The order-book widget only polls while the dashboard is visible.
     if (name === "dashboard") { if (state.activeSymbol) startBookPolling(); }
     else stopBookPolling();
+    // Live charts poll only while the dashboard is visible too.
+    if (name === "dashboard") startChartPolling();
+    else stopChartPolling();
   };
   tabs.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => show(b.dataset.tab)));
 }
@@ -2381,6 +2384,317 @@ function syncHeaderHeight() {
 }
 
 // ---------------------------------------------------------------------------
+// Live candlestick charts (read-only public market data via /api/klines).
+// Bybit kline → hand-drawn SVG candles (CSP-safe, like svgAreaChart). Polls
+// every 1s WHILE the Dashboard tab is visible — independent of the 5s account
+// feed — and pauses when the tab/pane is hidden. No write or account data.
+// ---------------------------------------------------------------------------
+// Must mirror the server-side CHART_SYMBOLS whitelist (the server stays
+// authoritative and rejects anything off-list). dp = price decimal places.
+const CHART_SYMBOLS = [
+  { id: "BTCUSDT", label: "BTC", dp: 1 },
+  { id: "ETHUSDT", label: "ETH", dp: 2 },
+  { id: "SOLUSDT", label: "SOL", dp: 2 },
+];
+const CHART_LIMIT = { grid: 60, single: 160 };
+// Single source for the interval set: the #chart-iv buttons AND the footer label
+// both derive from this. The backend _INTERVALS map stays the authoritative gate.
+const CHART_INTERVALS = [
+  { code: "1", label: "1m" },
+  { code: "5", label: "5m" },
+  { code: "15", label: "15m" },
+  { code: "60", label: "1H" },
+];
+const chartState = {
+  view: "grid",         // "grid" | "single"
+  interval: "15",       // Bybit kline code (1 | 5 | 15 | 60) — the SELECTED interval
+  loadedInterval: "15", // interval the on-screen candles were actually fetched with
+  single: "BTCUSDT",
+  data: {},             // symbol -> ascending candle[] {o,h,l,c,v}
+  fetching: false,      // single-flight guard so 1s ticks never pile up
+  pending: false,       // a control change arrived mid-fetch -> fetch once more after
+};
+let _chartTimer = null;
+
+function chartSymById(id) {
+  return CHART_SYMBOLS.find((s) => s.id === id) || CHART_SYMBOLS[0];
+}
+function intervalLabel(code) {
+  const m = CHART_INTERVALS.find((i) => i.code === code);
+  return m ? m.label : code;
+}
+
+// Parse a Bybit kline payload into ascending {o,h,l,c,v} numbers. Bybit returns
+// result.list as [start, open, high, low, close, volume, turnover] strings,
+// NEWEST first — iterate in reverse to get chronological order.
+function parseKline(data) {
+  const list = (data && data.result && data.result.list) || [];
+  const out = [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const k = list[i];
+    if (!Array.isArray(k) || k.length < 5) continue;
+    const o = Number(k[1]), h = Number(k[2]), l = Number(k[3]), c = Number(k[4]), v = Number(k[5]);
+    if (!isFinite(o) || !isFinite(h) || !isFinite(l) || !isFinite(c)) continue;
+    out.push({ o, h, l, c, v: isFinite(v) ? v : 0 });
+  }
+  return out;
+}
+
+// Hand-drawn candlestick SVG + right-hand price scale. Inputs are coerced
+// NUMBERS only — no exchange string ever reaches innerHTML here, so this is
+// XSS-safe by construction (the price-scale labels go through fmtNum).
+function renderCandles(svg, axisEl, candles, dp) {
+  if (!svg) return;
+  if (!candles || !candles.length) {
+    svg.innerHTML = "";
+    if (axisEl) axisEl.innerHTML = "";
+    return;
+  }
+  // SVG geometry (user-space units; preserveAspectRatio="none" stretches X/Y to
+  // the element box): W/H = viewBox size; L/R/T/B = inner padding; volH = bottom
+  // volume-strip height; gap = price↔volume separation. The price band is the
+  // vertical range [T, priceBottom]; the volume bars sit below it.
+  const W = 600, H = 210, L = 6, R = 6, T = 10, B = 6, volH = 34, gap = 8;
+  const priceBottom = H - B - volH - gap;
+  let min = Infinity, max = -Infinity, maxV = 0;
+  candles.forEach((c) => {
+    if (c.l < min) min = c.l;
+    if (c.h > max) max = c.h;
+    if (c.v > maxV) maxV = c.v;
+  });
+  // 8% vertical headroom so wicks aren't flush to the edges; fall back to a tiny
+  // band for a (near-)flat series, then to 1 so the span is never 0.
+  const padR = (max - min) * 0.08 || Math.abs(max) * 0.001 || 1;
+  min -= padR; max += padR;
+  const span = (max - min) || 1;
+  if (!(maxV > 0)) maxV = 1;
+  // body = 62% of each candle's horizontal slot (leaves the inter-candle gap); ≥1.4px.
+  const n = candles.length, plotW = W - L - R, step = plotW / n, bodyW = Math.max(1.4, step * 0.62);
+  const y = (p) => T + (priceBottom - T) * (1 - (p - min) / span);
+  const parts = [];
+  for (let g = 1; g <= 3; g++) {
+    const gy = (T + (priceBottom - T) * g / 4).toFixed(1);
+    parts.push(`<line class="cs-grid" x1="0" y1="${gy}" x2="${W}" y2="${gy}"/>`);
+  }
+  candles.forEach((cd, i) => {
+    const xc = L + (i + 0.5) * step;
+    const cls = cd.c >= cd.o ? "cs-up" : "cs-down";
+    parts.push(`<line class="${cls}" x1="${xc.toFixed(1)}" y1="${y(cd.h).toFixed(1)}" x2="${xc.toFixed(1)}" y2="${y(cd.l).toFixed(1)}" stroke-width="1" vector-effect="non-scaling-stroke"/>`);
+    const yo = y(cd.o), yc = y(cd.c), top = Math.min(yo, yc), hgt = Math.max(1, Math.abs(yo - yc));
+    parts.push(`<rect class="${cls}" x="${(xc - bodyW / 2).toFixed(1)}" y="${top.toFixed(1)}" width="${bodyW.toFixed(1)}" height="${hgt.toFixed(1)}"/>`);
+    const bh = (cd.v / maxV) * volH;
+    parts.push(`<rect class="${cls}" x="${(xc - bodyW / 2).toFixed(1)}" y="${(H - B - bh).toFixed(1)}" width="${bodyW.toFixed(1)}" height="${bh.toFixed(1)}" fill-opacity="0.28"/>`);
+  });
+  const last = candles[candles.length - 1];
+  const lastCls = last.c >= last.o ? "cs-up" : "cs-down";
+  parts.push(`<line class="${lastCls}" x1="0" y1="${y(last.c).toFixed(1)}" x2="${W}" y2="${y(last.c).toFixed(1)}" stroke-width="1" stroke-dasharray="4 4" opacity="0.55" vector-effect="non-scaling-stroke"/>`);
+  svg.innerHTML = parts.join("");
+  if (axisEl) {
+    const a = [];
+    const levels = 5;
+    for (let k = 0; k < levels; k++) {
+      const f = k / (levels - 1);
+      const price = max - f * span;
+      const topPct = ((T + f * (priceBottom - T)) / H * 100).toFixed(2);
+      a.push(`<span class="cc-ax-lbl" style="top:${topPct}%">${fmtNum(price, dp)}</span>`);
+    }
+    const fLast = (max - last.c) / span;
+    const ltop = ((T + fLast * (priceBottom - T)) / H * 100).toFixed(2);
+    a.push(`<span class="cc-ax-last ${last.c >= last.o ? "pos" : "neg"}" style="top:${ltop}%">${fmtNum(last.c, dp)}</span>`);
+    axisEl.innerHTML = a.join("");
+  }
+}
+
+// Static card shell (built once). suffix = "BTCUSDT"… for grid cards, "single"
+// for the single-view card. Labels are our own constants but still escaped.
+function chartCardHTML(sm, suffix) {
+  return (
+    `<div class="cc-head">` +
+      `<div class="cc-sym"><b>${esc(sm.label)}</b><span>${esc(sm.id)} · Perp</span></div>` +
+      `<div class="cc-px"><span class="cc-last mono" id="cc-last-${suffix}">—</span><span class="cc-chg mono" id="cc-chg-${suffix}">—</span></div>` +
+    `</div>` +
+    `<div class="cc-chart${suffix === "single" ? " lg" : ""}">` +
+      `<svg class="cs" id="cs-${suffix}" viewBox="0 0 600 210" preserveAspectRatio="none" role="img" aria-label="${esc(sm.label)} candlesticks"></svg>` +
+      `<div class="cc-axis" id="cax-${suffix}"></div>` +
+    `</div>` +
+    `<div class="cc-foot"><span id="cfoot-${suffix}">—</span><span class="muted" id="civ-${suffix}"></span></div>`
+  );
+}
+
+function buildChartDom() {
+  const ivSeg = document.getElementById("chart-iv");
+  if (ivSeg && !ivSeg.children.length) {
+    ivSeg.innerHTML = CHART_INTERVALS.map((iv) => {
+      const on = iv.code === chartState.interval;
+      return `<button type="button" class="seg-neutral${on ? " active" : ""}" data-iv="${esc(iv.code)}" aria-pressed="${on}">${esc(iv.label)}</button>`;
+    }).join("");
+  }
+  const symSeg = document.getElementById("chart-sym");
+  if (symSeg && !symSeg.children.length) {
+    symSeg.innerHTML = CHART_SYMBOLS.map((s) => {
+      const on = s.id === chartState.single;
+      return `<button type="button" class="seg-neutral${on ? " active" : ""}" data-sym="${esc(s.id)}" aria-pressed="${on}">${esc(s.label)}</button>`;
+    }).join("");
+  }
+  const grid = document.getElementById("charts-grid");
+  if (grid && !grid.children.length) {
+    // data-trade reuses the existing delegated click → loadSymbolIntoTicket wiring.
+    grid.innerHTML = CHART_SYMBOLS.map(
+      (s) => `<div class="cc-card clickable" data-trade="${esc(s.id)}">${chartCardHTML(s, s.id)}</div>`
+    ).join("");
+  }
+  const single = document.getElementById("charts-single");
+  if (single && !single.children.length) {
+    single.innerHTML = `<div class="cc-card">${chartCardHTML(chartSymById(chartState.single), "single")}</div>`;
+  }
+}
+
+function updateChartHeader(sm, suffix) {
+  const arr = chartState.data[sm.id];
+  if (!arr || !arr.length) return;
+  const last = arr[arr.length - 1], first = arr[0];
+  const chg = first.o ? (last.c / first.o - 1) * 100 : 0;
+  const lastEl = document.getElementById(`cc-last-${suffix}`);
+  if (lastEl) lastEl.textContent = fmtNum(last.c, sm.dp);
+  const chgEl = document.getElementById(`cc-chg-${suffix}`);
+  if (chgEl) {
+    chgEl.textContent = `${chg > 0 ? "▲ +" : chg < 0 ? "▼ " : ""}${chg.toFixed(2)}%`;
+    chgEl.className = "cc-chg mono " + (chg > 0 ? "pos" : chg < 0 ? "neg" : "flat");
+  }
+  let hi = -Infinity, lo = Infinity;
+  arr.forEach((c) => { if (c.h > hi) hi = c.h; if (c.l < lo) lo = c.l; });
+  const footEl = document.getElementById(`cfoot-${suffix}`);
+  if (footEl) footEl.textContent = `H ${fmtNum(hi, sm.dp)}  L ${fmtNum(lo, sm.dp)}`;
+  const ivEl = document.getElementById(`civ-${suffix}`);
+  // Label from the interval the on-screen data was fetched with (not the freshly
+  // selected one) so the footer can never describe candles it doesn't show.
+  if (ivEl) ivEl.textContent = `${intervalLabel(chartState.loadedInterval)} · ${arr.length} candles`;
+}
+
+function renderCharts() {
+  const grid = document.getElementById("charts-grid");
+  const single = document.getElementById("charts-single");
+  const symSeg = document.getElementById("chart-sym");
+  if (chartState.view === "grid") {
+    if (grid) grid.hidden = false;
+    if (single) single.hidden = true;
+    if (symSeg) symSeg.hidden = true;
+    CHART_SYMBOLS.forEach((s) => {
+      renderCandles(document.getElementById(`cs-${s.id}`), document.getElementById(`cax-${s.id}`), chartState.data[s.id], s.dp);
+      updateChartHeader(s, s.id);
+    });
+  } else {
+    if (grid) grid.hidden = true;
+    if (single) single.hidden = false;
+    if (symSeg) symSeg.hidden = false;
+    const s = chartSymById(chartState.single);
+    const head = single && single.querySelector(".cc-sym");
+    if (head) head.innerHTML = `<b>${esc(s.label)}</b><span>${esc(s.id)} · Perp</span>`;
+    renderCandles(document.getElementById("cs-single"), document.getElementById("cax-single"), chartState.data[s.id], s.dp);
+    updateChartHeader(s, "single");
+  }
+}
+
+async function fetchCharts() {
+  // Single-flight: if a batch is already running, record that the selection may
+  // have changed and let the in-flight batch trigger ONE more fetch when it ends,
+  // so a control click during a poll tick is never silently dropped.
+  if (chartState.fetching) { chartState.pending = true; return; }
+  // Snapshot the params for THIS batch so the URL, the rendered data, and the
+  // footer label are always mutually consistent even if a control changes mid-flight.
+  const iv = chartState.interval;
+  const view = chartState.view;
+  const syms = view === "grid" ? CHART_SYMBOLS.map((s) => s.id) : [chartState.single];
+  const limit = view === "grid" ? CHART_LIMIT.grid : CHART_LIMIT.single;
+  chartState.fetching = true;
+  try {
+    await Promise.all(
+      syms.map(async (id) => {
+        try {
+          const data = await api(
+            `/api/klines?symbol=${encodeURIComponent(id)}&interval=${encodeURIComponent(iv)}&limit=${limit}`
+          );
+          chartState.data[id] = parseKline(data);
+        } catch (e) {
+          // Keep the previous candles on a transient error — never blank the chart.
+        }
+      })
+    );
+    chartState.loadedInterval = iv; // the on-screen candles now reflect `iv`
+    renderCharts();
+  } finally {
+    chartState.fetching = false;
+    if (chartState.pending) { chartState.pending = false; fetchCharts(); }
+  }
+}
+
+function chartsVisible() {
+  const pane = document.querySelector('[data-pane="dashboard"]');
+  return !!pane && !pane.hidden && !document.hidden;
+}
+function startChartPolling() {
+  stopChartPolling();
+  if (!chartsVisible()) return;
+  fetchCharts(); // immediate first paint
+  _chartTimer = setInterval(() => {
+    if (!chartsVisible()) { stopChartPolling(); return; }
+    fetchCharts();
+  }, 1000);
+}
+function stopChartPolling() {
+  if (_chartTimer) { clearInterval(_chartTimer); _chartTimer = null; }
+}
+
+function wireCharts() {
+  const panel = document.getElementById("charts-panel");
+  if (!panel) return;
+  buildChartDom();
+  const repaintSeg = (seg, btn) =>
+    seg.querySelectorAll("button").forEach((x) => {
+      const on = x === btn;
+      x.classList.toggle("active", on);
+      x.setAttribute("aria-pressed", String(on));
+    });
+
+  const viewSeg = document.getElementById("chart-view");
+  if (viewSeg) viewSeg.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-view]");
+    if (!b) return;
+    chartState.view = b.getAttribute("data-view");
+    repaintSeg(viewSeg, b);
+    renderCharts();
+    fetchCharts(); // single view / different limit may need fresh data
+  });
+
+  const symSeg = document.getElementById("chart-sym");
+  if (symSeg) symSeg.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-sym]");
+    if (!b) return;
+    chartState.single = b.getAttribute("data-sym");
+    repaintSeg(symSeg, b);
+    renderCharts();
+    fetchCharts();
+  });
+
+  const ivSeg = document.getElementById("chart-iv");
+  if (ivSeg) ivSeg.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-iv]");
+    if (!b) return;
+    chartState.interval = b.getAttribute("data-iv");
+    repaintSeg(ivSeg, b);
+    fetchCharts();
+  });
+
+  // Pause polling when the browser tab is backgrounded; resume when visible.
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopChartPolling();
+    else startChartPolling();
+  });
+
+  startChartPolling();
+}
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 (async function init() {
@@ -2394,6 +2708,7 @@ function syncHeaderHeight() {
   wireExplorer();
   wireTabs();
   wireMarketsHistory();
+  wireCharts(); // live candlestick charts (read-only; polls while dashboard visible)
   wireCurrencyToggle(); // restore saved currency BEFORE the first render
   renderLoading(); // skeleton rows until the first snapshot lands
   updateSizingAvail();

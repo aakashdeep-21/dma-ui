@@ -124,6 +124,25 @@
               </table>
             </div>
           </section>
+
+          <!-- Live candlestick charts (read-only public market data). Available
+               to both roles; click a chart to load that symbol into the ticket. -->
+          <section class="panel" id="charts-panel">
+            <div class="panel-head">
+              <h2>Live Charts</h2>
+              <div class="chart-controls">
+                <div class="segment chart-seg" id="chart-view" role="group" aria-label="Chart view">
+                  <button type="button" class="seg-neutral active" data-view="grid" aria-pressed="true">BTC · ETH · SOL</button>
+                  <button type="button" class="seg-neutral" data-view="single" aria-pressed="false">Single</button>
+                </div>
+                <div class="segment chart-seg" id="chart-sym" role="group" aria-label="Chart symbol" hidden></div>
+                <!-- Interval buttons are rendered by wireCharts() from CHART_INTERVALS (single source). -->
+                <div class="segment chart-seg" id="chart-iv" role="group" aria-label="Candle interval"></div>
+              </div>
+            </div>
+            <div id="charts-grid" class="charts-grid"></div>
+            <div id="charts-single" class="charts-single" hidden></div>
+          </section>
         </div>
 
         <!-- Docked order rail (admin only). Co-locates the decision (positions/PnL)

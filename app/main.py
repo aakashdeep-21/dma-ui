@@ -30,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from starlette.responses import Response as StarletteResponse
 
-from . import auth, dma_client
+from . import auth, dma_client, market_data
 from .config import settings
 
 def _configure_logging() -> None:
@@ -73,8 +73,9 @@ logger = logging.getLogger("dma-ui")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
-    # Cleanly close the shared upstream HTTP client on shutdown.
+    # Cleanly close the shared upstream HTTP clients on shutdown.
     await dma_client.aclose()
+    await market_data.aclose()
 
 
 app = FastAPI(title="DMA Trading UI", lifespan=lifespan)
@@ -363,6 +364,20 @@ async def api_orderbook(symbol: str, user: dict = Depends(current_user)):
     return await dma_client.get_orderbook(symbol)
 
 
+@app.get("/api/klines")
+async def api_klines(
+    symbol: str,
+    interval: str,
+    limit: str | None = None,
+    user: dict = Depends(current_user),
+):
+    """Public OHLC candles for the dashboard charts. Read-only and isolated from
+    the signed trading path: served by `market_data` (no API key, no signing),
+    with the symbol/interval validated against a server-side whitelist. Requires
+    a logged-in session like every other read endpoint."""
+    return await market_data.get_kline(symbol, interval, limit)
+
+
 # --------------------------------------------------------------------------
 # Write API (admin only)
 # --------------------------------------------------------------------------
@@ -588,6 +603,14 @@ async def dma_error_handler(request: Request, exc: dma_client.DMAError):
     if status in (401, 403):
         status = 502
     return JSONResponse(status_code=status, content={"error": exc.detail})
+
+
+@app.exception_handler(market_data.MarketDataError)
+async def market_data_error_handler(request: Request, exc: market_data.MarketDataError):
+    # Read-only public-data errors. Never remapped to 401/403 (those would make
+    # the frontend think the session expired); validation failures are 400 and
+    # upstream issues are 502, both safe for the browser to see.
+    return JSONResponse(status_code=exc.status, content={"error": exc.detail})
 
 
 # --------------------------------------------------------------------------

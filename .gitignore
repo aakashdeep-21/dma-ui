@@ -17,8 +17,8 @@ env/
 .vscode/
 *.swp
 
-# Claude Code local settings (machine-specific)
-.claude/settings.local.json
+# Claude Code local settings (machine-specific) — exclude the whole dir
+.claude/
 
 # Reference/source material — not part of the deployment, may contain secrets
 dma-api.json
