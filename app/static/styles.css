@@ -669,3 +669,84 @@ body.viewer .workspace { grid-template-columns: 1fr; }
 .cs-down { fill: var(--neg); stroke: var(--neg); }
 .cs-grid { stroke: rgba(35,43,58,0.6); stroke-width: 1; vector-effect: non-scaling-stroke; }
 @media (max-width: 760px) { .cc-chart.lg { height: 300px; } }
+
+/* ---------- Privacy mode (hide account figures) ----------
+   A DISPLAY-ONLY lens for shoulder-surfing / screen-share protection. Toggling
+   `body.privacy-on` masks every element carrying `.priv` (account money, size,
+   PnL and performance figures) behind a fixed-width mask, and blanks the visual
+   gauges that encode those same figures (margin meter, win/loss bar, PnL curve).
+
+   It deliberately changes NOTHING about the data model: state.available, the
+   order-sizing math, confirm dialogs and submissions all read the real numbers
+   from JS, never from the (visually masked) DOM. So this is purely cosmetic and
+   carries no monetary or security risk. Public market data — Markets, Live
+   Charts, the order book, tickers and instrument specs — is never marked `.priv`
+   and stays fully visible. A FIXED mask (constant width, regardless of the
+   value) also leaks no magnitude/digit-count. */
+.icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 34px; height: 32px; padding: 0;
+  background: transparent; border: 1px solid var(--border); color: var(--text-secondary);
+  border-radius: 8px; cursor: pointer;
+}
+.icon-btn:hover { border-color: var(--accent); color: var(--text); }
+.icon-btn svg { width: 18px; height: 18px; display: block; fill: none; stroke: currentColor;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+/* Eye (open) shows while figures are visible; eye-off shows while masked. */
+.icon-btn .icon-off { display: none; }
+body.privacy-on .icon-btn .icon-on { display: none; }
+body.privacy-on .icon-btn .icon-off { display: block; }
+body.privacy-on #privacy-toggle { color: var(--warn); border-color: rgba(245,166,35,0.5); }
+
+body.privacy-on .priv {
+  position: relative;
+  color: transparent !important;   /* also hides gain/loss colour, so the mask leaks no sign */
+  text-shadow: none !important;
+  cursor: default;
+  overflow: hidden;                /* clip the mask to the cell (only while masking) so a
+                                      short value's **** can't bleed into a neighbour column */
+}
+/* Hide nested sub-hints (ROE%, break-even, fill/liq gauges, range markers) but
+   keep them in flow so the cell footprint — and column alignment — is stable. */
+body.privacy-on .priv * { visibility: hidden !important; }
+/* `:not(:empty)` so a value that is legitimately blank (e.g. an empty PnL% or
+   available sub-stat) shows nothing rather than a misleading ****. */
+body.privacy-on .priv:not(:empty)::after {
+  content: "****";
+  position: absolute;
+  inset: 0;
+  display: block;
+  text-align: inherit;             /* respect right-aligned numeric cells */
+  color: var(--muted);
+  letter-spacing: 0.12em;
+  font-weight: 600;
+  visibility: visible;
+  pointer-events: none;
+  -webkit-user-select: none; user-select: none;
+}
+/* Gauges that visually encode a masked figure → blank the fill while masked. */
+body.privacy-on #margin-meter > span,
+body.privacy-on .analytics .wl-bar > span,
+body.privacy-on .analytics .posneg-bar > span { visibility: hidden !important; }
+body.privacy-on .analytics .chart-card svg { visibility: hidden !important; }
+
+/* The PnL cell pulses its BACKGROUND green/red on each meaningful tick (flash-up/
+   -down). The text mask doesn't touch background, so without this the masked
+   **** cell would still flash the gain/loss direction — silence the animation
+   while masking (mirrors the prefers-reduced-motion rule). */
+body.privacy-on td.flash-up,
+body.privacy-on td.flash-down { animation: none !important; }
+
+/* Raw-JSON dumps in the API Explorer print the full unmasked API payload (which
+   for account queries is every balance/size/PnL figure). The `.priv` text mask
+   can't cover a tall multi-line <pre>, so hide the JSON body outright while
+   masking and label why. Public-query JSON is hidden too — a dev aid the user
+   can restore by leaving privacy mode; safer than leaking account JSON. */
+body.privacy-on .json-view { display: none !important; }
+body.privacy-on .raw-json > summary::after {
+  content: " · hidden in privacy mode"; color: var(--muted); font-weight: 400;
+}
+
+/* Positive / negative PnL split bar (History analytics) — mirrors .wl-bar. */
+.posneg-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: var(--border); margin-top: 4px; }
+.posneg-bar .p { background: var(--pos); } .posneg-bar .n { background: var(--neg); }

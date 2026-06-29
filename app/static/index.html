@@ -18,30 +18,30 @@
       <div class="topbar-stats">
         <div class="stat stat-primary">
           <span class="stat-label">Unrealised PnL</span>
-          <span class="stat-value" id="stat-pnl">—</span>
-          <span class="stat-sub" id="stat-pnl-pct"></span>
+          <span class="stat-value priv" id="stat-pnl">—</span>
+          <span class="stat-sub priv" id="stat-pnl-pct"></span>
         </div>
         <div class="stat stat-primary">
           <span class="stat-label" title="Maintenance margin ÷ margin balance. Higher = closer to liquidation.">Margin Ratio</span>
-          <span class="stat-value" id="stat-margin-ratio">—</span>
+          <span class="stat-value priv" id="stat-margin-ratio">—</span>
           <span class="meter" id="margin-meter" role="img" aria-label="Margin ratio"><span style="width:0%"></span></span>
         </div>
         <div class="stat">
           <span class="stat-label">Equity</span>
-          <span class="stat-value" id="stat-equity">—</span>
-          <span class="stat-sub" id="stat-available"></span>
+          <span class="stat-value priv" id="stat-equity">—</span>
+          <span class="stat-sub priv" id="stat-available"></span>
         </div>
         <div class="stat">
           <span class="stat-label">Margin Used</span>
-          <span class="stat-value" id="stat-margin-used">—</span>
+          <span class="stat-value priv" id="stat-margin-used">—</span>
         </div>
         <div class="stat stat-chip">
           <span class="stat-label">Positions</span>
-          <span class="stat-value" id="stat-positions">—</span>
+          <span class="stat-value priv" id="stat-positions">—</span>
         </div>
         <div class="stat stat-chip">
           <span class="stat-label">Open Orders</span>
-          <span class="stat-value" id="stat-orders">—</span>
+          <span class="stat-value priv" id="stat-orders">—</span>
         </div>
       </div>
       <div class="topbar-right">
@@ -49,6 +49,14 @@
           <button type="button" data-ccy="USDT" class="seg-neutral active" aria-pressed="true">USDT</button>
           <button type="button" data-ccy="INR" class="seg-neutral" aria-pressed="false">INR</button>
         </div>
+        <!-- Privacy toggle: masks account figures (balances, sizes, PnL) behind
+             **** for shoulder-surfing/screen-share. Display-only; public market
+             data stays visible and trading math is unaffected. -->
+        <button id="privacy-toggle" class="icon-btn" type="button" aria-pressed="false"
+                title="Hide account figures" aria-label="Hide account figures">
+          <svg class="icon-on" viewBox="0 0 24 24" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>
+          <svg class="icon-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+        </button>
         <span id="conn-status" class="conn conn-off" role="status" aria-live="polite">connecting…</span>
         <span class="user-badge"><span id="user-name">—</span> <span id="user-role" class="role-pill"></span></span>
         <button id="logout-btn" class="btn-ghost">Logout</button>
@@ -196,7 +204,7 @@
                    (leverage is changed separately under Account). -->
               <div class="sizing">
                 <div class="sizing-row">
-                  <span class="sizing-avail" id="sizing-avail">avail —</span>
+                  <span class="sizing-avail priv" id="sizing-avail">avail —</span>
                   <label class="sizing-lev">lev
                     <input id="sizing-lev" type="text" inputmode="decimal" value="1" autocomplete="off" />
                   </label>

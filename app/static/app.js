@@ -83,11 +83,14 @@ function updateSortIndicators() {
   });
 }
 
-// Small key/value detail grid for an expanded row. Skips empty values.
+// Small key/value detail grid for an expanded row. Skips empty values. A third
+// truthy tuple element ([k, v, true]) marks that value as a private account
+// figure, so the privacy toggle masks it (money/size) while leaving neutral
+// fields like ids, modes and timestamps readable.
 function detailGrid(pairs) {
   const items = pairs
     .filter(([, v]) => v !== undefined && v !== null && v !== "" && v !== "—")
-    .map(([k, v]) => `<div><span class="dt-k">${esc(k)}</span><span class="dt-v mono">${esc(v)}</span></div>`)
+    .map(([k, v, priv]) => `<div><span class="dt-k">${esc(k)}</span><span class="dt-v mono${priv ? " priv" : ""}">${esc(v)}</span></div>`)
     .join("");
   return `<div class="detail-grid">${items || '<span class="muted">No extra detail.</span>'}</div>`;
 }
@@ -467,7 +470,8 @@ function renderSummary(d) {
   const upl = Number(summary.totalUnrealisedPnl);
   const pnlEl = $("#stat-pnl");
   pnlEl.textContent = `${fmtMoneySigned(summary.totalUnrealisedPnl)} ${curUnit()}`;
-  pnlEl.className = "stat-value " + pnlClass(summary.totalUnrealisedPnl);
+  // `priv` kept on every reassignment so the privacy mask survives re-renders.
+  pnlEl.className = "stat-value priv " + pnlClass(summary.totalUnrealisedPnl);
 
   $("#stat-positions").textContent = summary.openPositions ?? "—";
   $("#stat-orders").textContent = summary.openOrders ?? "—";
@@ -506,7 +510,7 @@ function renderSummary(d) {
     const base = usedMargin && usedMargin > 0 ? usedMargin : equity;
     if (isFinite(upl) && base && base > 0) {
       pnlPctEl.textContent = fmtPct((upl / base) * 100);
-      pnlPctEl.className = "stat-sub " + pnlClass(upl);
+      pnlPctEl.className = "stat-sub priv " + pnlClass(upl);
     } else {
       pnlPctEl.textContent = "";
     }
@@ -532,10 +536,10 @@ function renderSummary(d) {
       bar.style.width = Math.min(100, Math.max(0, ratio)).toFixed(1) + "%";
       meter.className = "meter" + (ratio >= 80 ? " danger" : ratio >= 50 ? " warn" : "");
       meter.setAttribute("aria-label", "Margin ratio " + fmtPct(ratio, false));
-      ratioEl.className = "stat-value" + (ratio >= 80 ? " neg" : ratio >= 50 ? " warn" : "");
+      ratioEl.className = "stat-value priv" + (ratio >= 80 ? " neg" : ratio >= 50 ? " warn" : "");
     } else {
       ratioEl.textContent = "—";
-      ratioEl.className = "stat-value";
+      ratioEl.className = "stat-value priv";
       bar.style.width = "0%";
       meter.className = "meter";
       meter.setAttribute("aria-label", "Margin ratio unavailable");
@@ -634,12 +638,12 @@ function renderPositions(positions) {
       if (isFinite(cur)) nextPrev[key] = cur;
 
       const detail = detailGrid([
-        ["Break-even", hasVal(p.breakEvenPrice) ? fmtMoney(p.breakEvenPrice, 4) : ""],
-        ["Initial margin", p.positionIM ? fmtMoney(p.positionIM) : ""],
-        ["Maint. margin", p.positionMM ? fmtMoney(p.positionMM) : ""],
-        ["Realized PnL", p.curRealisedPnl !== undefined && p.curRealisedPnl !== "" ? fmtMoney(p.curRealisedPnl) : ""],
-        ["Cum. realized", p.cumRealisedPnl ? fmtMoney(p.cumRealisedPnl) : ""],
-        ["Position value", fmtMoney(p.positionValue)],
+        ["Break-even", hasVal(p.breakEvenPrice) ? fmtMoney(p.breakEvenPrice, 4) : "", true],
+        ["Initial margin", p.positionIM ? fmtMoney(p.positionIM) : "", true],
+        ["Maint. margin", p.positionMM ? fmtMoney(p.positionMM) : "", true],
+        ["Realized PnL", p.curRealisedPnl !== undefined && p.curRealisedPnl !== "" ? fmtMoney(p.curRealisedPnl) : "", true],
+        ["Cum. realized", p.cumRealisedPnl ? fmtMoney(p.cumRealisedPnl) : "", true],
+        ["Position value", fmtMoney(p.positionValue), true],
         ["TP/SL mode", p.tpslMode],
         ["Position idx", p.positionIdx],
         ["Opened", fmtTime(p.createdTime)],
@@ -649,15 +653,15 @@ function renderPositions(positions) {
       return `<tr class="exp-row${expanded ? " expanded" : ""}" data-pkey="${esc(key)}" role="button" tabindex="0" aria-expanded="${expanded}">
         <td class="mono card-head"><span class="caret">${expanded ? "▾" : "▸"}</span>${esc(p.symbol)}</td>
         <td data-label="Side" class="side-cell ${(p.side || "").toLowerCase() === "buy" ? "pos" : "neg"}">${esc(p.side)}</td>
-        <td data-label="Size" class="mono">${fmtNum(p.size, 4)}</td>
-        <td data-label="Entry" class="mono">${fmtMoney(p.avgPrice, 4)}${beSub}</td>
+        <td data-label="Size" class="mono priv">${fmtNum(p.size, 4)}</td>
+        <td data-label="Entry" class="mono priv">${fmtMoney(p.avgPrice, 4)}${beSub}</td>
         <td data-label="Mark" class="mono">${fmtMoney(p.markPrice, 4)}</td>
-        <td data-label="Liq." class="mono">${liqCell}</td>
-        <td data-label="Lev" class="mono">${esc(p.leverage ?? "—")}x</td>
-        <td data-label="Value" class="mono">${fmtMoney(p.positionValue)}</td>
-        <td data-label="Unrealised PnL" class="mono ${pnlClass(pnl)}${flash}">${fmtMoneySigned(pnl)}${roeSub}</td>
-        <td data-label="TP" class="mono">${tpCell}</td>
-        <td data-label="SL" class="mono">${slCell}</td>
+        <td data-label="Liq." class="mono priv">${liqCell}</td>
+        <td data-label="Lev" class="mono priv">${esc(p.leverage ?? "—")}x</td>
+        <td data-label="Value" class="mono priv">${fmtMoney(p.positionValue)}</td>
+        <td data-label="Unrealised PnL" class="mono priv ${pnlClass(pnl)}${flash}">${fmtMoneySigned(pnl)}${roeSub}</td>
+        <td data-label="TP" class="mono priv">${tpCell}</td>
+        <td data-label="SL" class="mono priv">${slCell}</td>
         ${actions}
       </tr>
       <tr class="detail-row"${expanded ? "" : " hidden"}><td colspan="99">${detail}</td></tr>`;
@@ -714,8 +718,8 @@ function renderOrders(orders) {
         ["Close on trigger", o.closeOnTrigger === undefined ? "" : String(o.closeOnTrigger)],
         ["Stop order type", o.stopOrderType],
         ["Trigger by", o.triggerBy],
-        ["Cum. exec qty", o.cumExecQty],
-        ["Leaves qty", o.leavesQty],
+        ["Cum. exec qty", o.cumExecQty, true],
+        ["Leaves qty", o.leavesQty, true],
         ["Created", fmtTime(o.createdTime)],
         ["Updated", fmtTime(o.updatedTime)],
       ]);
@@ -724,9 +728,9 @@ function renderOrders(orders) {
         <td class="mono card-head"><span class="caret">${expanded ? "▾" : "▸"}</span>${esc(o.symbol)}</td>
         <td data-label="Side" class="side-cell ${(o.side || "").toLowerCase() === "buy" ? "pos" : "neg"}">${esc(o.side)}</td>
         <td data-label="Type">${esc(o.orderType)}${badges}</td>
-        <td data-label="Qty" class="mono">${fmtNum(o.qty, 4)}${fillSub}</td>
-        <td data-label="Price" class="mono">${o.price && Number(o.price) ? fmtMoney(o.price, 4) : "—"}</td>
-        <td data-label="Trigger" class="mono">${o.triggerPrice && Number(o.triggerPrice) ? fmtMoney(o.triggerPrice, 4) : "—"}</td>
+        <td data-label="Qty" class="mono priv">${fmtNum(o.qty, 4)}${fillSub}</td>
+        <td data-label="Price" class="mono priv">${o.price && Number(o.price) ? fmtMoney(o.price, 4) : "—"}</td>
+        <td data-label="Trigger" class="mono priv">${o.triggerPrice && Number(o.triggerPrice) ? fmtMoney(o.triggerPrice, 4) : "—"}</td>
         <td data-label="Status">${esc(o.orderStatus)}</td>
         ${actions}
       </tr>
@@ -1492,10 +1496,13 @@ function listOf(data) {
   return [];
 }
 // Build a table. columns: [{label, get:(row)=>value, cls?:(row)=>className,
-// raw?:(row)=>html}]. `raw` injects pre-built HTML for a cell (used for sign-
-// coloured funding %, fill/range gauges). IMPORTANT: a raw producer must build
-// its HTML only from numeric/own values — never from unescaped exchange strings.
-// Every cell carries data-label so the mobile card layout can label values.
+// raw?:(row)=>html, priv?:bool}]. `raw` injects pre-built HTML for a cell (used
+// for sign-coloured funding %, fill/range gauges). IMPORTANT: a raw producer
+// must build its HTML only from numeric/own values — never from unescaped
+// exchange strings. `priv: true` marks the column as a private account figure
+// (money/size/PnL) so the privacy toggle masks it; leave it off for public
+// market columns (prices on Tickers, instrument specs, …). Every cell carries
+// data-label so the mobile card layout can label values.
 function buildTable(rows, columns) {
   const head = columns.map((c) => `<th>${esc(c.label)}</th>`).join("");
   const body = rows
@@ -1504,7 +1511,7 @@ function buildTable(rows, columns) {
         "<tr>" +
         columns
           .map((c) => {
-            const extra = c.cls ? " " + c.cls(r) : "";
+            const extra = (c.priv ? " priv" : "") + (c.cls ? " " + c.cls(r) : "");
             const lbl = ` data-label="${esc(c.label)}"`;
             // c.money => currency-convert the value (INR mode) via cvtCell;
             // c.raw => caller-built safe HTML; otherwise escaped raw value.
@@ -1563,20 +1570,21 @@ function autoRender(data) {
 function renderWallet(data) {
   const acct = listOf(data)[0];
   if (!acct) return autoRender(data);
+  // Third tuple element = private account figure (masked by the privacy toggle).
   const rows = [
     ["Account Type", esc(cell(acct.accountType))],
-    ["Total Equity", cvtCell(acct.totalEquity, 2)],
-    ["Wallet Balance", cvtCell(acct.totalWalletBalance, 2)],
-    ["Available Balance", cvtCell(acct.totalAvailableBalance, 2)],
-    ["Margin Balance", cvtCell(acct.totalMarginBalance, 2)],
-    ["Unrealised PnL", cvtCell(acct.totalPerpUPL, 2)],
-    ["Initial Margin", cvtCell(acct.totalInitialMargin, 2)],
-    ["Maint. Margin", cvtCell(acct.totalMaintenanceMargin, 2)],
+    ["Total Equity", cvtCell(acct.totalEquity, 2), true],
+    ["Wallet Balance", cvtCell(acct.totalWalletBalance, 2), true],
+    ["Available Balance", cvtCell(acct.totalAvailableBalance, 2), true],
+    ["Margin Balance", cvtCell(acct.totalMarginBalance, 2), true],
+    ["Unrealised PnL", cvtCell(acct.totalPerpUPL, 2), true],
+    ["Initial Margin", cvtCell(acct.totalInitialMargin, 2), true],
+    ["Maint. Margin", cvtCell(acct.totalMaintenanceMargin, 2), true],
     ["Display Currency", esc(curUnit())],
   ];
   const summary =
     `<div class="table-wrap"><table class="kv"><tbody>` +
-    rows.map(([k, v]) => `<tr><th>${esc(k)}</th><td class="mono">${v}</td></tr>`).join("") +
+    rows.map(([k, v, priv]) => `<tr><th>${esc(k)}</th><td class="mono${priv ? " priv" : ""}">${v}</td></tr>`).join("") +
     `</tbody></table></div>`;
   const coins = acct.coin || [];
   // Per-coin balances (equity/wallet/available/PnL) are denominated in the
@@ -1587,12 +1595,12 @@ function renderWallet(data) {
   const coinTable = coins.length
     ? buildTable(coins, [
         { label: "Coin", get: (c) => c.coin },
-        { label: "Equity", raw: (c) => coinAmt(c, c.equity) },
-        { label: "Wallet Bal", raw: (c) => coinAmt(c, c.walletBalance) },
-        { label: "Available", raw: (c) => coinAmt(c, c.availableToWithdraw ?? c.availableToBorrow) },
-        { label: "Unreal PnL", raw: (c) => coinAmt(c, c.unrealisedPnl), cls: (c) => pnlClass(c.unrealisedPnl) },
-        { label: "Realised PnL", raw: (c) => coinAmt(c, c.cumRealisedPnl), cls: (c) => pnlClass(c.cumRealisedPnl) },
-        { label: `Value (${curUnit()})`, get: (c) => c.usdValue, money: true, digits: 2 },
+        { label: "Equity", raw: (c) => coinAmt(c, c.equity), priv: true },
+        { label: "Wallet Bal", raw: (c) => coinAmt(c, c.walletBalance), priv: true },
+        { label: "Available", raw: (c) => coinAmt(c, c.availableToWithdraw ?? c.availableToBorrow), priv: true },
+        { label: "Unreal PnL", raw: (c) => coinAmt(c, c.unrealisedPnl), cls: (c) => pnlClass(c.unrealisedPnl), priv: true },
+        { label: "Realised PnL", raw: (c) => coinAmt(c, c.cumRealisedPnl), cls: (c) => pnlClass(c.cumRealisedPnl), priv: true },
+        { label: `Value (${curUnit()})`, get: (c) => c.usdValue, money: true, digits: 2, priv: true },
       ])
     : "";
   return summary + coinTable;
@@ -1612,8 +1620,10 @@ function renderWithdrawable(data) {
   const kv = (obj) => {
     const rows = Object.entries(obj).map(([k, v]) => {
       const isNum = v !== "" && v !== null && typeof v !== "object" && isFinite(Number(v));
-      const html = isNum && _MONEY_KEY.test(k) ? cvtCell(v, 2) : esc(cell(v));
-      return `<tr><th>${esc(k)}</th><td class="mono">${html}</td></tr>`;
+      const isMoney = isNum && _MONEY_KEY.test(k);
+      const html = isMoney ? cvtCell(v, 2) : esc(cell(v));
+      // Money amounts are private (masked by the privacy toggle); other fields stay.
+      return `<tr><th>${esc(k)}</th><td class="mono${isMoney ? " priv" : ""}">${html}</td></tr>`;
     });
     return `<div class="table-wrap"><table class="kv"><tbody>${rows.join("")}</tbody></table></div>`;
   };
@@ -1658,14 +1668,14 @@ function renderClosedPnl(data) {
     { label: "Closed At", get: (r) => fmtTime(r.updatedTime ?? r.createdTime) },
     { label: "Symbol", get: (r) => r.symbol },
     { label: "Side", get: (r) => r.side, cls: (r) => sideClass(r.side) },
-    { label: "Qty", get: (r) => r.qty ?? r.closedSize },
-    { label: "Entry", get: (r) => r.avgEntryPrice, money: true },
-    { label: "Exit", get: (r) => r.avgExitPrice, money: true },
-    { label: "Closed PnL", get: (r) => r.closedPnl, cls: (r) => pnlClass(r.closedPnl), money: true, digits: 2 },
-    { label: "Leverage", get: (r) => r.leverage },
+    { label: "Qty", get: (r) => r.qty ?? r.closedSize, priv: true },
+    { label: "Entry", get: (r) => r.avgEntryPrice, money: true, priv: true },
+    { label: "Exit", get: (r) => r.avgExitPrice, money: true, priv: true },
+    { label: "Closed PnL", get: (r) => r.closedPnl, cls: (r) => pnlClass(r.closedPnl), money: true, digits: 2, priv: true },
+    { label: "Leverage", get: (r) => r.leverage, priv: true },
   ]);
   return (
-    `<div class="explorer-summary">Total closed PnL: <span class="${pnlClass(total)}">${fmtMoney(total)} ${esc(curUnit())}</span> · ${list.length} record(s)</div>` +
+    `<div class="explorer-summary">Total closed PnL: <span class="${pnlClass(total)} priv">${fmtMoney(total)} ${esc(curUnit())}</span> · ${list.length} record(s)</div>` +
     table
   );
 }
@@ -1678,10 +1688,10 @@ function renderExecutions(data) {
     { label: "Symbol", get: (r) => r.symbol },
     { label: "Side", get: (r) => r.side, cls: (r) => sideClass(r.side) },
     { label: "Type", get: (r) => r.orderType },
-    { label: "Exec Qty", get: (r) => r.execQty },
-    { label: "Exec Price", get: (r) => r.execPrice, money: true },
-    { label: "Exec Value", get: (r) => r.execValue, money: true, digits: 2 },
-    { label: "Fee", get: (r) => r.execFee, money: true, digits: 4 },
+    { label: "Exec Qty", get: (r) => r.execQty, priv: true },
+    { label: "Exec Price", get: (r) => r.execPrice, money: true, priv: true },
+    { label: "Exec Value", get: (r) => r.execValue, money: true, digits: 2, priv: true },
+    { label: "Fee", get: (r) => r.execFee, money: true, digits: 4, priv: true },
     { label: "Maker", get: (r) => r.isMaker },
   ]);
 }
@@ -1723,12 +1733,12 @@ function renderPositionsTable(data) {
   return buildTable(list, [
     { label: "Symbol", get: (p) => p.symbol },
     { label: "Side", get: (p) => p.side, cls: (p) => sideClass(p.side) },
-    { label: "Size", get: (p) => p.size },
-    { label: "Entry", get: (p) => p.avgPrice, money: true },
+    { label: "Size", get: (p) => p.size, priv: true },
+    { label: "Entry", get: (p) => p.avgPrice, money: true, priv: true },
     { label: "Mark", get: (p) => p.markPrice, money: true },
-    { label: "Lev", get: (p) => (p.leverage ? p.leverage + "x" : "—") },
-    { label: "Value", get: (p) => p.positionValue, money: true },
-    { label: "Unreal PnL", get: (p) => p.unrealisedPnl, cls: (p) => pnlClass(p.unrealisedPnl), money: true, digits: 2 },
+    { label: "Lev", get: (p) => (p.leverage ? p.leverage + "x" : "—"), priv: true },
+    { label: "Value", get: (p) => p.positionValue, money: true, priv: true },
+    { label: "Unreal PnL", get: (p) => p.unrealisedPnl, cls: (p) => pnlClass(p.unrealisedPnl), money: true, digits: 2, priv: true },
   ]);
 }
 
@@ -1739,9 +1749,9 @@ function renderOrdersTable(data) {
     { label: "Symbol", get: (o) => o.symbol },
     { label: "Side", get: (o) => o.side, cls: (o) => sideClass(o.side) },
     { label: "Type", get: (o) => o.orderType },
-    { label: "Qty", get: (o) => o.qty },
-    { label: "Price", get: (o) => o.price, money: true },
-    { label: "Trigger", get: (o) => o.triggerPrice, money: true },
+    { label: "Qty", get: (o) => o.qty, priv: true },
+    { label: "Price", get: (o) => o.price, money: true, priv: true },
+    { label: "Trigger", get: (o) => o.triggerPrice, money: true, priv: true },
     { label: "Status", get: (o) => o.orderStatus },
   ]);
 }
@@ -1892,9 +1902,9 @@ async function fetchHistory() {
     });
     sumEl.hidden = false;
     sumEl.innerHTML =
-      `Realized today: <span class="${pnlClass(today)}">${fmtMoneySigned(today)} ${esc(curUnit())}</span> · ` +
-      `Total (recent ${list.length}): <span class="${pnlClass(total)}">${fmtMoneySigned(total)}</span> · ` +
-      `Win rate: ${list.length ? Math.round((wins / list.length) * 100) : 0}%`;
+      `Realized today: <span class="${pnlClass(today)} priv">${fmtMoneySigned(today)} ${esc(curUnit())}</span> · ` +
+      `Total (recent ${list.length}): <span class="${pnlClass(total)} priv">${fmtMoneySigned(total)}</span> · ` +
+      `Win rate: <span class="priv">${list.length ? Math.round((wins / list.length) * 100) : 0}%</span>`;
     renderHistoryAnalytics(list); // curve + win/loss now; fees fill in after execs load
     closedEl.innerHTML = renderClosedPnl(closed);
   } catch (e) {
@@ -2271,19 +2281,36 @@ function renderHistoryAnalytics(closedList, fees, makerCount, takerCount) {
   const losses = list.length - wins;
   const winPct = list.length ? (wins / list.length) * 100 : 0;
   const total = curve[curve.length - 1] || 0;
+
+  // Profit/loss BOOKED: split realised PnL by sign. grossLoss accumulates the
+  // negative records (so it is ≤ 0). "Positive PnL %" is the share of profit in
+  // the total gross flow (profit ÷ (profit + |loss|)) — the amount-weighted
+  // analogue of win rate, so a few big losses pull it down even at a high win rate.
+  let grossWin = 0, grossLoss = 0;
+  list.forEach((r) => { const v = Number(r.closedPnl) || 0; if (v > 0) grossWin += v; else grossLoss += v; });
+  const grossLossAbs = Math.abs(grossLoss);
+  const flow = grossWin + grossLossAbs;
+  const posPct = flow > 0 ? (grossWin / flow) * 100 : 0;
+
   const coin = curUnit();
   const feeStr = fees != null && isFinite(fees) ? `${fmtMoney(fees)} ${coin}` : "—";
   const mt = (makerCount != null && takerCount != null) ? `${makerCount} / ${takerCount}` : "—";
   el.hidden = false;
+  // Every `.v` (and the bars/curve, handled in CSS) is a private account figure,
+  // masked by the privacy toggle; the `.k` labels stay readable.
   el.innerHTML =
     `<div class="chart-card"><div class="chart-title">Cumulative closed PnL (recent ${list.length})</div>${svgAreaChart(curve)}</div>` +
     `<div class="stat-figs">` +
-      `<div class="figrow"><span class="k">Net realised</span><span class="v ${pnlClass(total)}">${fmtMoneySigned(total)} ${esc(coin)}</span></div>` +
-      `<div class="figrow"><span class="k">Win rate</span><span class="v">${winPct.toFixed(0)}%</span></div>` +
+      `<div class="figrow"><span class="k">Net realised</span><span class="v priv ${pnlClass(total)}">${fmtMoneySigned(total)} ${esc(coin)}</span></div>` +
+      `<div class="figrow"><span class="k">Win rate</span><span class="v priv">${winPct.toFixed(0)}%</span></div>` +
       `<div class="wl-bar" role="img" aria-label="${wins} wins, ${losses} losses"><span class="w" style="width:${winPct.toFixed(1)}%"></span><span class="l" style="width:${(100 - winPct).toFixed(1)}%"></span></div>` +
-      `<div class="figrow"><span class="k">Wins / Losses</span><span class="v">${wins} / ${losses}</span></div>` +
-      `<div class="figrow"><span class="k">Fees (maker/taker)</span><span class="v">${esc(mt)}</span></div>` +
-      `<div class="figrow"><span class="k">Total fees</span><span class="v neg">${esc(feeStr)}</span></div>` +
+      `<div class="figrow"><span class="k">Wins / Losses</span><span class="v priv">${wins} / ${losses}</span></div>` +
+      `<div class="figrow"><span class="k">Profit booked</span><span class="v priv pos">${fmtMoneySigned(grossWin)} ${esc(coin)}</span></div>` +
+      `<div class="figrow"><span class="k">Loss booked</span><span class="v priv neg">${fmtMoneySigned(grossLoss)} ${esc(coin)}</span></div>` +
+      `<div class="figrow"><span class="k">Positive PnL %</span><span class="v priv">${posPct.toFixed(0)}%</span></div>` +
+      `<div class="posneg-bar" role="img" aria-label="${posPct.toFixed(0)}% of booked PnL is profit"><span class="p" style="width:${posPct.toFixed(1)}%"></span><span class="n" style="width:${(100 - posPct).toFixed(1)}%"></span></div>` +
+      `<div class="figrow"><span class="k">Fees (maker/taker)</span><span class="v priv">${esc(mt)}</span></div>` +
+      `<div class="figrow"><span class="k">Total fees</span><span class="v priv neg">${esc(feeStr)}</span></div>` +
     `</div>`;
 }
 
@@ -2316,7 +2343,8 @@ async function loadAccountOverview() {
       const util = (im != null && mb && mb > 0) ? (im / mb) * 100 : null;
       const mmRate = num(acct.accountMMRate);
       const ratio = mmRate != null ? mmRate * 100 : (mm != null && mb && mb > 0 ? (mm / mb) * 100 : null);
-      const card = (k, v, cls) => cards.push(`<div class="acct-card"><div class="k">${esc(k)}</div><div class="v ${cls || ""}">${v}</div></div>`);
+      // Every account-overview card is a private money/ratio figure → `priv`.
+      const card = (k, v, cls) => cards.push(`<div class="acct-card"><div class="k">${esc(k)}</div><div class="v priv ${cls || ""}">${v}</div></div>`);
       card("Equity", `${fmtMoney(num(acct.totalEquity))} ${esc(coin)}`);
       card("Available", `${fmtMoney(avail)} ${esc(coin)}`);
       card("Unrealised PnL", `${fmtMoneySigned(acct.totalPerpUPL)} ${esc(coin)}`, pnlClass(acct.totalPerpUPL));
@@ -2333,6 +2361,35 @@ async function loadAccountOverview() {
   } catch (e) {
     el.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(e.message)}</p>`;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Privacy toggle — hide every account figure (balances, sizes, PnL, performance)
+// behind a fixed **** mask. A DISPLAY-ONLY lens: it flips body.privacy-on, which
+// CSS uses to mask `.priv` elements + neutralise their gauges. It never touches
+// the data model (state.available, sizing math, confirms, submissions all read
+// real numbers from JS), so there is no monetary/security impact. Public market
+// data (Markets, Live Charts, order book, tickers) is unmarked and stays visible.
+// Preference persists in localStorage (like the currency lens); never the token.
+// ---------------------------------------------------------------------------
+function wirePrivacyToggle() {
+  const btn = document.getElementById("privacy-toggle");
+  if (!btn) return;
+  let on = false;
+  try { on = localStorage.getItem("dma.privacy") === "on"; } catch (e) {}
+  const apply = () => {
+    document.body.classList.toggle("privacy-on", on);
+    btn.setAttribute("aria-pressed", String(on));
+    const label = on ? "Show account figures" : "Hide account figures";
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+  };
+  apply(); // restore saved state before the first snapshot renders (no flash)
+  btn.addEventListener("click", () => {
+    on = !on;
+    try { localStorage.setItem("dma.privacy", on ? "on" : "off"); } catch (e) {}
+    apply();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2737,6 +2794,7 @@ function wireCharts() {
   wireTabs();
   wireMarketsHistory();
   wireCharts(); // live candlestick charts (read-only; polls while dashboard visible)
+  wirePrivacyToggle(); // restore saved privacy state BEFORE the first render (no flash)
   wireCurrencyToggle(); // restore saved currency BEFORE the first render
   renderLoading(); // skeleton rows until the first snapshot lands
   updateSizingAvail();
