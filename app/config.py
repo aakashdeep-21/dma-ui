@@ -120,6 +120,18 @@ class Settings:
         # (symbol, interval, limit) per interval, shielding the public API.
         self.CHART_CACHE_TTL: float = _float_env("CHART_CACHE_TTL", 1.0)
 
+        # --- Execution alerts via Telegram (READ-ONLY, opt-in) ---
+        # A background watcher (app/notifier.py) polls the account's executions
+        # and pushes a Telegram message on each fill / TP-SL / liquidation. It is
+        # read-only (cannot trade) and OFF unless BOTH values below are set.
+        # Token/chat are secrets — set them as env vars, never in code.
+        self.TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        self.TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "")
+        # How often the watcher polls executions (seconds) and how many recent
+        # executions to scan each poll.
+        self.NOTIFY_POLL_INTERVAL: float = _float_env("NOTIFY_POLL_INTERVAL", 10.0)
+        self.NOTIFY_EXEC_LIMIT: int = max(1, _int_env("NOTIFY_EXEC_LIMIT", 50))
+
     def missing_required(self) -> list[str]:
         """Return the names of required vars that are not set."""
         required = {

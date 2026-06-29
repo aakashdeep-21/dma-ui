@@ -30,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from starlette.responses import Response as StarletteResponse
 
-from . import auth, dma_client, market_data
+from . import auth, dma_client, market_data, notifier
 from .config import settings
 
 def _configure_logging() -> None:
@@ -72,10 +72,21 @@ logger = logging.getLogger("dma-ui")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
-    # Cleanly close the shared upstream HTTP clients on shutdown.
-    await dma_client.aclose()
-    await market_data.aclose()
+    # Background execution-alert watcher (Telegram). Runs for the app's lifetime,
+    # independent of any browser; a no-op if alerts aren't configured.
+    watcher = asyncio.create_task(notifier.run_watcher())
+    try:
+        yield
+    finally:
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+        # Cleanly close the shared upstream HTTP clients on shutdown.
+        await dma_client.aclose()
+        await market_data.aclose()
+        await notifier.aclose()
 
 
 app = FastAPI(title="DMA Trading UI", lifespan=lifespan)
@@ -154,11 +165,8 @@ def _safe_float(value) -> float:
 
 
 def _extract_list(payload) -> list:
-    if isinstance(payload, dict):
-        result = payload.get("result")
-        if isinstance(result, dict) and isinstance(result.get("list"), list):
-            return result["list"]
-    return []
+    # Single source: shared with the alert watcher (app/notifier.py).
+    return dma_client.extract_list(payload)
 
 
 async def build_dashboard() -> dict:
