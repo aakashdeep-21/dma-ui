@@ -78,6 +78,15 @@ async def _request(method: str, path: str, params: dict | None = None, body: dic
     return data
 
 
+def extract_list(payload) -> list:
+    """Dig the v5 `result.list` array out of a response envelope, else []."""
+    if isinstance(payload, dict):
+        result = payload.get("result")
+        if isinstance(result, dict) and isinstance(result.get("list"), list):
+            return result["list"]
+    return []
+
+
 # --- Read endpoints -------------------------------------------------------
 
 async def get_positions():
