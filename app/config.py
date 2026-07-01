@@ -146,5 +146,45 @@ class Settings:
         }
         return [name for name, value in required.items() if not value]
 
+    def insecure_required(self) -> list[str]:
+        """Return human-readable problems with WEAK/PLACEHOLDER secrets.
+
+        Money app: refusing to boot on a copy-pasted .env.example value is much
+        safer than serving a forgeable session (a known SESSION_SECRET lets anyone
+        mint an admin cookie) or a guessable password/trade token. This is a
+        HARD-FAIL companion to missing_required(); callers should refuse to start
+        if it returns anything. Length is only WARNED on (see warn_weak) so a real,
+        already-deployed short secret is never crash-looped.
+        """
+        # Verbatim placeholders shipped in .env.example + a few obvious weak values.
+        placeholders = {
+            "change_this_admin_password",
+            "change_this_viewer_password",
+            "generate_a_long_random_string",
+            "generate_another_long_random_string",
+            "changeme", "change_this", "password", "secret", "token",
+            "admin", "viewer", "user", "trader", "test",
+        }
+        problems: list[str] = []
+        for name, value in (
+            ("ADMIN_PASSWORD", self.ADMIN_PASSWORD),
+            ("VIEWER_PASSWORD", self.VIEWER_PASSWORD),
+            ("SESSION_SECRET", self.SESSION_SECRET),
+            ("TRADE_TOKEN", self.TRADE_TOKEN),
+        ):
+            if value and value.strip().lower() in placeholders:
+                problems.append(f"{name} is set to a placeholder/weak value; use a unique high-entropy secret")
+        return problems
+
+    def warn_weak(self) -> list[str]:
+        """Non-fatal warnings for low-entropy secrets (short length). Kept separate
+        from insecure_required so a real-but-short secret warns instead of blocking
+        an existing deploy."""
+        warnings: list[str] = []
+        for name, value in (("SESSION_SECRET", self.SESSION_SECRET), ("TRADE_TOKEN", self.TRADE_TOKEN)):
+            if value and len(value) < 24:
+                warnings.append(f"{name} is short (<24 chars); prefer a 32+ char random secret")
+        return warnings
+
 
 settings = Settings()

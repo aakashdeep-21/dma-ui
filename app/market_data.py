@@ -47,7 +47,8 @@ _MAX_LIMIT = 1000
 _LIMIT_BUCKETS = (60, 160, 200, 500, 1000)
 
 # Dedicated client for the PUBLIC host. No auth headers are EVER attached here.
-_client = httpx.AsyncClient(timeout=10)
+# trust_env=False for parity with the signed client (ignore ambient proxy/CA env).
+_client = httpx.AsyncClient(timeout=10, trust_env=False)
 
 # Tiny in-process response cache to coalesce the ~1s frontend polling and shield
 # the upstream public API. Keyed by (symbol, bybit_interval, limit_bucket). The

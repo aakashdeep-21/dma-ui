@@ -241,7 +241,11 @@ function snapToStep(value, step) {
   const v = Number(value);
   const st = Number(step);
   if (!(v >= 0) || !(st > 0)) return null;
-  const snapped = Math.floor(v / st) * st;
+  // Add a tiny epsilon before flooring so IEEE-754 division error doesn't drop a
+  // whole lot step: e.g. 0.3 / 0.1 === 2.9999999999999996, which would floor to 2
+  // and silently under-size the order by a full step. The epsilon is far smaller
+  // than any real step, so it never rounds a genuinely-below value up.
+  const snapped = Math.floor(v / st + 1e-9) * st;
   return snapped.toFixed(decimalsOf(step));
 }
 
@@ -338,6 +342,20 @@ async function writeApi(path, body) {
     headers: { "Content-Type": "application/json", "X-Trade-Token": state.tradeToken },
     body: JSON.stringify(body || {}),
   });
+}
+
+// Client-owned idempotency keys for fund transfers (see the transfer form). Held
+// per transfer INTENT until that transfer confirms success, so a timeout-retry
+// reuses the same key (exchange dedups) but a later identical transfer is fresh.
+const _transferTxnIds = {};
+function _uuid() {
+  if (window.crypto && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  // Fallback (non-secure contexts): unique enough for a client idempotency key.
+  return "txn-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+}
+function transferTxnId(intentKey) {
+  if (!_transferTxnIds[intentKey]) _transferTxnIds[intentKey] = _uuid();
+  return _transferTxnIds[intentKey];
 }
 
 // Build the confirm-modal body. A plain string is shown as-is (textContent,
@@ -1143,7 +1161,20 @@ function wireAdminForms() {
         qty: f.qty.value.trim(),
         positionIdx: 0,
       };
-      if (!body.symbol || !body.qty) throw new Error("symbol and quantity are required");
+      // The order is ALWAYS sent as a base-coin qty. In Margin mode that qty was
+      // derived from the margin input; a blank/zero derived qty means no price was
+      // resolvable or the margin rounded below the lot step. Defence-in-depth:
+      // reject qty <= 0 here too (the server also validates) so nothing invalid can
+      // reach the money path. This blocks no order the exchange would have accepted.
+      const sizedByMargin = f.sizeMode.value === "margin";
+      if (!body.symbol) throw new Error("symbol is required");
+      if (!body.qty || !(Number(body.qty) > 0)) {
+        throw new Error(
+          sizedByMargin
+            ? "Enter a margin amount — plus a limit price (or wait for the market price) — so a quantity can be derived"
+            : "quantity is required"
+        );
+      }
       if (f.orderType.value === "Limit") {
         body.price = f.price.value.trim();
         if (!body.price) throw new Error("limit price is required for a Limit order");
@@ -1179,21 +1210,60 @@ function wireAdminForms() {
           specWarnings.push(`Qty ${body.qty} exceeds the ${body.symbol} maximum (${spec.maxOrderQty}); the exchange may reject it.`);
       }
 
-      // Enriched confirm: show notional and %-of-available so the size is
-      // legible before a real-money write. Entry = limit price, else live last.
+      // Money-safety: the margin estimate uses the local leverage field, but the
+      // ACTUAL margin the exchange consumes depends on the account's leverage for
+      // this symbol. We can only READ that leverage from a live position, so:
+      //   * live position, leverage differs  -> warn (real margin will differ);
+      //   * no live position                  -> warn (leverage is UNVERIFIED —
+      //     the qty was sized against the assumed field value). This never leaves
+      //     the assumption silent, which is the whole point on a real-money path.
+      if (sizedByMargin) {
+        const posLev = (state.lastPositions || []).find(
+          (p) => String(p.symbol).toUpperCase() === body.symbol && Number(p.size) !== 0 && Number(p.leverage) > 0
+        );
+        if (posLev) {
+          if (Math.abs(Number(posLev.leverage) - sizingLeverage()) > 1e-9) {
+            specWarnings.push(`Margin estimate assumes ${sizingLeverage()}x, but ${body.symbol}'s live position leverage is ${posLev.leverage}x — the actual margin consumed will differ. Set leverage to match, or size by Quantity.`);
+          }
+        } else {
+          specWarnings.push(`Margin sizing assumes ${sizingLeverage()}x — there is no open ${body.symbol} position to confirm your account's actual leverage, so the real margin consumed may differ. Verify leverage under Account.`);
+        }
+
+        // A Market order sized by margin derives qty from the last fetched price,
+        // which refreshes on symbol/type change (not continuously). Warn if it has
+        // gone stale so a drifted quote isn't trusted blindly for the size.
+        if (String(body.orderType).toLowerCase() === "market") {
+          const lp = state.orderLastPrice;
+          const ageMs = lp && lp.symbol === body.symbol && lp.ts ? Date.now() - lp.ts : null;
+          if (ageMs != null && ageMs > 15000) {
+            specWarnings.push(`The market price used to size this order is ${Math.round(ageMs / 1000)}s old; re-select the symbol to refresh it if the price may have moved.`);
+          }
+        }
+      }
+
+      // Enriched confirm: show notional, estimated initial margin and
+      // %-of-available so the size is legible before a real-money write.
+      // Entry = limit price, else live last.
       let entry = body.price ? Number(body.price) : null;
       if (entry == null && state.orderLastPrice && state.orderLastPrice.symbol === body.symbol) {
         entry = Number(state.orderLastPrice.price);
       }
+      const lev = sizingLeverage();
       const lines = [
         ["Side / Type", `${body.side} ${body.orderType}`],
         ["Symbol", body.symbol],
         ["Quantity", String(body.qty)],
       ];
+      if (sizedByMargin && Number(f.margin.value.trim()) > 0) {
+        lines.push(["Margin (requested)", `${fmtNum(Number(f.margin.value.trim()))} ${settleCoin()} (${lev}x)`]);
+      }
       if (body.price) lines.push(["Limit price", String(body.price)]);
       if (entry && Number(body.qty) > 0) {
         const notional = Number(body.qty) * entry;
         lines.push(["Notional", `${fmtNum(notional)} ${settleCoin()}${body.price ? "" : " (est.)"}`]);
+        // Reduce-only closes an existing position and commits no new margin, so
+        // the initial-margin estimate would be misleading there.
+        if (!body.reduceOnly) lines.push(["Est. initial margin", `${fmtNum(notional / lev)} ${settleCoin()} (${lev}x)`]);
         if (state.available && state.available > 0) {
           lines.push(["≈ % of available", fmtPct((notional / state.available) * 100, false)]);
         }
@@ -1211,6 +1281,7 @@ function wireAdminForms() {
           // Re-sync segmented toggles + dependent UI to the reset select values.
           f.side.dispatchEvent(new Event("change", { bubbles: true }));
           f.orderType.dispatchEvent(new Event("change", { bubbles: true }));
+          f.sizeMode.dispatchEvent(new Event("change", { bubbles: true }));
           syncLimit();
           updateOrderPreview();
           refreshDashboardSoon(); // surface the new resting order / position promptly
@@ -1237,37 +1308,119 @@ function wireAdminForms() {
     try {
       const data = await api(`/api/tickers?symbol=${encodeURIComponent(symbol)}`);
       const t = ((data.result && data.result.list) || [])[0];
-      if (t && t.lastPrice) state.orderLastPrice = { symbol, price: t.lastPrice };
+      if (t && t.lastPrice) state.orderLastPrice = { symbol, price: t.lastPrice, ts: Date.now() };
     } catch (e) {
       /* preview simply won't render for market until a price is available */
     }
     updateOrderPreview();
   }
 
+  // Leverage used ONLY by the local sizing helpers (%-buttons + Margin→Quantity).
+  // It is never sent with the order; the exchange uses the account's own leverage.
+  function sizingLeverage() {
+    const levEl = document.getElementById("sizing-lev");
+    return Math.max(1, Number(levEl && levEl.value) || 1);
+  }
+
+  // Base coin of a linear USDT symbol (e.g. "SOLUSDT" -> "SOL") for labelling the
+  // derived quantity. Display-only; falls back to the raw symbol.
+  function baseCoin(symbol) {
+    const s = String(symbol || "").toUpperCase();
+    const q = settleCoin();
+    return s.endsWith(q) && s.length > q.length ? s.slice(0, -q.length) : s;
+  }
+
+  // Entry price used for sizing/preview: the typed limit price for a Limit order,
+  // else the symbol's live last price (an estimate) for a Market order. Returns
+  // { price: NaN } when no usable price is available yet.
+  function resolveEntryPrice() {
+    const symbol = orderForm.symbol.value.trim().toUpperCase();
+    if (orderForm.orderType.value === "Limit") {
+      const p = Number(orderForm.price.value.trim());
+      return { price: p > 0 ? p : NaN, estimate: false };
+    }
+    if (state.orderLastPrice && state.orderLastPrice.symbol === symbol) {
+      const p = Number(state.orderLastPrice.price);
+      return { price: p > 0 ? p : NaN, estimate: true };
+    }
+    return { price: NaN, estimate: false };
+  }
+
+  // Margin sizing: in 'Margin' mode the user enters the USDT margin to commit and
+  // we DERIVE the authoritative base-coin quantity (qty = margin × lev ÷ price),
+  // floored to the lot step. The order payload is ALWAYS the qty field — the
+  // margin value is never sent to the exchange. Re-run on every relevant change
+  // so qty can never lag its inputs. No-op (never touches qty) in 'Quantity' mode.
+  function recomputeMarginQty(price) {
+    if (orderForm.sizeMode.value !== "margin") return;
+    const margin = Number(orderForm.margin.value.trim());
+    const lev = sizingLeverage();
+    const sym = orderForm.symbol.value.trim().toUpperCase();
+    if (!(margin > 0) || !(price > 0)) { orderForm.qty.value = ""; return; }
+    const spec = state.specs[sym];
+    // Never derive a qty without the instrument's lot step: an unfloored qty is
+    // rejected by the exchange and would make the notional/margin preview wrong.
+    // Clear qty until the spec loads (fetchInstrumentSpec re-runs this on arrival).
+    if (!spec || spec.qtyStep == null) { orderForm.qty.value = ""; return; }
+    const snapped = snapToStep((margin * lev) / price, spec.qtyStep);
+    // Flooring to the lot step can round a tiny margin down to 0 — treat that as
+    // "no quantity" so the submit guard blocks it rather than sending qty "0".
+    orderForm.qty.value = snapped && Number(snapped) > 0 ? snapped : "";
+  }
+
+  // Auto-match the local leverage field to the symbol's LIVE position leverage
+  // (when one exists) so the Margin→Quantity math reflects the real margin the
+  // exchange will consume. Fires only on symbol change; manual edits then stick.
+  function autofillLeverageForSymbol(sym) {
+    const levEl = document.getElementById("sizing-lev");
+    if (!levEl) return;
+    const pos = (state.lastPositions || []).find(
+      (p) => String(p.symbol).toUpperCase() === sym && Number(p.size) !== 0 && Number(p.leverage) > 0
+    );
+    if (pos) levEl.value = String(pos.leverage);
+  }
+
   function updateOrderPreview() {
     const symbol = orderForm.symbol.value.trim().toUpperCase();
     const side = orderForm.side.value;
+    const { price: entryNum, estimate } = resolveEntryPrice();
+
+    // In Margin mode, re-derive qty BEFORE reading it so the notional/PnL below
+    // and the submitted order all reflect the current margin/lev/price inputs.
+    recomputeMarginQty(entryNum);
+
     const qty = orderForm.qty.value.trim();
-    const isLimit = orderForm.orderType.value === "Limit";
     const tp = orderForm.takeProfit.value.trim();
     const sl = orderForm.stopLoss.value.trim();
-    let entry = "";
-    let estimate = false;
-    if (isLimit) {
-      entry = orderForm.price.value.trim();
-    } else if (state.orderLastPrice && state.orderLastPrice.symbol === symbol) {
-      entry = state.orderLastPrice.price;
-      estimate = true;
-    }
+    const entry = entryNum > 0 ? String(entryNum) : "";
+    const marginMode = orderForm.sizeMode.value === "margin";
+    const lev = sizingLeverage();
 
-    // Notional value hint (qty × price) so position size is obvious — shows
-    // independently of TP/SL.
+    // Sizing hint: notional (qty × price) and the initial margin it implies
+    // (notional ÷ leverage). In Margin mode we also lead with the resolved qty so
+    // the exact size being ordered is always visible before submit. Reduce-only
+    // orders commit no new margin, so the margin figure is omitted for them.
     if (orderNotional) {
-      const notional = Number(qty) * Number(entry);
-      orderNotional.textContent =
-        Number(qty) > 0 && Number(entry) > 0
-          ? `≈ ${fmtNum(notional)} ${settleCoin()} notional${estimate ? " (at market price)" : ""}`
-          : "";
+      const marginTyped = Number(orderForm.margin.value.trim());
+      const reduceOnly = orderForm.reduceOnly.checked;
+      const spec = state.specs[symbol];
+      if (Number(qty) > 0 && entryNum > 0) {
+        const notional = Number(qty) * entryNum;
+        const parts = [];
+        if (marginMode) parts.push(`→ <b>${esc(qty)}</b> ${esc(baseCoin(symbol))}`);
+        parts.push(`${fmtNum(notional)} ${esc(settleCoin())} notional${estimate ? " (at market)" : ""}`);
+        if (!reduceOnly) parts.push(`margin ≈ <b>${fmtNum(notional / lev)}</b> ${esc(settleCoin())} <span class="muted">(${lev}x)</span>`);
+        orderNotional.innerHTML = parts.join('<span class="sep">·</span>');
+      } else if (marginMode && marginTyped > 0 && !(entryNum > 0)) {
+        orderNotional.innerHTML = `<span class="warn">enter a limit price (or wait for the market price) to size by margin</span>`;
+      } else if (marginMode && marginTyped > 0 && (!spec || spec.qtyStep == null)) {
+        orderNotional.innerHTML = `<span class="muted">loading ${esc(baseCoin(symbol))} contract details…</span>`;
+      } else if (marginMode && marginTyped > 0 && entryNum > 0) {
+        const minTxt = spec && spec.minOrderQty != null ? ` (min ${esc(spec.minOrderQty)})` : "";
+        orderNotional.innerHTML = `<span class="warn">margin too small for one lot step${minTxt} — increase margin or leverage</span>`;
+      } else {
+        orderNotional.textContent = "";
+      }
     }
 
     if (!entry || !qty || (!tp && !sl) || orderForm.reduceOnly.checked) {
@@ -1295,6 +1448,7 @@ function wireAdminForms() {
           const sym = orderForm.symbol.value.trim().toUpperCase();
           clearTimeout(_lastPriceTimer);
           _lastPriceTimer = setTimeout(() => {
+            autofillLeverageForSymbol(sym); // match margin math to the live position leverage
             fetchMarketPrice(sym);    // live last price (sizing + market preview)
             fetchInstrumentSpec(sym); // tick/lot/leverage filters -> spec strip
             setActiveSymbol(sym);     // load the order-book widget for this symbol
@@ -1320,14 +1474,28 @@ function wireAdminForms() {
       if (!b) return;
       const pct = Number(b.dataset.pct) / 100;
       const avail = Number(state.available);
-      const levEl = document.getElementById("sizing-lev");
-      const lev = Math.max(1, Number(levEl && levEl.value) || 1);
+      const lev = sizingLeverage();
       const sym = orderForm.symbol.value.trim().toUpperCase();
+      if (!(avail > 0)) { toast("Available balance not loaded yet.", "warn"); return; }
+      // % of available = the margin to commit. In Margin mode we fill the margin
+      // field (qty is then derived + snapped from it); in Quantity mode we fill
+      // qty directly. Both resolve to the SAME size: qty = (avail × pct × lev) ÷ price.
+      if (orderForm.sizeMode.value === "margin") {
+        // The margin <input> shows a raw balance-derived figure that CSS privacy
+        // masking cannot hide (it masks text, not input values). Don't leak the
+        // balance on screen while privacy mode is on.
+        if (document.body.classList.contains("privacy-on")) {
+          toast("Turn off privacy mode to size by % (it would show your balance).", "warn");
+          return;
+        }
+        orderForm.margin.value = String(Number((avail * pct).toFixed(2)));
+        updateOrderPreview();
+        return;
+      }
       let price = orderForm.orderType.value === "Limit" ? Number(orderForm.price.value) : NaN;
       if (!(price > 0) && state.orderLastPrice && state.orderLastPrice.symbol === sym) {
         price = Number(state.orderLastPrice.price);
       }
-      if (!(avail > 0)) { toast("Available balance not loaded yet.", "warn"); return; }
       if (!(price > 0)) { toast("Enter a symbol (and price for a Limit) to size by %.", "warn"); return; }
       const qty = (avail * pct * lev) / price;
       const spec = state.specs[sym];
@@ -1365,6 +1533,47 @@ function wireAdminForms() {
   };
   wireSegment("#seg-side", orderForm.side);
   wireSegment("#seg-type", orderForm.orderType);
+  wireSegment("#seg-sizemode", orderForm.sizeMode);
+
+  // 'Size by' toggle: show the Quantity input or the Margin input (never both).
+  // The Margin field is a sizing helper only — it derives qty (see
+  // recomputeMarginQty) and is never part of the order payload.
+  const syncSizeMode = () => {
+    const marginMode = orderForm.sizeMode.value === "margin";
+    // Carry the size across a Quantity→Margin switch: seed the (empty) margin
+    // field from the qty already entered so toggling modes never silently
+    // discards a size the user typed. Margin = qty × price ÷ leverage.
+    if (marginMode && !orderForm.margin.value.trim()) {
+      const { price } = resolveEntryPrice();
+      const qtyNum = Number(orderForm.qty.value.trim());
+      const lev = sizingLeverage();
+      if (qtyNum > 0 && price > 0) {
+        orderForm.margin.value = String(Number(((qtyNum * price) / lev).toFixed(2)));
+      }
+    }
+    document.querySelectorAll(".sizeby-qty").forEach((el) => (el.style.display = marginMode ? "none" : ""));
+    document.querySelectorAll(".sizeby-margin").forEach((el) => (el.style.display = marginMode ? "" : "none"));
+    updateOrderPreview();
+  };
+  orderForm.sizeMode.addEventListener("change", syncSizeMode);
+  syncSizeMode();
+
+  // Reduce-only closes a known position size — committing fresh margin is
+  // meaningless there — so lock the form to Quantity mode while it's checked.
+  const marginModeBtn = document.querySelector('#seg-sizemode button[data-val="margin"]');
+  const syncReduceOnly = () => {
+    const ro = orderForm.reduceOnly.checked;
+    if (marginModeBtn) {
+      marginModeBtn.disabled = ro; // native: a disabled button can't be clicked
+      marginModeBtn.setAttribute("aria-disabled", String(ro));
+    }
+    if (ro && orderForm.sizeMode.value === "margin") {
+      orderForm.sizeMode.value = "qty"; // preserves the last derived qty in the field
+      orderForm.sizeMode.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+  };
+  orderForm.reduceOnly.addEventListener("change", syncReduceOnly);
+  syncReduceOnly();
 
   $("#leverage-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -1446,18 +1655,25 @@ function wireAdminForms() {
     const f = e.target;
     runWrite(f.querySelector("button[type=submit]"), $("#transfer-result"), () => {
       const amount = Number(f.amount.value);
-      if (!(amount > 0)) throw new Error("amount must be greater than 0");
+      if (!(amount > 0) || !isFinite(amount)) throw new Error("amount must be a finite number greater than 0");
       const body = {
         direction: f.direction.value,
         amount,
         quote_asset: f.quote_asset.value,
       };
+      // Idempotency key OWNED by the client, keyed on the exact transfer intent
+      // (direction+amount+asset). A retry after a local timeout reuses the SAME
+      // id, so the exchange dedups it instead of moving funds twice. It is cleared
+      // ONLY on confirmed success, so a genuinely-repeated identical transfer
+      // later gets a fresh id (and is not wrongly deduped as a replay).
+      const intentKey = `${body.direction}|${body.amount}|${body.quote_asset}`;
+      body.client_txn_id = transferTxnId(intentKey);
       return {
         path: "/api/funds/transfer",
         body,
         confirmMsg: `Transfer ${body.amount} ${body.quote_asset} (${body.direction}). This moves real funds.`,
         successMsg: () => "✓ Transfer request submitted — verify your balance to confirm it completed",
-        onSuccess: () => { f.reset(); refreshDashboardSoon(); },
+        onSuccess: () => { delete _transferTxnIds[intentKey]; f.reset(); refreshDashboardSoon(); },
       };
     });
   });
@@ -2136,6 +2352,13 @@ async function fetchInstrumentSpec(symbol) {
       maxLeverage: i.leverageFilter && i.leverageFilter.maxLeverage,
     };
     renderSpecStrip(state.specs[sym]);
+    // Re-run order-form sizing now the lot step is known, so a Margin-derived qty
+    // snaps to the step as soon as the spec arrives (the first derive may have run
+    // with an unsnapped value while this request was in flight).
+    const oform = document.getElementById("order-form");
+    if (oform && oform.symbol && oform.symbol.value.trim().toUpperCase() === sym) {
+      oform.dispatchEvent(new Event("input", { bubbles: true }));
+    }
   } catch (e) {
     renderSpecStrip(null); // never block trading on a spec-fetch failure
   }

@@ -168,6 +168,9 @@ button:disabled { opacity: 0.5; cursor: default; }
 
 .result-msg { padding: 0 16px 16px; font-size: 13px; min-height: 16px; }
 .limit-only { display: none; }
+/* 'Size by' = Margin hides the Quantity field and shows the Margin field
+   (toggled in JS, mirroring .limit-only). Only one is ever visible. */
+.sizeby-margin { display: none; }
 
 /* Projected PnL hint under a TP/SL table cell */
 .pnl-hint { font-size: 11px; font-weight: 600; margin-top: 2px; }
@@ -293,6 +296,10 @@ table.kv td { text-align: left; }
 
 /* Notional value hint under the quantity field */
 .notional-hint { font-size: 11px; color: var(--muted); margin-top: -4px; min-height: 14px; font-variant-numeric: tabular-nums; }
+/* Derived numbers (resolved qty / margin) stand out from the muted hint text. */
+.notional-hint b { color: var(--text); font-weight: 600; }
+.notional-hint .sep { opacity: 0.4; margin: 0 5px; }
+.notional-hint .warn { color: var(--warn, #e6a700); }
 
 /* Change-flash on live cell updates */
 @keyframes flashUp { from { background: rgba(27,207,138,0.28); } to { background: transparent; } }

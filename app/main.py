@@ -12,7 +12,9 @@ Security model:
 import asyncio
 import logging
 import math
+import re
 import sys
+import time
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
@@ -30,7 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from starlette.responses import Response as StarletteResponse
 
-from . import auth, dma_client, market_data, notifier
+from . import auth, dma_client, market_data, notifier, signer
 from .config import settings
 
 def _configure_logging() -> None:
@@ -104,6 +106,82 @@ if _missing_env:
         + ", ".join(_missing_env)
     )
 
+# Refuse to boot on placeholder/weak secrets (e.g. a verbatim .env.example): a
+# known SESSION_SECRET lets anyone forge an admin cookie, and a guessable
+# password/trade token is a direct path to the money controls.
+_insecure_env = settings.insecure_required()
+if _insecure_env:
+    raise RuntimeError("Refusing to start — insecure configuration: " + "; ".join(_insecure_env))
+
+# A malformed signing key must fail the deploy, not the first live trade.
+if not signer.secret_is_valid_ed25519_hex(settings.DMA_API_SECRET):
+    raise RuntimeError("Refusing to start — DMA_API_SECRET is not a valid Ed25519 hex key")
+
+for _w in settings.warn_weak():
+    logger.warning("config: %s", _w)
+
+
+# --------------------------------------------------------------------------
+# Security headers (defense-in-depth) — stamped on EVERY response.
+#   * CSP + frame-ancestors 'none' / X-Frame-Options: DENY -> no clickjacking of
+#     the authenticated real-money SPA (the X-Trade-Token CSRF defense does not
+#     stop UI-redress framing).
+#   * script-src 'self' -> a future escaping regression can't execute injected JS.
+#     (All scripts are external files; style-src keeps 'unsafe-inline' for the
+#     HTML's style="" attributes.)
+# --------------------------------------------------------------------------
+_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+    "base-uri 'none'; object-src 'none'; form-action 'self'"
+)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers["Content-Security-Policy"] = _CSP
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    resp.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    return resp
+
+
+# --------------------------------------------------------------------------
+# Lightweight in-process rate limiting for the auth endpoints (single replica,
+# so a module dict suffices). Counts only FAILED attempts and clears on success,
+# so a legitimate operator typing the right secret is never locked out. Best-
+# effort (resets on restart); an edge/CDN limiter is still recommended.
+# --------------------------------------------------------------------------
+_FAIL_WINDOW = 300.0  # seconds
+_FAIL_MAX = 10        # failures per key per window before a 429
+
+_auth_failures: dict[str, list[float]] = {}
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_limited(bucket_key: str) -> bool:
+    now = time.monotonic()
+    times = [t for t in _auth_failures.get(bucket_key, []) if now - t < _FAIL_WINDOW]
+    _auth_failures[bucket_key] = times
+    return len(times) >= _FAIL_MAX
+
+
+def _record_failure(bucket_key: str) -> None:
+    _auth_failures.setdefault(bucket_key, []).append(time.monotonic())
+
+
+def _clear_failures(bucket_key: str) -> None:
+    _auth_failures.pop(bucket_key, None)
+
 
 # --------------------------------------------------------------------------
 # Auth dependencies
@@ -111,9 +189,9 @@ if _missing_env:
 def current_user(request: Request) -> dict:
     token = request.cookies.get(auth.COOKIE_NAME)
     user = auth.verify_session_token(token)
-    # Enforce the single active session: a valid-but-superseded cookie (an older
-    # tab/device after a newer login elsewhere) is rejected as not authenticated.
-    if not user or not auth.is_active_session(user.get("sid")):
+    # Enforce the single active session PER ROLE: a valid-but-superseded cookie
+    # (an older tab/device after a newer same-role login) is rejected.
+    if not user or not auth.is_active_session(user.get("r"), user.get("sid")):
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user
 
@@ -167,6 +245,28 @@ def _safe_float(value) -> float:
 def _extract_list(payload) -> list:
     # Single source: shared with the alert watcher (app/notifier.py).
     return dma_client.extract_list(payload)
+
+
+# Bybit-v5 linear symbols are upper-case alphanumeric (e.g. BTCUSDT, 1000PEPEUSDT).
+_SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,20}$")
+
+
+def _valid_symbol(sym) -> bool:
+    return isinstance(sym, str) and bool(_SYMBOL_RE.match(sym))
+
+
+def _positive_finite(value) -> bool:
+    """True iff `value` parses to a FINITE number > 0.
+
+    Money-path guard: a bare `float(x) <= 0` check lets 'inf'/'1e400' through
+    (inf <= 0 is False), which would serialise as invalid JSON to the exchange.
+    Requiring math.isfinite closes that.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0
 
 
 async def build_dashboard() -> dict:
@@ -233,7 +333,10 @@ def login_page():
 @app.get("/")
 def index(request: Request):
     token = request.cookies.get(auth.COOKIE_NAME)
-    if not auth.verify_session_token(token):
+    user = auth.verify_session_token(token)
+    # Mirror current_user: don't serve the app shell to a superseded session
+    # (the data APIs/WS would reject it anyway; this keeps the redirect consistent).
+    if not user or not auth.is_active_session(user.get("r"), user.get("sid")):
         return RedirectResponse(url="/login", status_code=302)
     return FileResponse(STATIC_DIR / "index.html", headers=_NO_CACHE)
 
@@ -252,17 +355,25 @@ def healthz():
 # Auth API
 # --------------------------------------------------------------------------
 @app.post("/api/login")
-def api_login(payload: dict = Body(...)):
+def api_login(request: Request, payload: dict = Body(...)):
+    ip = _client_ip(request)
+    if _rate_limited(f"login:{ip}"):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts; wait a few minutes and try again",
+        )
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
     role = auth.authenticate(username, password)
     if not role:
+        _record_failure(f"login:{ip}")
         raise HTTPException(status_code=401, detail="Invalid username or password")
+    _clear_failures(f"login:{ip}")
 
-    # Mint a new session id and make it THE active session — this evicts any
-    # other logged-in session (global single-session).
+    # Mint a new session id and make it THE active session FOR THIS ROLE — this
+    # evicts any other same-role session, but never the other role's.
     sid = auth.new_session_id()
-    auth.set_active_session(sid)
+    auth.set_active_session(role, sid)
     token = auth.create_session_token(username, role, sid)
     resp = JSONResponse({"username": username, "role": role})
     resp.set_cookie(
@@ -282,7 +393,7 @@ def api_logout(request: Request):
     # tab's logout can't evict a newer session).
     data = auth.verify_session_token(request.cookies.get(auth.COOKIE_NAME))
     if data:
-        auth.clear_active_session(data.get("sid"))
+        auth.clear_active_session(data.get("r"), data.get("sid"))
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(auth.COOKIE_NAME)
     return resp
@@ -294,13 +405,23 @@ def api_me(user: dict = Depends(current_user)):
 
 
 @app.post("/api/verify-trade-token")
-def api_verify_trade_token(payload: dict = Body(...), user: dict = Depends(require_admin)):
+def api_verify_trade_token(
+    request: Request, payload: dict = Body(...), user: dict = Depends(require_admin)
+):
     """Check whether a trade token is correct so the UI can give immediate
     feedback when it's entered (instead of only failing on the first write).
-    Admin-only and constant-time; the token is high-entropy so this oracle is
-    not a practical brute-force risk.
+    Admin-only and constant-time; additionally rate-limited so it can't be used
+    as an online guessing oracle even after an admin session is obtained.
     """
-    return {"valid": auth.verify_trade_token(payload.get("token") or "")}
+    ip = _client_ip(request)
+    if _rate_limited(f"tradetoken:{ip}"):
+        raise HTTPException(status_code=429, detail="Too many attempts; wait a few minutes")
+    valid = auth.verify_trade_token(payload.get("token") or "")
+    if valid:
+        _clear_failures(f"tradetoken:{ip}")
+    else:
+        _record_failure(f"tradetoken:{ip}")
+    return {"valid": valid}
 
 
 # --------------------------------------------------------------------------
@@ -399,27 +520,51 @@ async def api_create_order(payload: dict = Body(...), user: dict = Depends(requi
         raise HTTPException(
             status_code=400, detail="symbol, side, orderType and qty are required"
         )
+    symbol = str(symbol).upper()
+    if not _valid_symbol(symbol):
+        raise HTTPException(status_code=400, detail="symbol has an invalid format")
     if str(side).lower() not in ("buy", "sell"):
         raise HTTPException(status_code=400, detail="side must be Buy or Sell")
+    if str(order_type).lower() not in ("market", "limit"):
+        raise HTTPException(status_code=400, detail="orderType must be Market or Limit")
+    if not _positive_finite(qty):
+        raise HTTPException(status_code=400, detail="qty must be a finite number greater than 0")
+
+    # Build the OUTBOUND body from an explicit ALLOWLIST — never forward the raw
+    # client payload. Mass-assignment defense: a stray/forged field (closeOnTrigger,
+    # orderLinkId, a client-chosen positionIdx, a truthy-string reduceOnly) must not
+    # silently reach the exchange. Only these validated fields are sent.
+    order: dict = {
+        "symbol": symbol,
+        "side": "Buy" if str(side).lower() == "buy" else "Sell",
+        "orderType": "Limit" if str(order_type).lower() == "limit" else "Market",
+        "qty": str(qty).strip(),
+    }
+
+    # positionIdx: one-way mode uses 0. Accept only 0/1/2; default to 0.
     try:
-        if float(qty) <= 0:
-            raise ValueError
+        pos_idx = int(payload.get("positionIdx", 0))
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="qty must be a number greater than 0")
-    if str(order_type).lower() == "limit":
+        pos_idx = 0
+    order["positionIdx"] = pos_idx if pos_idx in (0, 1, 2) else 0
+
+    if order["orderType"] == "Limit":
         price = payload.get("price")
-        try:
-            if price is None or float(price) <= 0:
-                raise ValueError
-        except (TypeError, ValueError):
+        if not _positive_finite(price):
             raise HTTPException(
-                status_code=400, detail="price must be greater than 0 for a Limit order"
+                status_code=400,
+                detail="price must be a finite number greater than 0 for a Limit order",
             )
+        order["price"] = str(price).strip()
+
+    # reduceOnly must be a real bool (not a truthy string) before it can gate risk.
+    reduce_only = bool(payload.get("reduceOnly"))
+
     # Optional TP/SL attached at order creation.
     take_profit = payload.get("takeProfit")
     stop_loss = payload.get("stopLoss")
     has_tpsl = take_profit not in (None, "") or stop_loss not in (None, "")
-    if has_tpsl and payload.get("reduceOnly"):
+    if has_tpsl and reduce_only:
         # Bybit rejects TP/SL combined with reduceOnly; catch it early.
         raise HTTPException(
             status_code=400,
@@ -428,14 +573,16 @@ async def api_create_order(payload: dict = Body(...), user: dict = Depends(requi
     for name, value in (("takeProfit", take_profit), ("stopLoss", stop_loss)):
         if value in (None, ""):
             continue
-        try:
-            if float(value) <= 0:
-                raise ValueError
-        except (TypeError, ValueError):
+        if not _positive_finite(value):
             raise HTTPException(
-                status_code=400, detail=f"{name} must be a number greater than 0"
+                status_code=400, detail=f"{name} must be a finite number greater than 0"
             )
-    return await dma_client.create_order(payload)
+        order[name] = str(value).strip()
+
+    if reduce_only:
+        order["reduceOnly"] = True
+
+    return await dma_client.create_order(order)
 
 
 @app.post("/api/order/cancel")
@@ -460,6 +607,14 @@ async def api_set_leverage(payload: dict = Body(...), user: dict = Depends(requi
     sell = payload.get("sellLeverage", buy)
     if not symbol or buy is None:
         raise HTTPException(status_code=400, detail="symbol and buyLeverage are required")
+    symbol = str(symbol).upper()
+    if not _valid_symbol(symbol):
+        raise HTTPException(status_code=400, detail="symbol has an invalid format")
+    for name, value in (("buyLeverage", buy), ("sellLeverage", sell)):
+        if not _positive_finite(value):
+            raise HTTPException(
+                status_code=400, detail=f"{name} must be a finite number greater than 0"
+            )
     return await dma_client.set_leverage(symbol, buy, sell)
 
 
@@ -538,6 +693,8 @@ async def api_trading_stop(payload: dict = Body(...), user: dict = Depends(requi
             number = float(value)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail=f"{name} must be a number")
+        if not math.isfinite(number):
+            raise HTTPException(status_code=400, detail=f"{name} must be a finite number")
         if number < 0:
             raise HTTPException(status_code=400, detail=f"{name} must be >= 0 (0 cancels)")
         return str(value).strip()
@@ -580,20 +737,22 @@ async def api_transfer_funds(payload: dict = Body(...), user: dict = Depends(req
     direction = payload.get("direction")
     amount = payload.get("amount")
     quote_asset = payload.get("quote_asset") or payload.get("quoteAsset")
+    client_txn_id = payload.get("client_txn_id")
     if not direction or amount is None or not quote_asset:
         raise HTTPException(
             status_code=400, detail="direction, amount and quote_asset are required"
         )
+    # Idempotency is MANDATORY on the money-movement path. The client owns a stable
+    # id per transfer intent so a retry after a local timeout is a no-op at the
+    # exchange (the dedup key is unchanged) instead of a second, real transfer.
+    if not isinstance(client_txn_id, str) or not client_txn_id.strip():
+        raise HTTPException(status_code=400, detail="client_txn_id is required for a transfer")
     if str(direction).upper() not in ("IN", "OUT"):
         raise HTTPException(status_code=400, detail="direction must be IN or OUT")
-    try:
-        amount_val = float(amount)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="amount must be a number")
-    if amount_val <= 0:
-        raise HTTPException(status_code=400, detail="amount must be greater than 0")
+    if not _positive_finite(amount):
+        raise HTTPException(status_code=400, detail="amount must be a finite number greater than 0")
     return await dma_client.transfer_funds(
-        str(direction).upper(), amount, quote_asset, payload.get("client_txn_id")
+        str(direction).upper(), amount, quote_asset, client_txn_id.strip()
     )
 
 
@@ -610,7 +769,21 @@ async def dma_error_handler(request: Request, exc: dma_client.DMAError):
     status = exc.status
     if status in (401, 403):
         status = 502
-    return JSONResponse(status_code=status, content={"error": exc.detail})
+    # Do not forward the full upstream envelope to the browser — it can carry
+    # reflected params, request ids and internal diagnostics. Surface only a
+    # concise message; log the full detail server-side for debugging.
+    detail = exc.detail
+    if isinstance(detail, dict):
+        message = (
+            detail.get("retMsg")
+            or detail.get("message")
+            or detail.get("error")
+            or "The exchange rejected the request"
+        )
+        logger.warning("upstream DMA error %s: %s", exc.status, detail)
+    else:
+        message = str(detail)
+    return JSONResponse(status_code=status, content={"error": message})
 
 
 @app.exception_handler(market_data.MarketDataError)
@@ -639,16 +812,16 @@ async def ws_feed(websocket: WebSocket):
         return
     token = websocket.cookies.get(auth.COOKIE_NAME)
     user = auth.verify_session_token(token)
-    if not user or not auth.is_active_session(user.get("sid")):
+    if not user or not auth.is_active_session(user.get("r"), user.get("sid")):
         await websocket.close(code=1008)
         return
 
     await websocket.accept()
     try:
         while True:
-            # If this session was superseded by a newer login elsewhere, close
+            # If this session was superseded by a newer same-role login, close
             # with 1008 so the (now evicted) tab redirects itself to /login.
-            if not auth.is_active_session(user.get("sid")):
+            if not auth.is_active_session(user.get("r"), user.get("sid")):
                 await websocket.close(code=1008)
                 return
             try:
@@ -658,6 +831,12 @@ async def ws_feed(websocket: WebSocket):
             except Exception as exc:  # defensive: keep the socket alive
                 logger.exception("dashboard build failed")
                 data = {"type": "error", "error": str(exc)}
+            # Re-check RIGHT BEFORE sending: build_dashboard can take up to ~20s,
+            # and the session may have been evicted in that window — don't push a
+            # final account-data frame to an already-superseded socket.
+            if not auth.is_active_session(user.get("r"), user.get("sid")):
+                await websocket.close(code=1008)
+                return
             await websocket.send_json(data)
             await asyncio.sleep(settings.POLL_INTERVAL)
     except WebSocketDisconnect:

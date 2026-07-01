@@ -196,11 +196,32 @@
                   <option value="Limit">Limit</option>
                 </select>
               </label>
-              <label>Quantity
-                <input name="qty" placeholder="1" required inputmode="decimal" autocomplete="off" />
+              <!-- Position sizing. Enter the size either as a base-coin Quantity
+                   or as the USDT Margin you want to commit. Margin is a CLIENT-SIDE
+                   convenience only: it is converted to a quantity
+                   (qty = margin × leverage ÷ price) and the order sent to the
+                   exchange is ALWAYS the base-coin qty — the margin figure itself is
+                   never part of the order payload. Leverage/margin-mode stay account
+                   state, changed separately under Account. -->
+              <label>Size by
+                <div class="segment" id="seg-sizemode" role="group" aria-label="Size order by quantity or margin">
+                  <button type="button" data-val="qty" class="seg-neutral" aria-pressed="true">Quantity</button>
+                  <button type="button" data-val="margin" class="seg-neutral" aria-pressed="false">Margin</button>
+                </div>
+                <select name="sizeMode" id="size-mode" class="sr-only" tabindex="-1">
+                  <option value="qty">Quantity</option>
+                  <option value="margin">Margin</option>
+                </select>
               </label>
-              <!-- %-of-balance sizing helper. The Lev field is used ONLY for this
-                   local position-size estimate; it is never sent with the order
+              <label class="sizeby-qty">Quantity
+                <input name="qty" placeholder="1" inputmode="decimal" autocomplete="off" />
+              </label>
+              <label class="sizeby-margin">Margin <span class="muted">(USDT to commit)</span>
+                <input name="margin" placeholder="100" inputmode="decimal" autocomplete="off" />
+              </label>
+              <!-- %-of-balance sizing helper. The Lev field feeds BOTH the
+                   %-buttons and the Margin→Quantity conversion; it is a local
+                   position-size estimate only and is never sent with the order
                    (leverage is changed separately under Account). -->
               <div class="sizing">
                 <div class="sizing-row">
@@ -216,7 +237,7 @@
                   <button type="button" data-pct="100">Max</button>
                 </div>
               </div>
-              <div class="notional-hint" id="order-notional"></div>
+              <div class="notional-hint" id="order-notional" role="status" aria-live="polite"></div>
               <label class="limit-only">Price
                 <input name="price" placeholder="limit price" inputmode="decimal" autocomplete="off" />
               </label>

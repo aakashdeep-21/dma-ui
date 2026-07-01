@@ -22,6 +22,20 @@ def _epoch_ms() -> str:
     return str(int(time.time() * 1000))
 
 
+def secret_is_valid_ed25519_hex(secret_key_hex: str) -> bool:
+    """Return True iff `secret_key_hex` is a usable Ed25519 seed.
+
+    Called at startup so a malformed DMA_API_SECRET fails the deploy loudly
+    instead of surfacing as an unhandled 500 on the FIRST signed request (which
+    would look like an exchange outage mid-trade). Never logs the key.
+    """
+    try:
+        SigningKey(bytes.fromhex(secret_key_hex))
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def build_signed_request(
     method: str,
     path: str,

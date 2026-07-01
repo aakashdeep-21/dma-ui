@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Python tests
+        run: pytest -q
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Frontend syntax + money-math regression
+        run: |
+          node --check app/static/app.js
+          node --check app/static/login.js
+          node tests/test_snap.mjs

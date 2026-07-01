@@ -4,12 +4,14 @@ Credentials live in environment variables (ADMIN_* and VIEWER_*). On a
 successful login we hand back a tamper-proof signed cookie carrying the
 username, role and a session id.
 
-Single active session (GLOBAL): the server keeps ONE current session id in
-memory. Each login mints a new id and replaces it, so any earlier session
-(any account, any tab, any device) is immediately invalidated — only one login
-is ever active at a time. In-memory is intentional: it needs a single replica
-and resets on restart (everyone re-logs-in); there is no security downside,
-since the cookie is still cryptographically signed.
+Single active session PER ROLE: the server keeps one current session id per
+role (admin, viewer) in memory. Each login mints a new id and replaces the one
+for THAT role, so a second admin login evicts the earlier admin session — but a
+viewer login can never evict the admin (and vice-versa). Keying by role matters
+on a real-money app: the lower-trust viewer credential must not be able to knock
+the trading admin offline (a denial-of-control during a live market). In-memory
+is intentional: it needs a single replica and resets on restart (everyone
+re-logs-in); the cookie is still cryptographically signed regardless.
 """
 import hmac
 import secrets
@@ -22,37 +24,33 @@ COOKIE_NAME = "dma_session"
 ROLE_ADMIN = "admin"
 ROLE_VIEWER = "viewer"
 
-# The single currently-active session id (global across all users). None means
-# no one is logged in (also the state after a restart).
-_active_session_id: str | None = None
+# The currently-active session id PER ROLE. A role missing/None means no one is
+# logged in with that role (also the state after a restart). Dict get/set is
+# atomic under CPython's GIL, so there is no torn read/write.
+_active_sessions: dict[str, str] = {}
 
 
 def new_session_id() -> str:
     return secrets.token_urlsafe(16)
 
 
-def set_active_session(sid: str) -> None:
-    """Make `sid` the one and only active session (evicts all others).
-
-    Single-assignment of a module global is atomic under CPython's GIL, so there
-    is no torn read/write. If two logins happen at the exact same instant, the
-    last one scheduled wins (best-effort ordering) and the situation self-heals
-    on the next login — acceptable for a 1-2 user terminal.
+def set_active_session(role: str, sid: str) -> None:
+    """Make `sid` the one active session FOR THIS ROLE (evicts the prior one of
+    the same role only). If two same-role logins race, the last one scheduled
+    wins and self-heals on the next login — acceptable for a 1-2 user terminal.
     """
-    global _active_session_id
-    _active_session_id = sid
+    _active_sessions[role] = sid
 
 
-def is_active_session(sid: str | None) -> bool:
-    return bool(sid) and sid == _active_session_id
+def is_active_session(role: str | None, sid: str | None) -> bool:
+    return bool(role) and bool(sid) and _active_sessions.get(role) == sid
 
 
-def clear_active_session(sid: str | None) -> None:
-    """Clear the active session, but only if `sid` is the current one, so a
-    stale tab logging out cannot evict a newer session."""
-    global _active_session_id
-    if sid and sid == _active_session_id:
-        _active_session_id = None
+def clear_active_session(role: str | None, sid: str | None) -> None:
+    """Clear this role's active session, but only if `sid` is the current one, so
+    a stale tab logging out cannot evict a newer session of the same role."""
+    if role and sid and _active_sessions.get(role) == sid:
+        _active_sessions.pop(role, None)
 
 
 def _serializer() -> URLSafeTimedSerializer:
@@ -60,10 +58,15 @@ def _serializer() -> URLSafeTimedSerializer:
 
 
 def _matches(candidate: str, expected: str) -> bool:
-    """Constant-time comparison that is safe when expected is empty."""
+    """Constant-time comparison that is safe when expected is empty.
+
+    Encodes to UTF-8 bytes first: hmac.compare_digest raises TypeError on a str
+    containing non-ASCII, which would turn a login/token attempt into an HTTP 500
+    (log-spam / DoS). Byte comparison stays constant-time and accepts any input.
+    """
     if not expected:
         return False
-    return hmac.compare_digest(candidate, expected)
+    return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
 
 
 def authenticate(username: str, password: str) -> str | None:
@@ -87,7 +90,8 @@ def verify_session_token(token: str | None) -> dict | None:
     """Return {'u': username, 'r': role, 'sid': ...} for a valid token, else None.
 
     NOTE: this only checks the signature/expiry. Callers must ALSO check
-    is_active_session(payload['sid']) to enforce the single-session rule.
+    is_active_session(payload['r'], payload['sid']) to enforce the per-role
+    single-session rule.
     """
     if not token:
         return None
@@ -107,4 +111,5 @@ def verify_trade_token(provided: str | None) -> bool:
         return False
     if not provided:
         return False
-    return hmac.compare_digest(provided, settings.TRADE_TOKEN)
+    # Encode to bytes so a non-ASCII token can't raise (see _matches).
+    return hmac.compare_digest(provided.encode("utf-8"), settings.TRADE_TOKEN.encode("utf-8"))

@@ -24,7 +24,10 @@ class DMAError(Exception):
 
 # One shared async client reused across all calls (connection pooling / keep-alive)
 # instead of a new client + TLS handshake per request. Closed on app shutdown.
-_client = httpx.AsyncClient(timeout=20)
+# trust_env=False: ignore ambient HTTP(S)_PROXY / SSL_CERT_FILE env vars so a
+# misconfigured or hostile environment can't reroute or re-anchor the SIGNED
+# trading traffic through a proxy/MITM.
+_client = httpx.AsyncClient(timeout=20, trust_env=False)
 
 
 async def aclose() -> None:
@@ -51,7 +54,13 @@ async def _request(method: str, path: str, params: dict | None = None, body: dic
             resp = await _client.get(url, headers=headers)
         else:
             # Body is sent compact and is NOT part of the signature.
-            content = json.dumps(body or {}, separators=(",", ":"))
+            # allow_nan=False: refuse to serialise NaN/Infinity (invalid JSON that
+            # some parsers coerce to huge/zero numbers) into a money request — a
+            # last-ditch guard behind the per-endpoint finite-number validation.
+            try:
+                content = json.dumps(body or {}, separators=(",", ":"), allow_nan=False)
+            except ValueError as exc:
+                raise DMAError(400, "request body contains a non-finite number") from exc
             resp = await _client.post(url, headers=headers, content=content)
     except httpx.HTTPError as exc:
         raise DMAError(502, f"upstream request failed: {exc}") from exc
