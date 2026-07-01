@@ -219,16 +219,15 @@
               <label class="sizeby-margin">Margin <span class="muted">(USDT to commit)</span>
                 <input name="margin" placeholder="100" inputmode="decimal" autocomplete="off" />
               </label>
-              <!-- %-of-balance sizing helper. The Lev field feeds BOTH the
-                   %-buttons and the Margin→Quantity conversion; it is a local
-                   position-size estimate only and is never sent with the order
-                   (leverage is changed separately under Account). -->
+              <!-- %-of-balance sizing helper. Leverage is fetched from the exchange
+                   for the typed symbol (your REAL account leverage), shown read-only,
+                   and feeds BOTH the %-buttons and the Margin→Quantity conversion. It
+                   is never sent with the order (change it under Account → Set Leverage). -->
               <div class="sizing">
                 <div class="sizing-row">
                   <span class="sizing-avail priv" id="sizing-avail">avail —</span>
-                  <label class="sizing-lev">lev
-                    <input id="sizing-lev" type="text" inputmode="decimal" value="1" autocomplete="off" />
-                  </label>
+                  <span class="sizing-lev-display priv" id="sizing-lev-display"
+                        title="Your account leverage for this symbol, fetched from the exchange">lev —</span>
                 </div>
                 <div class="sizing-btns" id="sizing-btns" role="group" aria-label="Size as percent of available balance">
                   <button type="button" data-pct="25">25%</button>

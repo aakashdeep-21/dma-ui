@@ -106,6 +106,18 @@ async def get_positions():
     )
 
 
+async def get_position_by_symbol(symbol: str):
+    """Position record for ONE symbol. Unlike get_positions (settleCoin-scoped —
+    only coins you currently hold), a symbol-scoped query returns the record
+    including the current `leverage` even when size is 0. This is the source of
+    truth for a coin's set leverage BEFORE any position exists."""
+    return await _request(
+        "GET",
+        "/v5/position/list",
+        params={"category": settings.CATEGORY, "symbol": symbol},
+    )
+
+
 async def get_open_orders():
     return await _request(
         "GET",

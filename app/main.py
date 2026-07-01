@@ -437,6 +437,27 @@ async def api_positions(user: dict = Depends(current_user)):
     return await dma_client.get_positions()
 
 
+@app.get("/api/position/leverage")
+async def api_position_leverage(symbol: str, user: dict = Depends(require_admin)):
+    """The account's CURRENT leverage for a symbol — present even with no open
+    position. Admin-only (only the order ticket uses it) and read-only; returns
+    just the leverage value, not the full position record.
+
+    Returns ONLY the one-way (positionIdx 0) leg's leverage. On a hedge-mode
+    account (no idx-0 leg; separate buy/sell leverage) it returns null rather than
+    guess a leg — the order ticket then falls back to its safe 'unavailable' path
+    instead of sizing against the wrong side's leverage."""
+    sym = str(symbol).upper()
+    if not _valid_symbol(sym):
+        raise HTTPException(status_code=400, detail="symbol has an invalid format")
+    entries = _extract_list(await dma_client.get_position_by_symbol(sym))
+    one_way = next(
+        (e for e in entries if str(e.get("positionIdx")) == "0" and e.get("leverage")),
+        None,
+    )
+    return {"symbol": sym, "leverage": (one_way or {}).get("leverage")}
+
+
 @app.get("/api/orders")
 async def api_orders(user: dict = Depends(current_user)):
     return await dma_client.get_open_orders()

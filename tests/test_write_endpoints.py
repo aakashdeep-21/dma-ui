@@ -120,6 +120,75 @@ def test_dma_error_handler_returns_only_retmsg(admin_client, monkeypatch):
     assert "sekret-123" not in r.text  # internal diagnostics not forwarded
 
 
+# ---- position/leverage read (symbol-scoped; drives order-ticket sizing) ----
+
+def test_position_leverage_reads_size0_record(admin_client, monkeypatch):
+    from app import dma_client
+
+    async def fake(symbol):
+        return {"result": {"list": [
+            {"symbol": symbol, "leverage": "5", "size": "0", "positionIdx": 0},
+        ]}}
+
+    monkeypatch.setattr(dma_client, "get_position_by_symbol", fake)
+    r = admin_client.get("/api/position/leverage?symbol=solusdt")
+    assert r.status_code == 200
+    assert r.json() == {"symbol": "SOLUSDT", "leverage": "5"}
+
+
+def test_position_leverage_bad_symbol(admin_client):
+    assert admin_client.get("/api/position/leverage?symbol=SOL-USDT!").status_code == 400
+
+
+def test_position_leverage_empty_list(admin_client, monkeypatch):
+    from app import dma_client
+
+    async def fake(symbol):
+        return {"result": {"list": []}}
+
+    monkeypatch.setattr(dma_client, "get_position_by_symbol", fake)
+    r = admin_client.get("/api/position/leverage?symbol=BTCUSDT")
+    assert r.status_code == 200 and r.json()["leverage"] is None
+
+
+def test_position_leverage_one_way_returns_idx0(admin_client, monkeypatch):
+    from app import dma_client
+
+    async def fake(symbol):
+        return {"result": {"list": [
+            {"symbol": symbol, "leverage": "7", "positionIdx": 0},
+        ]}}
+
+    monkeypatch.setattr(dma_client, "get_position_by_symbol", fake)
+    assert admin_client.get("/api/position/leverage?symbol=ETHUSDT").json()["leverage"] == "7"
+
+
+def test_position_leverage_hedge_returns_null(admin_client, monkeypatch):
+    # A hedge-mode account has NO idx-0 leg (buy=idx1, sell=idx2 with different
+    # leverage). The endpoint must refuse to guess a leg and return null so the
+    # ticket falls back to its safe "unavailable" path.
+    from app import dma_client
+
+    async def fake(symbol):
+        return {"result": {"list": [
+            {"symbol": symbol, "leverage": "5", "positionIdx": 1},
+            {"symbol": symbol, "leverage": "20", "positionIdx": 2},
+        ]}}
+
+    monkeypatch.setattr(dma_client, "get_position_by_symbol", fake)
+    assert admin_client.get("/api/position/leverage?symbol=ETHUSDT").json()["leverage"] is None
+
+
+def test_position_leverage_requires_auth():
+    # No auth override here (unlike the admin_client fixture): the endpoint must
+    # reject an unauthenticated request rather than reach the exchange.
+    from fastapi.testclient import TestClient
+    from app import main as main_mod
+
+    with TestClient(main_mod.app) as c:
+        assert c.get("/api/position/leverage?symbol=BTCUSDT").status_code == 401
+
+
 # ---- security headers on every response (S3) ------------------------------
 
 def test_security_headers_present(admin_client):

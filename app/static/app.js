@@ -13,6 +13,7 @@ const state = {
   tradeToken: "",
   writeInFlight: false,
   orderLastPrice: null,
+  symbolLeverage: null, // { symbol, leverage } — the exchange's real leverage for the order-ticket symbol
   prevPos: {},
   lastPositions: [],
   lastOrders: [],
@@ -1210,34 +1211,26 @@ function wireAdminForms() {
           specWarnings.push(`Qty ${body.qty} exceeds the ${body.symbol} maximum (${spec.maxOrderQty}); the exchange may reject it.`);
       }
 
-      // Money-safety: the margin estimate uses the local leverage field, but the
-      // ACTUAL margin the exchange consumes depends on the account's leverage for
-      // this symbol. We can only READ that leverage from a live position, so:
-      //   * live position, leverage differs  -> warn (real margin will differ);
-      //   * no live position                  -> warn (leverage is UNVERIFIED —
-      //     the qty was sized against the assumed field value). This never leaves
-      //     the assumption silent, which is the whole point on a real-money path.
-      if (sizedByMargin) {
-        const posLev = (state.lastPositions || []).find(
-          (p) => String(p.symbol).toUpperCase() === body.symbol && Number(p.size) !== 0 && Number(p.leverage) > 0
-        );
-        if (posLev) {
-          if (Math.abs(Number(posLev.leverage) - sizingLeverage()) > 1e-9) {
-            specWarnings.push(`Margin estimate assumes ${sizingLeverage()}x, but ${body.symbol}'s live position leverage is ${posLev.leverage}x — the actual margin consumed will differ. Set leverage to match, or size by Quantity.`);
-          }
-        } else {
-          specWarnings.push(`Margin sizing assumes ${sizingLeverage()}x — there is no open ${body.symbol} position to confirm your account's actual leverage, so the real margin consumed may differ. Verify leverage under Account.`);
+      // A Market order sized by margin derives qty from the last fetched price,
+      // which refreshes on symbol/type change (not continuously). Warn if it has
+      // gone stale so a drifted quote isn't trusted blindly for the size. (Leverage
+      // no longer needs an "assumed" warning — the qty is derived from the exchange's
+      // real leverage, and margin sizing refuses to proceed when it isn't known.)
+      if (sizedByMargin && String(body.orderType).toLowerCase() === "market") {
+        const lp = state.orderLastPrice;
+        const ageMs = lp && lp.symbol === body.symbol && lp.ts ? Date.now() - lp.ts : null;
+        if (ageMs != null && ageMs > 15000) {
+          specWarnings.push(`The market price used to size this order is ${Math.round(ageMs / 1000)}s old; re-select the symbol to refresh it if the price may have moved.`);
         }
-
-        // A Market order sized by margin derives qty from the last fetched price,
-        // which refreshes on symbol/type change (not continuously). Warn if it has
-        // gone stale so a drifted quote isn't trusted blindly for the size.
-        if (String(body.orderType).toLowerCase() === "market") {
-          const lp = state.orderLastPrice;
-          const ageMs = lp && lp.symbol === body.symbol && lp.ts ? Date.now() - lp.ts : null;
-          if (ageMs != null && ageMs > 15000) {
-            specWarnings.push(`The market price used to size this order is ${Math.round(ageMs / 1000)}s old; re-select the symbol to refresh it if the price may have moved.`);
-          }
+      }
+      // Leverage is fetched on symbol select / after an in-app change, but not
+      // continuously — warn if it's old so an out-of-band change (exchange app)
+      // isn't silently sized against.
+      if (sizedByMargin) {
+        const sl = state.symbolLeverage;
+        const ageMs = sl && sl.symbol === body.symbol && sl.ts ? Date.now() - sl.ts : null;
+        if (ageMs != null && ageMs > 300000) {
+          specWarnings.push(`Leverage for ${body.symbol} was read ${Math.round(ageMs / 60000)}m ago; if you changed it on the exchange since, re-select the symbol to refresh.`);
         }
       }
 
@@ -1254,16 +1247,17 @@ function wireAdminForms() {
         ["Symbol", body.symbol],
         ["Quantity", String(body.qty)],
       ];
-      if (sizedByMargin && Number(f.margin.value.trim()) > 0) {
-        lines.push(["Margin (requested)", `${fmtNum(Number(f.margin.value.trim()))} ${settleCoin()} (${lev}x)`]);
+      if (sizedByMargin && lev > 0 && Number(f.margin.value.trim()) > 0) {
+        lines.push(["Margin (requested)", `${fmtNum(Number(f.margin.value.trim()))} ${settleCoin()} (${lev}×)`]);
       }
       if (body.price) lines.push(["Limit price", String(body.price)]);
       if (entry && Number(body.qty) > 0) {
         const notional = Number(body.qty) * entry;
         lines.push(["Notional", `${fmtNum(notional)} ${settleCoin()}${body.price ? "" : " (est.)"}`]);
-        // Reduce-only closes an existing position and commits no new margin, so
-        // the initial-margin estimate would be misleading there.
-        if (!body.reduceOnly) lines.push(["Est. initial margin", `${fmtNum(notional / lev)} ${settleCoin()} (${lev}x)`]);
+        // Reduce-only closes an existing position and commits no new margin, so the
+        // initial-margin estimate would be misleading; also omit it if leverage is
+        // unknown (never shown against a guess).
+        if (!body.reduceOnly && lev > 0) lines.push(["Est. initial margin", `${fmtNum(notional / lev)} ${settleCoin()} (${lev}×)`]);
         if (state.available && state.available > 0) {
           lines.push(["≈ % of available", fmtPct((notional / state.available) * 100, false)]);
         }
@@ -1282,6 +1276,7 @@ function wireAdminForms() {
           f.side.dispatchEvent(new Event("change", { bubbles: true }));
           f.orderType.dispatchEvent(new Event("change", { bubbles: true }));
           f.sizeMode.dispatchEvent(new Event("change", { bubbles: true }));
+          state.symbolLeverage = null; // symbol cleared by reset; drop its cached leverage
           syncLimit();
           updateOrderPreview();
           refreshDashboardSoon(); // surface the new resting order / position promptly
@@ -1315,11 +1310,60 @@ function wireAdminForms() {
     updateOrderPreview();
   }
 
-  // Leverage used ONLY by the local sizing helpers (%-buttons + Margin→Quantity).
-  // It is never sent with the order; the exchange uses the account's own leverage.
+  // The account's REAL leverage for the active symbol, fetched from the exchange
+  // on symbol change (see fetchSymbolLeverage) and used by the %-buttons and the
+  // Margin→Quantity conversion. It is NEVER sent with the order. Returns null when
+  // it isn't known yet (still loading, fetch failed, or no symbol) — callers must
+  // then refuse to size rather than guess, since a wrong leverage mis-sizes real
+  // money. Guarded by symbol so a stale value is never used for a different coin.
   function sizingLeverage() {
-    const levEl = document.getElementById("sizing-lev");
-    return Math.max(1, Number(levEl && levEl.value) || 1);
+    const sl = state.symbolLeverage;
+    if (!sl || sl.symbol !== orderForm.symbol.value.trim().toUpperCase()) return null;
+    const lev = Number(sl.leverage);
+    return lev > 0 && isFinite(lev) ? lev : null;
+  }
+
+  // Render the read-only leverage chip: a value, "loading" while a fetch is in
+  // flight for the current symbol, or "unavailable" if the fetch couldn't resolve it.
+  function updateLeverageDisplay() {
+    const el = document.getElementById("sizing-lev-display");
+    if (!el) return;
+    const sym = orderForm.symbol.value.trim().toUpperCase();
+    const sl = state.symbolLeverage;
+    if (!sym) { el.innerHTML = "lev —"; return; }
+    if (!sl || sl.symbol !== sym) { el.innerHTML = 'lev <span class="muted">…</span>'; return; }
+    el.innerHTML = sl.leverage > 0
+      ? `lev <b>${esc(String(sl.leverage))}×</b>`
+      : 'lev <span class="warn">unavailable</span>';
+  }
+
+  // Monotonic token so a slower reply for the SAME symbol can't overwrite a newer
+  // one (e.g. symbol re-selected, or a set-leverage re-fetch races the initial).
+  let _levSeq = 0;
+
+  // Fetch the exchange's real leverage for `symbol` and cache it in state. Guards:
+  //  * out-of-order: applied only if it's still the LATEST request AND the field
+  //    still holds this symbol (covers same-symbol and cross-symbol races);
+  //  * fail-open: on error, leverage is marked unknown (null) — the ticket keeps
+  //    working (Quantity mode unaffected; Margin mode refuses to guess);
+  //  * empty symbol clears it. A cached record with leverage===null means
+  //    "resolved but unavailable" (distinct from "still loading" = no record yet).
+  async function fetchSymbolLeverage(symbol) {
+    const sym = (symbol || "").trim().toUpperCase();
+    const seq = ++_levSeq;
+    if (!sym) { state.symbolLeverage = null; updateLeverageDisplay(); return; }
+    let leverage = null;
+    try {
+      const data = await api(`/api/position/leverage?symbol=${encodeURIComponent(sym)}`);
+      const lev = Number(data && data.leverage);
+      if (lev > 0 && isFinite(lev)) leverage = lev;
+    } catch (e) {
+      /* leave leverage null -> sizing refuses to guess; never blocks the ticket */
+    }
+    if (seq !== _levSeq || orderForm.symbol.value.trim().toUpperCase() !== sym) return; // superseded
+    state.symbolLeverage = { symbol: sym, leverage, ts: Date.now() };
+    updateLeverageDisplay();
+    updateOrderPreview();
   }
 
   // Base coin of a linear USDT symbol (e.g. "SOLUSDT" -> "SOL") for labelling the
@@ -1356,7 +1400,10 @@ function wireAdminForms() {
     const margin = Number(orderForm.margin.value.trim());
     const lev = sizingLeverage();
     const sym = orderForm.symbol.value.trim().toUpperCase();
-    if (!(margin > 0) || !(price > 0)) { orderForm.qty.value = ""; return; }
+    // Need margin, price AND the real leverage — never guess leverage on the money
+    // path. A null leverage (still loading / fetch failed) clears qty so the submit
+    // guard blocks it and the hint explains why.
+    if (!(margin > 0) || !(price > 0) || !(lev > 0)) { orderForm.qty.value = ""; return; }
     const spec = state.specs[sym];
     // Never derive a qty without the instrument's lot step: an unfloored qty is
     // rejected by the exchange and would make the notional/margin preview wrong.
@@ -1368,22 +1415,12 @@ function wireAdminForms() {
     orderForm.qty.value = snapped && Number(snapped) > 0 ? snapped : "";
   }
 
-  // Auto-match the local leverage field to the symbol's LIVE position leverage
-  // (when one exists) so the Margin→Quantity math reflects the real margin the
-  // exchange will consume. Fires only on symbol change; manual edits then stick.
-  function autofillLeverageForSymbol(sym) {
-    const levEl = document.getElementById("sizing-lev");
-    if (!levEl) return;
-    const pos = (state.lastPositions || []).find(
-      (p) => String(p.symbol).toUpperCase() === sym && Number(p.size) !== 0 && Number(p.leverage) > 0
-    );
-    if (pos) levEl.value = String(pos.leverage);
-  }
-
   function updateOrderPreview() {
     const symbol = orderForm.symbol.value.trim().toUpperCase();
     const side = orderForm.side.value;
     const { price: entryNum, estimate } = resolveEntryPrice();
+
+    updateLeverageDisplay();
 
     // In Margin mode, re-derive qty BEFORE reading it so the notional/PnL below
     // and the submitted order all reflect the current margin/lev/price inputs.
@@ -1394,7 +1431,7 @@ function wireAdminForms() {
     const sl = orderForm.stopLoss.value.trim();
     const entry = entryNum > 0 ? String(entryNum) : "";
     const marginMode = orderForm.sizeMode.value === "margin";
-    const lev = sizingLeverage();
+    const lev = sizingLeverage(); // real leverage, or null if not known yet
 
     // Sizing hint: notional (qty × price) and the initial margin it implies
     // (notional ÷ leverage). In Margin mode we also lead with the resolved qty so
@@ -1409,10 +1446,19 @@ function wireAdminForms() {
         const parts = [];
         if (marginMode) parts.push(`→ <b>${esc(qty)}</b> ${esc(baseCoin(symbol))}`);
         parts.push(`${fmtNum(notional)} ${esc(settleCoin())} notional${estimate ? " (at market)" : ""}`);
-        if (!reduceOnly) parts.push(`margin ≈ <b>${fmtNum(notional / lev)}</b> ${esc(settleCoin())} <span class="muted">(${lev}x)</span>`);
+        // Margin figure only when the real leverage is known (never shown against a guess).
+        if (!reduceOnly && lev > 0) parts.push(`margin ≈ <b>${fmtNum(notional / lev)}</b> ${esc(settleCoin())} <span class="muted">(${lev}×)</span>`);
         orderNotional.innerHTML = parts.join('<span class="sep">·</span>');
       } else if (marginMode && marginTyped > 0 && !(entryNum > 0)) {
         orderNotional.innerHTML = `<span class="warn">enter a limit price (or wait for the market price) to size by margin</span>`;
+      } else if (marginMode && marginTyped > 0 && !(lev > 0)) {
+        // Distinguish "still fetching" (no record for this symbol yet) from
+        // "resolved but no leverage available" (fetch returned/failed) so the hint
+        // doesn't say "loading…" forever after a failure or on a hedge account.
+        const resolved = state.symbolLeverage && state.symbolLeverage.symbol === symbol;
+        orderNotional.innerHTML = resolved
+          ? `<span class="warn">leverage unavailable for ${esc(baseCoin(symbol))} — size by Quantity, or set leverage under Account</span>`
+          : `<span class="muted">loading leverage for ${esc(baseCoin(symbol))}…</span>`;
       } else if (marginMode && marginTyped > 0 && (!spec || spec.qtyStep == null)) {
         orderNotional.innerHTML = `<span class="muted">loading ${esc(baseCoin(symbol))} contract details…</span>`;
       } else if (marginMode && marginTyped > 0 && entryNum > 0) {
@@ -1448,10 +1494,10 @@ function wireAdminForms() {
           const sym = orderForm.symbol.value.trim().toUpperCase();
           clearTimeout(_lastPriceTimer);
           _lastPriceTimer = setTimeout(() => {
-            autofillLeverageForSymbol(sym); // match margin math to the live position leverage
-            fetchMarketPrice(sym);    // live last price (sizing + market preview)
-            fetchInstrumentSpec(sym); // tick/lot/leverage filters -> spec strip
-            setActiveSymbol(sym);     // load the order-book widget for this symbol
+            fetchSymbolLeverage(sym);  // REAL account leverage — issued first (drives margin sizing)
+            fetchMarketPrice(sym);     // live last price (sizing + market preview)
+            fetchInstrumentSpec(sym);  // tick/lot filters -> spec strip
+            setActiveSymbol(sym);      // load the order-book widget for this symbol
           }, 400);
         } else if (e.target.name === "orderType" && orderForm.orderType.value === "Market") {
           const sym = orderForm.symbol.value.trim().toUpperCase();
@@ -1465,8 +1511,10 @@ function wireAdminForms() {
     })
   );
 
-  // %-of-balance sizing: writes a snapped quantity into the qty field. The lev
-  // field is a local estimate input only — it is NOT part of the order payload.
+  // %-of-balance sizing: "commit X% of available as margin". In Margin mode we fill
+  // the margin field (qty is derived from it once leverage/price load); in Quantity
+  // mode we fill qty directly using the REAL leverage. Both resolve to the SAME
+  // size: qty = (avail × pct × lev) ÷ price. Leverage is never part of the payload.
   const sizingBtns = document.getElementById("sizing-btns");
   if (sizingBtns) {
     sizingBtns.addEventListener("click", (e) => {
@@ -1474,12 +1522,8 @@ function wireAdminForms() {
       if (!b) return;
       const pct = Number(b.dataset.pct) / 100;
       const avail = Number(state.available);
-      const lev = sizingLeverage();
       const sym = orderForm.symbol.value.trim().toUpperCase();
       if (!(avail > 0)) { toast("Available balance not loaded yet.", "warn"); return; }
-      // % of available = the margin to commit. In Margin mode we fill the margin
-      // field (qty is then derived + snapped from it); in Quantity mode we fill
-      // qty directly. Both resolve to the SAME size: qty = (avail × pct × lev) ÷ price.
       if (orderForm.sizeMode.value === "margin") {
         // The margin <input> shows a raw balance-derived figure that CSS privacy
         // masking cannot hide (it masks text, not input values). Don't leak the
@@ -1488,10 +1532,15 @@ function wireAdminForms() {
           toast("Turn off privacy mode to size by % (it would show your balance).", "warn");
           return;
         }
+        // Setting the margin is valid regardless of leverage; qty derives once the
+        // real leverage (and price) are available.
         orderForm.margin.value = String(Number((avail * pct).toFixed(2)));
         updateOrderPreview();
         return;
       }
+      // Quantity mode needs the real leverage to convert margin→qty.
+      const lev = sizingLeverage();
+      if (!(lev > 0)) { toast("Leverage not loaded yet for this symbol.", "warn"); return; }
       let price = orderForm.orderType.value === "Limit" ? Number(orderForm.price.value) : NaN;
       if (!(price > 0) && state.orderLastPrice && state.orderLastPrice.symbol === sym) {
         price = Number(state.orderLastPrice.price);
@@ -1547,7 +1596,7 @@ function wireAdminForms() {
       const { price } = resolveEntryPrice();
       const qtyNum = Number(orderForm.qty.value.trim());
       const lev = sizingLeverage();
-      if (qtyNum > 0 && price > 0) {
+      if (qtyNum > 0 && price > 0 && lev > 0) {
         orderForm.margin.value = String(Number(((qtyNum * price) / lev).toFixed(2)));
       }
     }
@@ -1602,10 +1651,10 @@ function wireAdminForms() {
       const curLev = posForSym ? Number(posForSym.leverage) : null;
       const bigJump = reqLev >= 25 || (curLev && curLev > 0 && reqLev >= curLev * 2);
       const lvLines = [
-        ["Buy leverage", `${body.buyLeverage}x`],
-        ["Sell leverage", `${body.sellLeverage}x`],
+        ["Buy leverage", `${body.buyLeverage}×`],
+        ["Sell leverage", `${body.sellLeverage}×`],
       ];
-      if (curLev) lvLines.push(["Current", `${curLev}x`]);
+      if (curLev) lvLines.push(["Current", `${curLev}×`]);
       return {
         path: "/api/position/set-leverage",
         body,
@@ -1618,7 +1667,12 @@ function wireAdminForms() {
             : "Higher leverage moves your liquidation price closer to the mark.",
         },
         successMsg: () => `✓ Leverage set for ${body.symbol}`,
-        onSuccess: () => refreshDashboardSoon(),
+        onSuccess: () => {
+          refreshDashboardSoon();
+          // If the ticket is on this symbol, refresh its leverage so the sizer
+          // reflects the change immediately.
+          if (orderForm.symbol.value.trim().toUpperCase() === body.symbol) fetchSymbolLeverage(body.symbol);
+        },
       };
     });
   });
