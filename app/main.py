@@ -162,9 +162,24 @@ _auth_failures: dict[str, list[float]] = {}
 
 
 def _client_ip(request: Request) -> str:
+    """Best-effort real client IP for rate-limit bucketing.
+
+    X-Forwarded-For is ``<client-supplied…>, <hop appended by proxy 1>, …`` — each
+    trusted proxy APPENDS the address it saw, on the RIGHT. The leftmost value is
+    fully client-controlled, so keying rate limits on it lets an attacker rotate a
+    fake XFF per request and dodge the login / trade-token lockout. We instead take
+    the hop `TRUSTED_PROXY_HOPS` from the right — the value our own proxy chain
+    added, which the client cannot forge. Default 1 (Railway's single proxy); set
+    TRUSTED_PROXY_HOPS=2 when an edge proxy (e.g. Cloudflare) sits in front, so all
+    clients don't collapse into one shared bucket (a lockout-DoS). Falls back to the
+    socket peer when no XFF is present.
+    """
     xff = request.headers.get("x-forwarded-for")
     if xff:
-        return xff.split(",")[0].strip()
+        hops = [h.strip() for h in xff.split(",") if h.strip()]
+        if hops:
+            idx = len(hops) - settings.TRUSTED_PROXY_HOPS
+            return hops[idx] if idx >= 0 else hops[0]
     return request.client.host if request.client else "unknown"
 
 
@@ -242,17 +257,47 @@ def _safe_float(value) -> float:
     return result if math.isfinite(result) else 0.0
 
 
-def _extract_list(payload) -> list:
-    # Single source: shared with the alert watcher (app/notifier.py).
-    return dma_client.extract_list(payload)
+# Single source, shared with the alert watcher (app/notifier.py). Aliased rather
+# than wrapped so there is no needless indirection.
+_extract_list = dma_client.extract_list
 
 
 # Bybit-v5 linear symbols are upper-case alphanumeric (e.g. BTCUSDT, 1000PEPEUSDT).
 _SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,20}$")
+# Coins/settle assets are shorter upper-case alphanumerics (USDT, USDC, BTC, …).
+_COIN_RE = re.compile(r"^[A-Z0-9]{1,15}$")
 
 
 def _valid_symbol(sym) -> bool:
     return isinstance(sym, str) and bool(_SYMBOL_RE.match(sym))
+
+
+def _require_symbol(symbol) -> str:
+    """Uppercase + validate a REQUIRED symbol; raise 400 on a bad format so a
+    garbage value never reaches the signed upstream."""
+    sym = str(symbol).upper()
+    if not _valid_symbol(sym):
+        raise HTTPException(status_code=400, detail="symbol has an invalid format")
+    return sym
+
+
+def _norm_symbol_opt(symbol):
+    """Uppercase + validate an OPTIONAL symbol param. None/blank passes through as
+    None (these endpoints legitimately query the full list when no symbol is
+    given); a provided-but-malformed symbol is rejected with 400."""
+    if symbol is None or (isinstance(symbol, str) and not symbol.strip()):
+        return None
+    return _require_symbol(symbol)
+
+
+def _norm_coin_opt(coin):
+    """Uppercase + validate an OPTIONAL coin param (None/blank -> None)."""
+    if coin is None or (isinstance(coin, str) and not coin.strip()):
+        return None
+    c = str(coin).upper()
+    if not _COIN_RE.match(c):
+        raise HTTPException(status_code=400, detail="coin has an invalid format")
+    return c
 
 
 def _positive_finite(value) -> bool:
@@ -267,6 +312,14 @@ def _positive_finite(value) -> bool:
     except (TypeError, ValueError):
         return False
     return math.isfinite(number) and number > 0
+
+
+# Monotonic dashboard-snapshot counter. Both the WS push and the /api/dashboard
+# GET call build_dashboard in this one process, so a per-build increment lets the
+# client order snapshots by data-assembly time regardless of transport (the client
+# renders the highest `gen` seen and drops older ones). Incremented with no await
+# between read and write, so it is race-free under the event loop's single thread.
+_dashboard_gen = 0
 
 
 async def build_dashboard() -> dict:
@@ -301,8 +354,14 @@ async def build_dashboard() -> dict:
     total_unrealised = sum(_safe_float(p.get("unrealisedPnl")) for p in positions)
     total_position_value = sum(_safe_float(p.get("positionValue")) for p in positions)
 
+    # Stamp at assembly time (no await between here and return, so it reflects the
+    # order in which concurrent builds finished reading the exchange).
+    global _dashboard_gen
+    _dashboard_gen += 1
+
     return {
         "type": "dashboard",
+        "gen": _dashboard_gen,
         "positions": positions,
         "orders": orders,
         "balance": balance,
@@ -447,9 +506,7 @@ async def api_position_leverage(symbol: str, user: dict = Depends(require_admin)
     account (no idx-0 leg; separate buy/sell leverage) it returns null rather than
     guess a leg — the order ticket then falls back to its safe 'unavailable' path
     instead of sizing against the wrong side's leverage."""
-    sym = str(symbol).upper()
-    if not _valid_symbol(sym):
-        raise HTTPException(status_code=400, detail="symbol has an invalid format")
+    sym = _require_symbol(symbol)
     entries = _extract_list(await dma_client.get_position_by_symbol(sym))
     one_way = next(
         (e for e in entries if str(e.get("positionIdx")) == "0" and e.get("leverage")),
@@ -470,17 +527,17 @@ async def api_balance(user: dict = Depends(current_user)):
 
 @app.get("/api/instruments")
 async def api_instruments(symbol: str | None = None, user: dict = Depends(current_user)):
-    return await dma_client.get_instruments(symbol)
+    return await dma_client.get_instruments(_norm_symbol_opt(symbol))
 
 
 @app.get("/api/closed-pnl")
 async def api_closed_pnl(symbol: str | None = None, user: dict = Depends(current_user)):
-    return await dma_client.get_closed_pnl(symbol)
+    return await dma_client.get_closed_pnl(_norm_symbol_opt(symbol))
 
 
 @app.get("/api/withdrawable")
 async def api_withdrawable(coin: str | None = None, user: dict = Depends(current_user)):
-    return await dma_client.get_withdrawable(coin)
+    return await dma_client.get_withdrawable(_norm_coin_opt(coin))
 
 
 @app.get("/api/executions")
@@ -491,7 +548,7 @@ async def api_executions(
     endTime: str | None = None,
     user: dict = Depends(current_user),
 ):
-    return await dma_client.get_executions(symbol, limit, startTime, endTime)
+    return await dma_client.get_executions(_norm_symbol_opt(symbol), limit, startTime, endTime)
 
 
 @app.get("/api/account-info")
@@ -506,12 +563,12 @@ async def api_server_time(user: dict = Depends(current_user)):
 
 @app.get("/api/tickers")
 async def api_tickers(symbol: str | None = None, user: dict = Depends(current_user)):
-    return await dma_client.get_tickers(symbol)
+    return await dma_client.get_tickers(_norm_symbol_opt(symbol))
 
 
 @app.get("/api/orderbook")
 async def api_orderbook(symbol: str, user: dict = Depends(current_user)):
-    return await dma_client.get_orderbook(symbol)
+    return await dma_client.get_orderbook(_require_symbol(symbol))
 
 
 @app.get("/api/klines")
@@ -612,12 +669,12 @@ async def api_cancel_order(payload: dict = Body(...), user: dict = Depends(requi
     order_id = payload.get("orderId")
     if not symbol or not order_id:
         raise HTTPException(status_code=400, detail="symbol and orderId are required")
-    return await dma_client.cancel_order(symbol, order_id)
+    return await dma_client.cancel_order(_require_symbol(symbol), order_id)
 
 
 @app.post("/api/order/cancel-all")
 async def api_cancel_all(payload: dict = Body(default={}), user: dict = Depends(require_trade_token)):
-    symbol = (payload or {}).get("symbol")
+    symbol = _norm_symbol_opt((payload or {}).get("symbol"))
     return await dma_client.cancel_all(symbol)
 
 
@@ -727,6 +784,15 @@ async def api_trading_stop(payload: dict = Body(...), user: dict = Depends(requi
             status_code=400, detail="at least one of takeProfit or stopLoss is required"
         )
 
+    # Validate the trigger source (allowlist, like every other write field) BEFORE
+    # the upstream position lookup, so a bad value fails fast without a wasted
+    # round-trip and can never be forwarded to silently no-op the stop.
+    trigger_by = payload.get("triggerBy")
+    if trigger_by and str(trigger_by) not in ("LastPrice", "MarkPrice", "IndexPrice"):
+        raise HTTPException(
+            status_code=400, detail="triggerBy must be LastPrice, MarkPrice or IndexPrice"
+        )
+
     pos = await _resolve_open_position(payload.get("symbol"), payload.get("positionIdx"))
 
     body = {
@@ -738,8 +804,7 @@ async def api_trading_stop(payload: dict = Body(...), user: dict = Depends(requi
         body["takeProfit"] = tp
     if sl is not None:
         body["stopLoss"] = sl
-    trigger_by = payload.get("triggerBy")
-    if trigger_by:
+    if trigger_by:  # already allowlist-validated above
         body["tpTriggerBy"] = trigger_by
         body["slTriggerBy"] = trigger_by
     return await dma_client.set_trading_stop(body)
@@ -750,6 +815,15 @@ async def api_set_margin_mode(payload: dict = Body(...), user: dict = Depends(re
     mode = payload.get("setMarginMode") or payload.get("mode")
     if not mode:
         raise HTTPException(status_code=400, detail="setMarginMode is required")
+    # Allowlist the mode like every other write field (side/orderType/direction).
+    # Small fixed domain, so a forged/garbled value is rejected locally with a
+    # clean 400 instead of being forwarded for the exchange to reject.
+    mode = str(mode).upper()
+    if mode not in ("ISOLATED_MARGIN", "REGULAR_MARGIN", "PORTFOLIO_MARGIN"):
+        raise HTTPException(
+            status_code=400,
+            detail="setMarginMode must be ISOLATED_MARGIN, REGULAR_MARGIN or PORTFOLIO_MARGIN",
+        )
     return await dma_client.set_margin_mode(mode)
 
 
@@ -861,6 +935,15 @@ async def ws_feed(websocket: WebSocket):
             await websocket.send_json(data)
             await asyncio.sleep(settings.POLL_INTERVAL)
     except WebSocketDisconnect:
+        return
+    except RuntimeError as exc:
+        # A client that vanishes WHILE a send is in flight surfaces as a
+        # RuntimeError ("Cannot call send once a close message has been sent"),
+        # not WebSocketDisconnect — a normal disconnect, not a server fault. A
+        # genuine RuntimeError from build_dashboard is already caught inside the
+        # loop, so this is the send-side close: return quietly (debug only) so it
+        # doesn't spam stderr as a red "error" on every abrupt tab close.
+        logger.debug("websocket closed during send: %s", exc)
         return
     except Exception:
         logger.exception("websocket loop error")

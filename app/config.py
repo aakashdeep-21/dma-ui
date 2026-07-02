@@ -97,6 +97,15 @@ class Settings:
         # --- Live dashboard poll interval (seconds) ---
         self.POLL_INTERVAL: float = _float_env("POLL_INTERVAL", 5.0)
 
+        # --- Number of TRUSTED reverse-proxy hops in front of the app ---
+        # The client IP used for rate-limit bucketing is taken this many hops from
+        # the RIGHT of X-Forwarded-For — i.e. the hop(s) your own proxies appended,
+        # which a client cannot forge. Railway alone = 1 (default). If you put an
+        # edge proxy in front (e.g. Cloudflare -> Railway), set this to 2 so the
+        # real per-client IP is used; otherwise every client collapses into a
+        # single shared bucket and one attacker could lock everyone out.
+        self.TRUSTED_PROXY_HOPS: int = max(1, _int_env("TRUSTED_PROXY_HOPS", 1))
+
         # --- Public market-data for the dashboard charts (READ-ONLY) ---
         # A SEPARATE, unauthenticated host used ONLY for public OHLC candles.
         # It NEVER carries the DMA API key/secret and is isolated from the signed

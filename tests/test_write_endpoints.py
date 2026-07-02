@@ -84,19 +84,33 @@ def test_transfer_requires_client_txn_id(admin_client):
 
 # "inf"/"nan" are sent as strings — a browser's JSON.stringify(Infinity) yields
 # null, so a non-finite number can only reach the server as a string anyway.
-@pytest.mark.parametrize("amount", ["inf", "nan", -1, 0])
+# "1e400" overflows float() to inf — must be caught by the isfinite check.
+@pytest.mark.parametrize("amount", ["inf", "nan", "1e400", -1, 0])
 def test_transfer_rejects_bad_amount(admin_client, amount):
     r = admin_client.post("/api/funds/transfer", json={
         "direction": "OUT", "amount": amount, "quote_asset": "USDT",
         "client_txn_id": "intent-1",
     })
     assert r.status_code == 400
+    assert "amount" in r.text  # pinned to the amount check, not an unrelated 400
 
 
 def test_transfer_forwards_idempotency_key(admin_client):
     r = admin_client.post("/api/funds/transfer", json={
         "direction": "OUT", "amount": 10, "quote_asset": "USDT",
         "client_txn_id": "intent-42",
+    })
+    assert r.status_code == 200, r.text
+    assert admin_client.captured["transfer"]["client_txn_id"] == "intent-42"
+
+
+def test_transfer_idempotency_key_stripped_but_preserved(admin_client):
+    # The dedup key is invariant-critical: whitespace is trimmed but the value
+    # itself must reach the exchange byte-identical (a changed key = a NEW
+    # transfer at the exchange, defeating retry dedup).
+    r = admin_client.post("/api/funds/transfer", json={
+        "direction": "OUT", "amount": 10, "quote_asset": "USDT",
+        "client_txn_id": "  intent-42  ",
     })
     assert r.status_code == 200, r.text
     assert admin_client.captured["transfer"]["client_txn_id"] == "intent-42"
@@ -206,3 +220,111 @@ def test_login_rate_limited_after_failures(admin_client):
     for _ in range(12):
         last = admin_client.post("/api/login", json={"username": "x", "password": "bad"}, headers=hdr)
     assert last.status_code == 429
+
+
+def test_rate_limit_keys_on_rightmost_xff_hop(admin_client):
+    # Default TRUSTED_PROXY_HOPS=1: a rotating LEFTMOST X-Forwarded-For
+    # (attacker-controlled) must NOT reset the bucket — the trusted proxy's
+    # RIGHTMOST hop is the real key. Same rightmost => still locked out despite a
+    # fresh spoofed leftmost each request.
+    for i in range(12):
+        admin_client.post(
+            "/api/login", json={"username": "x", "password": "bad"},
+            headers={"x-forwarded-for": f"1.2.3.{i}, 198.51.100.50"},
+        )
+    r = admin_client.post(
+        "/api/login", json={"username": "x", "password": "bad"},
+        headers={"x-forwarded-for": "9.9.9.9, 198.51.100.50"},
+    )
+    assert r.status_code == 429
+
+
+def test_rate_limit_two_trusted_hops_keys_on_real_client(admin_client, monkeypatch):
+    # With an edge proxy in front (TRUSTED_PROXY_HOPS=2, e.g. Cloudflare -> Railway),
+    # the real client is the 2nd-from-right hop. Rotating the rightmost (the value
+    # the edge/LB appended) must NOT escape the bucket; same real client stays locked.
+    from app import main as main_mod
+    monkeypatch.setattr(main_mod.settings, "TRUSTED_PROXY_HOPS", 2)
+    for i in range(12):
+        admin_client.post(
+            "/api/login", json={"username": "x", "password": "bad"},
+            headers={"x-forwarded-for": f"203.0.113.77, 10.0.0.{i}"},
+        )
+    r = admin_client.post(
+        "/api/login", json={"username": "x", "password": "bad"},
+        headers={"x-forwarded-for": "203.0.113.77, 10.0.0.250"},
+    )
+    assert r.status_code == 429
+
+
+# ---- dashboard snapshot carries a monotonic generation stamp --------------
+
+def test_dashboard_gen_is_monotonic(fake_upstream):
+    # fake_upstream's default resp (retCode 0, empty result) lets build_dashboard
+    # complete offline; assert the generation stamp is present and strictly rising.
+    import asyncio
+    from app import main as main_mod
+    d1 = asyncio.run(main_mod.build_dashboard())
+    d2 = asyncio.run(main_mod.build_dashboard())
+    assert isinstance(d1["gen"], int) and d2["gen"] > d1["gen"]
+
+
+# ---- set-margin-mode allowlist -------------------------------------------
+
+@pytest.mark.parametrize("payload", [{}, {"setMarginMode": ""}, {"setMarginMode": "HYPER_MARGIN"}, {"mode": "isolated"}])
+def test_set_margin_mode_rejects_bad(admin_client, payload):
+    assert admin_client.post("/api/account/set-margin-mode", json=payload).status_code == 400
+
+
+def test_set_margin_mode_normalizes_and_forwards(admin_client, monkeypatch):
+    from app import dma_client
+    captured = {}
+
+    async def fake(mode):
+        captured["mode"] = mode
+        return {"retCode": 0, "result": {}}
+
+    monkeypatch.setattr(dma_client, "set_margin_mode", fake)
+    r = admin_client.post("/api/account/set-margin-mode", json={"setMarginMode": "isolated_margin"})
+    assert r.status_code == 200
+    assert captured["mode"] == "ISOLATED_MARGIN"  # upper-cased before forwarding
+
+
+# ---- trading-stop triggerBy allowlist (fails fast, before the position lookup) --
+
+def test_trading_stop_rejects_bad_trigger_by(admin_client):
+    r = admin_client.post("/api/position/trading-stop", json={
+        "symbol": "BTCUSDT", "takeProfit": "70000", "triggerBy": "Bogus",
+    })
+    assert r.status_code == 400
+    assert "triggerBy" in r.text
+
+
+# ---- symbol format validation on read + cancel endpoints ------------------
+
+def test_orderbook_rejects_bad_symbol(admin_client):
+    assert admin_client.get("/api/orderbook?symbol=BTC-USD!").status_code == 400
+
+
+def test_instruments_rejects_bad_symbol(admin_client):
+    assert admin_client.get("/api/instruments?symbol=B*T").status_code == 400
+
+
+def test_instruments_allows_omitted_symbol(admin_client, monkeypatch):
+    from app import dma_client
+
+    async def fake(sym=None):
+        assert sym is None  # blank/omitted stays None (full-list query)
+        return {"result": {"list": []}}
+
+    monkeypatch.setattr(dma_client, "get_instruments", fake)
+    assert admin_client.get("/api/instruments").status_code == 200
+
+
+def test_cancel_order_rejects_bad_symbol(admin_client):
+    r = admin_client.post("/api/order/cancel", json={"symbol": "BTC/USD", "orderId": "1"})
+    assert r.status_code == 400
+
+
+def test_withdrawable_rejects_bad_coin(admin_client):
+    assert admin_client.get("/api/withdrawable?coin=US*T").status_code == 400

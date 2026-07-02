@@ -34,7 +34,10 @@ from .config import settings
 logger = logging.getLogger("dma-ui.notifier")
 
 # Dedicated outbound client (Telegram only). Closed by the lifespan on shutdown.
-_client = httpx.AsyncClient(timeout=15)
+# trust_env=False for parity with the signed + market-data clients: ambient
+# HTTP(S)_PROXY / SSL_CERT_FILE env vars must not be able to reroute or re-anchor
+# TLS on this request — its URL path embeds the bot token.
+_client = httpx.AsyncClient(timeout=15, trust_env=False)
 
 # Insertion-ordered set of execIds already processed, trimmed to a bound.
 _seen: "OrderedDict[str, None]" = OrderedDict()
@@ -55,12 +58,18 @@ def _remember(exec_id: str) -> None:
         _seen.popitem(last=False)
 
 
-async def _send(text: str) -> bool:
+async def _send(text: str) -> str:
     """Send a PLAIN-TEXT Telegram message (no parse mode, so any exchange-supplied
-    string is inert). Returns True ONLY on confirmed delivery (HTTP 200); honors a
-    429 Retry-After once. NEVER raises, and NEVER logs the exception instance, the
-    URL, or the response body — all can embed the bot token; we log only the
-    integer status or the exception TYPE name."""
+    string is inert). Returns one of:
+      * "sent"          — confirmed delivery (HTTP 200)
+      * "rate_limited"  — Telegram is throttling us (429, still 429 after one retry)
+      * "failed"        — any other error
+
+    Honors a 429 Retry-After ONCE (bounded to 30s). NEVER raises, and NEVER logs
+    the exception instance, the URL, or the response body — all can embed the bot
+    token; we log only the integer status or the exception TYPE name. The caller
+    stops the current poll on "rate_limited" so one throttled burst can't stall
+    the loop for minutes (undelivered fills stay unseen and retry next poll)."""
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": settings.TELEGRAM_CHAT_ID,
@@ -72,41 +81,44 @@ async def _send(text: str) -> bool:
             resp = await _client.post(url, json=payload)
         except httpx.HTTPError as exc:
             logger.warning("telegram send error: %s", type(exc).__name__)
-            return False
+            return "failed"
         if resp.status_code == 200:
-            return True
-        if resp.status_code == 429 and attempt == 1:
-            # Respect Telegram's backoff (parameters.retry_after / Retry-After), retry once.
-            retry_after = 1.0
-            try:
-                params = (resp.json() or {}).get("parameters") or {}
-                retry_after = float(params.get("retry_after") or resp.headers.get("Retry-After") or 1)
-            except (ValueError, TypeError):
+            return "sent"
+        if resp.status_code == 429:
+            if attempt == 1:
+                # Respect Telegram's backoff (parameters.retry_after / Retry-After), retry once.
                 retry_after = 1.0
-            await asyncio.sleep(min(max(retry_after, 0.0), 30.0))
-            continue
+                try:
+                    params = (resp.json() or {}).get("parameters") or {}
+                    retry_after = float(params.get("retry_after") or resp.headers.get("Retry-After") or 1)
+                except (ValueError, TypeError):
+                    retry_after = 1.0
+                await asyncio.sleep(min(max(retry_after, 0.0), 30.0))
+                continue
+            return "rate_limited"  # still throttled after one retry
         logger.warning("telegram send failed: HTTP %s", resp.status_code)
-        return False
-    return False
+        return "failed"
+    return "rate_limited"
 
 
 def _label(ex: dict) -> str | None:
     """Human alert label for an execution, or None to skip (non-order events)."""
     exec_type = str(ex.get("execType") or "")
     stop = str(ex.get("stopOrderType") or "")
+    stop_l = stop.lower()  # match case-insensitively so a re-cased/new variant still labels correctly
     if exec_type == "BustTrade":
         return "⚠️ Liquidation"
     if exec_type == "AdlTrade":
         return "⚠️ Auto-deleverage"
     if exec_type != "Trade":
         return None  # Funding / Settle / Delivery / etc. — not an order execution
-    if "TakeProfit" in stop:
+    if "takeprofit" in stop_l:
         return "\U0001f3af Take-Profit executed"
-    if "StopLoss" in stop:
+    if "stoploss" in stop_l:
         return "\U0001f6d1 Stop-Loss executed"
-    if "TrailingStop" in stop:
+    if "trailingstop" in stop_l:
         return "\U0001f6d1 Trailing-Stop executed"
-    if stop and stop.lower() != "unknownstoporder":
+    if stop and stop_l != "unknownstoporder":
         return f"⚙️ {stop} executed"
     return "✅ Order filled"
 
@@ -140,7 +152,11 @@ async def _poll_once(baseline: bool) -> None:
     alertable fill is marked seen ONLY after Telegram confirms delivery, so a
     dropped alert (e.g. a 429) is retried on the next poll rather than lost."""
     data = await dma_client.get_executions(limit=str(settings.NOTIFY_EXEC_LIMIT))
-    execs = dma_client.extract_list(data)
+    # Copy before mutating: extract_list returns the actual result.list object from
+    # the parsed response, and reverse()/sort() would reorder it in place. Harmless
+    # today (the response isn't reused), but a latent aliasing hazard if that ever
+    # changes — mirror the market_data mutation warning and never touch the source.
+    execs = list(dma_client.extract_list(data))
     # The API returns newest-first; reverse, then stable-sort ascending, so even
     # same-millisecond fills are alerted in chronological order.
     execs.reverse()
@@ -158,8 +174,15 @@ async def _poll_once(baseline: bool) -> None:
             continue
         # Remember ONLY on confirmed delivery; an undelivered alert stays unseen
         # and is retried next poll (no permanent loss on a transient 429/outage).
-        if await _send(_fmt(ex, label)):
+        result = await _send(_fmt(ex, label))
+        if result == "sent":
             _remember(exec_id)
+        elif result == "rate_limited":
+            # Telegram is throttling us: stop this poll rather than burning up to
+            # 30s per remaining fill. Unseen fills (this one included) retry on the
+            # next poll, still in chronological order — no loss, no reordering.
+            break
+        # "failed" (non-429): leave unseen and continue; retried next poll.
 
 
 async def run_watcher() -> None:

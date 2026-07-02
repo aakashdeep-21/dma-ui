@@ -22,6 +22,16 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app import dma_client, main as main_mod  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Clear the module-level auth-failure buckets around each test so no test
+    depends (even incidentally) on rate-limit state left behind by another —
+    keeps the suite order-independent under pytest-randomly/xdist."""
+    main_mod._auth_failures.clear()
+    yield
+    main_mod._auth_failures.clear()
+
+
 class _FakeResp:
     """Minimal stand-in for an httpx.Response."""
 

@@ -38,16 +38,31 @@ const state = {
 
 // Non-blocking toast notifications for action outcomes.
 function toast(msg, type = "info", ms = 4500) {
-  const wrap = document.getElementById("toasts");
-  if (!wrap || !msg) return;
+  if (!msg) return;
+  // Errors/warnings go to an assertive alert region so a failed or blocked action
+  // interrupts a screen reader instead of queuing politely (and possibly expiring
+  // before it is read); info/success stay polite.
+  const assertive = type === "neg" || type === "warn";
+  const wrap = document.getElementById(assertive ? "toasts-alert" : "toasts");
+  if (!wrap) return;
   const el = document.createElement("div");
   el.className = "toast " + (type || "");
-  el.textContent = msg;
+  // Prefix severity so it isn't carried by the left-border colour alone.
+  const prefix = type === "neg" ? "Error: " : type === "warn" ? "Warning: " : "";
+  el.textContent = prefix + msg;
+  el.title = "Dismiss";
   wrap.appendChild(el);
-  setTimeout(() => {
+  // Cap the stack so a burst of fills/errors can never bury the order rail's Submit.
+  while (wrap.children.length > 4) wrap.firstChild.remove();
+  let removed = false;
+  const remove = () => {
+    if (removed) return;
+    removed = true;
     el.classList.add("out");
     setTimeout(() => el.remove(), 300);
-  }, ms);
+  };
+  el.addEventListener("click", remove); // click to dismiss
+  setTimeout(remove, ms);
 }
 
 // Client-side sort of an array of objects by a key (auto numeric vs string).
@@ -500,6 +515,11 @@ function renderSummary(d) {
   const scope = $("#scope-chip");
   if (scope) scope.textContent = coin ? `${coin} PERP` : "";
 
+  // The rail order book always quotes the settle coin (never the INR lens); keep
+  // its unit chip in sync with the real settle coin rather than a hardcoded USDT.
+  const bookUnit = $("#book-unit");
+  if (bookUnit && coin) bookUnit.textContent = coin;
+
   // --- Account-health bar (all from the wallet-balance payload) ---
   const acct = walletAccount(d.balance);
   const num = (v) => (v !== undefined && v !== "" && isFinite(Number(v)) ? Number(v) : null);
@@ -571,7 +591,12 @@ function renderPositions(positions) {
   state.lastPositions = positions || [];
   const rows = state.lastPositions.filter((p) => Number(p.size) !== 0);
   if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="12" class="muted center">No open positions</td></tr>`;
+    // colspan="99" spans all columns regardless of count/role (same as the detail
+    // rows) — no hardcoded per-role count to drift when a column is added.
+    const hint = state.role === "admin"
+      ? `<div class="empty-hint">Use the order ticket on the right to open a position.</div>`
+      : "";
+    body.innerHTML = `<tr><td colspan="99" class="muted center empty-cell">No open positions${hint}</td></tr>`;
     return;
   }
   const isAdmin = state.role === "admin";
@@ -697,8 +722,15 @@ function renderOrders(orders) {
   const body = $("#orders-body");
   state.lastOrders = orders || [];
   const rows = state.lastOrders;
+  // Hide the bulk-destructive "Cancel all" when there's nothing to cancel, so a
+  // live wipe-everything button never sits on an empty panel. (Null for viewers.)
+  const cancelAllBtn = document.getElementById("cancel-all-btn");
+  if (cancelAllBtn) cancelAllBtn.hidden = !rows.length;
   if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="8" class="muted center">No open orders</td></tr>`;
+    const hint = state.role === "admin"
+      ? `<div class="empty-hint">Place an order from the ticket to see it here.</div>`
+      : "";
+    body.innerHTML = `<tr><td colspan="99" class="muted center empty-cell">No open orders${hint}</td></tr>`;
     updateSortIndicators();
     return;
   }
@@ -774,7 +806,21 @@ function renderErrors(errors) {
   }
 }
 
+// Highest server-authored dashboard generation rendered so far. Every dashboard
+// snapshot (WS push AND the /api/dashboard GET) carries `gen`, a monotonic counter
+// stamped server-side at data-assembly time, so freshness is ordered by when the
+// exchange reads completed — not by which transport happened to arrive first.
+// A snapshot older than the last rendered one is dropped, so neither a post-write
+// GET nor a routine WS frame can clobber the other with staler data. Reset to 0 on
+// WS reconnect (a redeploy restarts the server counter). Equal gen still renders,
+// so a currency-toggle re-render of the cached snapshot is unaffected.
+let _lastDashSeq = 0;
 function renderDashboard(d) {
+  const gen = Number(d && d.gen);
+  if (isFinite(gen)) {
+    if (gen < _lastDashSeq) return; // an older snapshot lost the race; keep the newer one
+    _lastDashSeq = gen;
+  }
   state.lastDashboard = d; // kept so a currency toggle can re-render instantly
   renderSummary(d);
   renderPositions(d.positions);
@@ -955,6 +1001,10 @@ let _tpslOpen = false;
 function openTpslModal(pos) {
   if (_tpslOpen) return;
   _tpslOpen = true;
+  // Set once cleanup runs so a late finally/catch from an in-flight write can't
+  // write to (or re-enable) this modal's shared DOM nodes after they've been
+  // handed to a reopened modal.
+  let closed = false;
   const _prevFocus = document.activeElement;
 
   const overlay = $("#tpsl-overlay");
@@ -995,12 +1045,14 @@ function openTpslModal(pos) {
   trigger.value = "LastPrice";
   out.textContent = "";
   out.className = "result-msg";
+  applyBtn.disabled = false; // clear a stuck-disabled state from a prior write
   overlay.hidden = false;
   updatePreview();
   tpInput.focus();
   const _untrap = focusTrap(overlay.querySelector(".modal"));
 
   const cleanup = () => {
+    closed = true;
     overlay.hidden = true;
     applyBtn.removeEventListener("click", onApply);
     cancelBtn.removeEventListener("click", onCancel);
@@ -1041,16 +1093,19 @@ function openTpslModal(pos) {
     withWriteLock(async () => {
       try {
         await writeApi("/api/position/trading-stop", body);
-        out.textContent = "✓ TP/SL applied";
-        out.className = "result-msg pos";
+        // The write settled; surface the outcome regardless of modal state.
         toast(`✓ TP/SL applied for ${pos.symbol}`, "pos");
         refreshDashboardSoon();
+        if (closed) return; // modal already dismissed — don't touch its shared DOM
+        out.textContent = "✓ TP/SL applied";
+        out.className = "result-msg pos";
         setTimeout(cleanup, 800);
       } catch (err) {
+        if (closed) return;
         out.textContent = "✗ " + err.message;
         out.className = "result-msg neg";
       } finally {
-        applyBtn.disabled = false;
+        if (!closed) applyBtn.disabled = false;
       }
     });
   };
@@ -1227,8 +1282,8 @@ function wireAdminForms() {
       // continuously — warn if it's old so an out-of-band change (exchange app)
       // isn't silently sized against.
       if (sizedByMargin) {
-        const sl = state.symbolLeverage;
-        const ageMs = sl && sl.symbol === body.symbol && sl.ts ? Date.now() - sl.ts : null;
+        const symLev = state.symbolLeverage;
+        const ageMs = symLev && symLev.symbol === body.symbol && symLev.ts ? Date.now() - symLev.ts : null;
         if (ageMs != null && ageMs > 300000) {
           specWarnings.push(`Leverage for ${body.symbol} was read ${Math.round(ageMs / 60000)}m ago; if you changed it on the exchange since, re-select the symbol to refresh.`);
         }
@@ -1279,6 +1334,10 @@ function wireAdminForms() {
           state.symbolLeverage = null; // symbol cleared by reset; drop its cached leverage
           syncLimit();
           updateOrderPreview();
+          // Repaint the Submit label AFTER runWrite's finally restores the pre-submit
+          // label, so it reflects the reset form (no stale symbol) rather than the
+          // label captured at submit time.
+          setTimeout(paintSubmit, 0);
           refreshDashboardSoon(); // surface the new resting order / position promptly
         },
       };
@@ -1538,6 +1597,14 @@ function wireAdminForms() {
         updateOrderPreview();
         return;
       }
+      // Quantity mode also writes a balance-derived figure (the qty) into a
+      // visible input. CSS privacy masks text, not <input> values, so — exactly
+      // like the Margin branch above — refuse to size by % while privacy is on
+      // rather than paint the (balance-derived) size on screen.
+      if (document.body.classList.contains("privacy-on")) {
+        toast("Turn off privacy mode to size by % (it would show your balance).", "warn");
+        return;
+      }
       // Quantity mode needs the real leverage to convert margin→qty.
       const lev = sizingLeverage();
       if (!(lev > 0)) { toast("Leverage not loaded yet for this symbol.", "warn"); return; }
@@ -1548,8 +1615,17 @@ function wireAdminForms() {
       if (!(price > 0)) { toast("Enter a symbol (and price for a Limit) to size by %.", "warn"); return; }
       const qty = (avail * pct * lev) / price;
       const spec = state.specs[sym];
-      const snapped = spec && spec.qtyStep ? snapToStep(qty, spec.qtyStep) : (qty > 0 ? String(qty) : "");
-      orderForm.qty.value = snapped || "";
+      // Mirror recomputeMarginQty: never write an unfloored/full-precision qty.
+      // Without the lot step the value isn't snapped (and can render as "1e-7"),
+      // which the exchange rejects — clear it and prompt to retry once specs load.
+      if (!spec || spec.qtyStep == null) {
+        orderForm.qty.value = "";
+        toast("Contract details still loading — try again in a moment.", "warn");
+        updateOrderPreview();
+        return;
+      }
+      const snapped = snapToStep(qty, spec.qtyStep);
+      orderForm.qty.value = snapped && Number(snapped) > 0 ? snapped : "";
       updateOrderPreview();
     });
   }
@@ -1575,6 +1651,17 @@ function wireAdminForms() {
         paint();
       })
     );
+    // Arrow-key navigation between the mutually-exclusive options (expected of a
+    // segmented single-select), moving focus and selection to the adjacent button.
+    seg.addEventListener("keydown", (e) => {
+      if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+      const enabled = buttons.filter((b) => !b.disabled);
+      if (enabled.length < 2) return;
+      const dir = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : -1;
+      const cur = enabled.indexOf(document.activeElement);
+      const next = enabled[((cur < 0 ? 0 : cur) + dir + enabled.length) % enabled.length];
+      if (next) { e.preventDefault(); next.click(); next.focus(); }
+    });
     // Keep the buttons in sync if the select is reset/changed programmatically
     // (e.g. f.reset() after a successful order).
     selectEl.addEventListener("change", paint);
@@ -1583,6 +1670,23 @@ function wireAdminForms() {
   wireSegment("#seg-side", orderForm.side);
   wireSegment("#seg-type", orderForm.orderType);
   wireSegment("#seg-sizemode", orderForm.sizeMode);
+
+  // Reinforce Buy/Sell intent at the point of commit: colour + label the Submit
+  // button to match the selected side (green Buy / red Sell), so a mistoggled side
+  // has a last-line-of-defense cue right where the click happens. Reads the side
+  // <select> (source of truth); presentation only — the order payload is unchanged.
+  const submitBtn = orderForm.querySelector('button[type="submit"]');
+  function paintSubmit() {
+    if (!submitBtn) return;
+    const isBuy = orderForm.side.value === "Buy";
+    submitBtn.classList.toggle("submit-buy", isBuy);
+    submitBtn.classList.toggle("submit-sell", !isBuy);
+    const sym = orderForm.symbol.value.trim().toUpperCase();
+    submitBtn.textContent = `${isBuy ? "Buy" : "Sell"}${sym ? " " + sym : ""} order`;
+  }
+  orderForm.side.addEventListener("change", paintSubmit);
+  orderForm.symbol.addEventListener("input", paintSubmit);
+  paintSubmit();
 
   // 'Size by' toggle: show the Quantity input or the Margin input (never both).
   // The Margin field is a sizing helper only — it derives qty (see
@@ -1726,7 +1830,13 @@ function wireAdminForms() {
         path: "/api/funds/transfer",
         body,
         confirmMsg: `Transfer ${body.amount} ${body.quote_asset} (${body.direction}). This moves real funds.`,
-        successMsg: () => "✓ Transfer request submitted — verify your balance to confirm it completed",
+        // The backend only resolves on a POSITIVELY confirmed transfer (exchange
+        // txn_id present), so this is a real confirmation, not a hedge. Show the
+        // txn id when the exchange returns one.
+        successMsg: (res) => {
+          const txn = res && res.data && (res.data.txn_id || res.data.txnId);
+          return "✓ Transfer completed" + (txn ? ` (txn ${txn})` : "");
+        },
         onSuccess: () => { delete _transferTxnIds[intentKey]; f.reset(); refreshDashboardSoon(); },
       };
     });
@@ -2088,8 +2198,16 @@ function wireTabs() {
   const tabs = document.getElementById("tabs");
   if (!tabs) return;
   const panes = document.querySelectorAll("main .pane");
-  const show = (name) => {
-    tabs.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+  const show = (name, focus = false) => {
+    // Keep the ARIA tab state and roving tabindex in lockstep with `active`, so a
+    // screen reader announces the selected view and only the active tab is a Tab stop.
+    tabs.querySelectorAll(".tab").forEach((b) => {
+      const on = b.dataset.tab === name;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-selected", String(on));
+      b.tabIndex = on ? 0 : -1;
+      if (on && focus) b.focus();
+    });
     panes.forEach((p) => { p.hidden = p.dataset.pane !== name; });
     if (name !== "markets") clearInterval(_marketsTimer); // stop polling when away
     if (name === "markets") onMarketsActive();
@@ -2103,6 +2221,20 @@ function wireTabs() {
     else stopChartPolling();
   };
   tabs.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => show(b.dataset.tab)));
+  // Arrow/Home/End roving expected of a tablist. Viewer-hidden tabs are removed
+  // from the DOM (loadMe), so the live NodeList is already the reachable set.
+  tabs.addEventListener("keydown", (e) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+    const list = Array.from(tabs.querySelectorAll(".tab"));
+    if (!list.length) return;
+    const cur = list.indexOf(document.activeElement);
+    let idx;
+    if (e.key === "Home") idx = 0;
+    else if (e.key === "End") idx = list.length - 1;
+    else idx = ((cur < 0 ? 0 : cur) + (e.key === "ArrowRight" ? 1 : -1) + list.length) % list.length;
+    e.preventDefault();
+    show(list[idx].dataset.tab, true);
+  });
 }
 
 let _marketsData = null;
@@ -2139,11 +2271,14 @@ function renderMarkets() {
 function onMarketsActive() {
   if (!_marketsData) fetchMarkets();
   clearInterval(_marketsTimer);
-  _marketsTimer = setInterval(() => {
+  // Capture the id locally so the self-clearing callback cancels ITS OWN interval,
+  // not whatever _marketsTimer happens to point at after a re-entry.
+  const id = setInterval(() => {
     const pane = document.querySelector('[data-pane="markets"]');
     if (pane && !pane.hidden) fetchMarkets();
-    else clearInterval(_marketsTimer);
+    else clearInterval(id);
   }, 15000);
+  _marketsTimer = id;
 }
 
 let _historyLoaded = false;
@@ -2336,6 +2471,10 @@ function connectWS() {
     // fresh baseline — an outage gap must not be recorded as a normal poll gap
     // (which would inflate the adaptive stale threshold).
     state.lastFrameAt = null;
+    // Reset the dashboard generation floor: a redeploy restarts the server-side
+    // gen counter at 0, so a stale in-memory floor would otherwise drop every
+    // frame from the new server and freeze the dashboard until a page reload.
+    _lastDashSeq = 0;
     renderConn();
     if (!opened) {
       // The socket never upgraded. Browsers report an auth/handshake rejection
@@ -2362,6 +2501,8 @@ let _refreshTimer = null;
 function refreshDashboardSoon() {
   clearTimeout(_refreshTimer);
   _refreshTimer = setTimeout(async () => {
+    // renderDashboard drops this snapshot if a newer-`gen` frame already rendered
+    // (and renders it if it is the fresher one), so no ordering guard is needed here.
     try { renderDashboard(await api("/api/dashboard")); } catch (e) { /* WS will catch up */ }
   }, 150);
 }
@@ -2488,7 +2629,10 @@ function renderBookLadder(data, opts = {}) {
   const money = (v) => (opts.convert ? fmtMoney(v, 4) : fmtNum(v, 4));
   const rowHTML = (side, px, size) => {
     const w = (Number(size) || 0) / maxSz * 100;
-    return `<div class="book-row ${side}${clickable}" data-px="${esc(px)}">` +
+    // When clickable, make each level keyboard-operable (role/tabindex + label)
+    // so the price can be picked without a mouse. px is upstream data — escape it.
+    const kb = opts.clickable ? ` role="button" tabindex="0" title="Click to fill the limit price" aria-label="Use price ${esc(px)}"` : "";
+    return `<div class="book-row ${side}${clickable}" data-px="${esc(px)}"${kb}>` +
       `<span class="depth" style="width:${w.toFixed(1)}%"></span>` +
       `<span class="px">${pxDisp(px)}</span><span class="sz">${esc(size)}</span></div>`;
   };
@@ -2506,10 +2650,9 @@ function renderBookLadder(data, opts = {}) {
   return asksHtml + spread + bidsHtml;
 }
 
-// Click a book level to pre-fill the limit price (switching to Limit if needed).
-document.addEventListener("click", (e) => {
-  const br = e.target.closest(".book-row.clickable[data-px]");
-  if (!br) return;
+// Pre-fill the limit price from a book level (switching to Limit if needed).
+// Shared by pointer + keyboard so the two paths can never diverge.
+function fillPriceFromBookRow(br) {
   const form = document.getElementById("order-form");
   if (!form) return;
   if (form.orderType.value !== "Limit") {
@@ -2518,6 +2661,20 @@ document.addEventListener("click", (e) => {
   }
   form.price.value = br.getAttribute("data-px");
   form.price.dispatchEvent(new Event("input", { bubbles: true }));
+}
+document.addEventListener("click", (e) => {
+  const br = e.target.closest(".book-row.clickable[data-px]");
+  if (br) fillPriceFromBookRow(br);
+});
+// Keyboard parity for clickable book rows AND clickable chart cards (both are
+// non-<button> elements made operable with role="button" tabindex="0").
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
+  if (!e.target || !e.target.closest) return;
+  const br = e.target.closest(".book-row.clickable[data-px]");
+  if (br && e.target === br) { e.preventDefault(); fillPriceFromBookRow(br); return; }
+  const card = e.target.closest(".cc-card.clickable[data-trade]");
+  if (card && e.target === card) { e.preventDefault(); loadSymbolIntoTicket(card.getAttribute("data-trade")); }
 });
 
 // ---------------------------------------------------------------------------
@@ -2743,6 +2900,8 @@ const chartState = {
   view: "grid",         // "grid" | "single"
   interval: "15",       // Bybit kline code (1 | 5 | 15 | 60) — the SELECTED interval
   loadedInterval: "15", // interval the on-screen candles were actually fetched with
+  loadedView: null,     // view the on-screen candles were fetched at (grid=60 vs single=160 candles)
+  loadedSingle: null,   // single-view symbol the on-screen candles were fetched for
   single: "BTCUSDT",
   data: {},             // symbol -> ascending candle[] {o,h,l,c,v}
   fetching: false,      // single-flight guard so 1s ticks never pile up
@@ -2791,8 +2950,19 @@ function renderCandles(svg, axisEl, timeEl, candles, dp) {
     svg.innerHTML = "";
     if (axisEl) axisEl.innerHTML = "";
     if (timeEl) timeEl.innerHTML = "";
+    svg.dataset.sig = ""; // reset so a later non-empty set always repaints
     return;
   }
+  // Dirty-check: at a 1-per-few-seconds poll the candles are usually identical
+  // between ticks (esp. 15m/1H). Tearing down + reparsing the whole SVG subtree
+  // each time is the hottest cost in the app; skip it when nothing changed. The
+  // signature keys on dp (precision), count, and the last candle's t/o/h/l/c —
+  // an interval/view switch changes the set (or uses a different <svg>), so it
+  // always repaints. (Never reached on the empty branch above.)
+  const lastC = candles[candles.length - 1];
+  const sig = `${dp}|${candles.length}|${lastC.t}|${lastC.o}|${lastC.h}|${lastC.l}|${lastC.c}`;
+  if (svg.dataset.sig === sig) return;
+  svg.dataset.sig = sig;
   // SVG geometry (user-space units; preserveAspectRatio="none" stretches X/Y to
   // the element box): W/H = viewBox size; L/R/T/B = inner padding; volH = bottom
   // volume-strip height; gap = price↔volume separation. The price band is the
@@ -2900,9 +3070,10 @@ function buildChartDom() {
   }
   const grid = document.getElementById("charts-grid");
   if (grid && !grid.children.length) {
-    // data-trade reuses the existing delegated click → loadSymbolIntoTicket wiring.
+    // data-trade reuses the existing delegated click → loadSymbolIntoTicket wiring;
+    // role/tabindex/aria-label + the shared keydown handler make it keyboard-operable.
     grid.innerHTML = CHART_SYMBOLS.map(
-      (s) => `<div class="cc-card clickable" data-trade="${esc(s.id)}">${chartCardHTML(s, s.id)}</div>`
+      (s) => `<div class="cc-card clickable" data-trade="${esc(s.id)}" role="button" tabindex="0" title="Load ${esc(s.id)} into the order ticket" aria-label="Load ${esc(s.id)} into the order ticket">${chartCardHTML(s, s.id)}</div>`
     ).join("");
   }
   const single = document.getElementById("charts-single");
@@ -2983,6 +3154,8 @@ async function fetchCharts() {
       })
     );
     chartState.loadedInterval = iv; // the on-screen candles now reflect `iv`
+    chartState.loadedView = view;   // ...and this view's candle count (grid 60 vs single 160)
+    chartState.loadedSingle = view === "single" ? syms[0] : chartState.loadedSingle;
     renderCharts();
   } finally {
     chartState.fetching = false;
@@ -2994,14 +3167,33 @@ function chartsVisible() {
   const pane = document.querySelector('[data-pane="dashboard"]');
   return !!pane && !pane.hidden && !document.hidden;
 }
+// True when the on-screen candles already match the current interval + view, so
+// a start (tab switch / visibility flap) can reuse them instead of firing a fresh
+// kline burst against the region-constrained public proxy on every transition.
+function chartsDataFresh() {
+  // Must match the interval AND the view the candles were fetched at — grid caches
+  // 60 candles, single caches 160, so grid data is NOT fresh for single view (and
+  // a single-symbol switch invalidates too). Otherwise a visibility flap could
+  // paint the wrong-resolution series as "fresh".
+  if (chartState.loadedInterval !== chartState.interval) return false;
+  if (chartState.loadedView !== chartState.view) return false;
+  if (chartState.view === "single" && chartState.loadedSingle !== chartState.single) return false;
+  const syms = chartState.view === "grid" ? CHART_SYMBOLS.map((s) => s.id) : [chartState.single];
+  return syms.every((id) => Array.isArray(chartState.data[id]) && chartState.data[id].length);
+}
 function startChartPolling() {
   stopChartPolling();
   if (!chartsVisible()) return;
-  fetchCharts(); // immediate first paint
+  // Only burst an immediate fetch when the cache can't already paint the current
+  // view/interval; otherwise repaint from cache and let the interval refresh it.
+  if (chartsDataFresh()) renderCharts();
+  else fetchCharts();
+  // 2s (not 1s): with the render dirty-check above this keeps the price line
+  // feeling live while halving request volume against the public kline proxy.
   _chartTimer = setInterval(() => {
     if (!chartsVisible()) { stopChartPolling(); return; }
     fetchCharts();
-  }, 1000);
+  }, 2000);
 }
 function stopChartPolling() {
   if (_chartTimer) { clearInterval(_chartTimer); _chartTimer = null; }

@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
+  <a href="#main" class="skip-link">Skip to content</a>
   <div class="sticky-top">
     <header class="topbar">
       <div class="brand">
@@ -63,18 +64,18 @@
       </div>
     </header>
 
-    <nav class="tabs" id="tabs">
-      <button class="tab active" data-tab="dashboard">Dashboard</button>
-      <button class="tab" data-tab="markets">Markets</button>
-      <button class="tab" data-tab="history">History</button>
-      <button class="tab admin-only" data-tab="account">Account</button>
-      <button class="tab" data-tab="tools">API</button>
+    <nav class="tabs" id="tabs" role="tablist" aria-label="Views">
+      <button class="tab active" data-tab="dashboard" role="tab" id="tab-dashboard" aria-controls="panel-dashboard" aria-selected="true" tabindex="0">Dashboard</button>
+      <button class="tab" data-tab="markets" role="tab" id="tab-markets" aria-controls="panel-markets" aria-selected="false" tabindex="-1">Markets</button>
+      <button class="tab" data-tab="history" role="tab" id="tab-history" aria-controls="panel-history" aria-selected="false" tabindex="-1">History</button>
+      <button class="tab admin-only" data-tab="account" role="tab" id="tab-account" aria-controls="panel-account" aria-selected="false" tabindex="-1">Account</button>
+      <button class="tab" data-tab="tools" role="tab" id="tab-tools" aria-controls="panel-tools" aria-selected="false" tabindex="-1">API</button>
     </nav>
   </div>
 
-  <main>
+  <main id="main" aria-label="Trading terminal" tabindex="-1">
     <!-- ============ DASHBOARD ============ -->
-    <div class="pane" data-pane="dashboard">
+    <div class="pane" data-pane="dashboard" id="panel-dashboard" role="tabpanel" aria-labelledby="tab-dashboard">
       <div class="workspace">
         <div class="workspace-main">
           <section class="panel">
@@ -101,7 +102,7 @@
                   </tr>
                 </thead>
                 <tbody id="positions-body">
-                  <tr><td colspan="12" class="muted center">Waiting for data…</td></tr>
+                  <tr><td colspan="12"><span class="skel"></span></td></tr>
                 </tbody>
               </table>
             </div>
@@ -127,7 +128,7 @@
                   </tr>
                 </thead>
                 <tbody id="orders-body">
-                  <tr><td colspan="8" class="muted center">Waiting for data…</td></tr>
+                  <tr><td colspan="8"><span class="skel"></span></td></tr>
                 </tbody>
               </table>
             </div>
@@ -159,11 +160,11 @@
           <section class="panel token-panel">
             <div class="panel-head">
               <h2>Trade Token</h2>
-              <span id="token-status" class="token-status locked">LOCKED</span>
+              <span id="token-status" class="token-status locked" role="status" aria-live="polite">LOCKED</span>
             </div>
             <div class="form-grid">
               <label>Required for every write operation
-                <input id="trade-token" type="password" placeholder="Paste trade token to unlock trading" autocomplete="off" />
+                <input id="trade-token" type="password" placeholder="Paste trade token to unlock trading" autocomplete="off" aria-describedby="token-status" />
               </label>
               <p class="muted token-help">Trading actions are disabled until a valid token is entered. The token is held only in this browser tab and sent with each write request.</p>
             </div>
@@ -260,7 +261,10 @@
           <section class="panel book-panel">
             <div class="panel-head">
               <h2>Order Book</h2>
-              <span class="muted" id="book-symbol">—</span>
+              <span class="panel-head-meta">
+                <span class="muted" id="book-symbol">—</span>
+                <span class="muted book-unit" id="book-unit">USDT</span>
+              </span>
             </div>
             <div id="book-widget" class="book-widget"><p class="muted book-empty">Pick a symbol to load depth.</p></div>
           </section>
@@ -269,7 +273,7 @@
     </div>
 
     <!-- ============ MARKETS ============ -->
-    <div class="pane" data-pane="markets" hidden>
+    <div class="pane" data-pane="markets" id="panel-markets" role="tabpanel" aria-labelledby="tab-markets" hidden>
       <section class="panel">
         <div class="panel-head">
           <h2>Markets</h2>
@@ -283,7 +287,7 @@
     </div>
 
     <!-- ============ HISTORY ============ -->
-    <div class="pane" data-pane="history" hidden>
+    <div class="pane" data-pane="history" id="panel-history" role="tabpanel" aria-labelledby="tab-history" hidden>
       <section class="panel">
         <div class="panel-head">
           <h2>Closed PnL</h2>
@@ -303,7 +307,7 @@
     </div>
 
     <!-- ============ ACCOUNT (admin) ============ -->
-    <div class="pane admin-only" data-pane="account" hidden>
+    <div class="pane admin-only" data-pane="account" id="panel-account" role="tabpanel" aria-labelledby="tab-account" hidden>
       <section class="panel">
         <div class="panel-head">
           <h2>Account &amp; Risk</h2>
@@ -371,7 +375,7 @@
     </div>
 
     <!-- ============ API (read-only Explorer) ============ -->
-    <div class="pane" data-pane="tools" hidden>
+    <div class="pane" data-pane="tools" id="panel-tools" role="tabpanel" aria-labelledby="tab-tools" hidden>
       <section class="panel explorer-panel">
         <div class="panel-head">
           <h2>API Explorer</h2>
@@ -386,7 +390,12 @@
     </div>
   </main>
 
-  <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+  <div class="toasts-wrap">
+    <!-- Errors/warnings interrupt (assertive); info/success are polite. No
+         aria-atomic: announce only the newly-added toast, not the whole stack. -->
+    <div id="toasts-alert" class="toasts" role="alert" aria-live="assertive"></div>
+    <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+  </div>
 
   <!-- Typed-confirm modal for write operations -->
   <div id="confirm-overlay" class="modal-overlay" hidden>

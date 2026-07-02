@@ -9,8 +9,10 @@
   --neg: #ff5c6c;
   --warn: #f5a623;
   --warn-tint: rgba(245,166,35,0.15);
-  --accent: #3b82f6;
-  --accent-hover: #2f6fe0;
+  /* Darkened from #3b82f6 so white text on an accent-blue background (buttons,
+     active neutral segments) clears WCAG AA (4.5:1): #2f6fe0 on white ≈ 4.6:1. */
+  --accent: #2f6fe0;
+  --accent-hover: #2560c9;
   --text-secondary: #aab6c4; /* brighter than --muted for high-stakes sub-text */
   --header-h: 104px; /* live-measured by JS (syncHeaderHeight); fallback for first paint */
 }
@@ -155,8 +157,16 @@ td { font-size: 13px; }
 .btn-primary {
   background: var(--accent); color: white; border: none; padding: 11px;
   border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 14px;
+  transition: background .15s ease, transform .05s ease, box-shadow .15s ease;
 }
-.btn-primary:hover { background: var(--accent-hover); }
+.btn-primary:hover { background: var(--accent-hover); box-shadow: 0 2px 12px rgba(47,111,224,0.35); }
+.btn-primary:active { transform: translateY(1px); }
+/* Submit-order button carries the selected side's colour (green Buy / red Sell)
+   as a last-line direction cue at the point of commit. Set by paintSubmit(). */
+.btn-primary.submit-buy { background: var(--pos); }
+.btn-primary.submit-buy:hover { background: #17b479; box-shadow: 0 2px 12px rgba(27,207,138,0.35); }
+.btn-primary.submit-sell { background: var(--neg); }
+.btn-primary.submit-sell:hover { background: #e6505f; box-shadow: 0 2px 12px rgba(255,92,108,0.35); }
 .btn-danger {
   background: rgba(255,92,108,0.14); color: var(--neg);
   border: 1px solid rgba(255,92,108,0.35); padding: 7px 12px;
@@ -349,12 +359,20 @@ main { display: block; }
 }
 .panel-head-actions input:focus { outline: none; border-color: var(--accent); }
 
-/* Toasts */
-.toasts { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 2000; }
+/* Toasts — a fixed bottom-right column holding the assertive + polite regions.
+   pointer-events:none on the wrapper (auto on each toast) so a transient stack
+   can never intercept clicks on the order rail / Submit button behind it. */
+.toasts-wrap {
+  position: fixed; bottom: 20px; right: 20px; z-index: 2000;
+  display: flex; flex-direction: column; gap: 8px;
+  max-height: 70vh; overflow: hidden; pointer-events: none;
+}
+.toasts { display: flex; flex-direction: column; gap: 8px; }
 .toast {
   background: var(--panel-2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
   color: var(--text); padding: 10px 14px; border-radius: 8px; font-size: 13px;
   box-shadow: 0 8px 24px rgba(0,0,0,0.45); max-width: 340px; animation: toastIn .2s ease;
+  pointer-events: auto; cursor: pointer;
 }
 .toast.pos { border-left-color: var(--pos); }
 .toast.neg { border-left-color: var(--neg); }
@@ -365,8 +383,11 @@ main { display: block; }
 /* Sortable headers */
 table.sortable thead th[data-sortkey] { cursor: pointer; user-select: none; }
 table.sortable thead th[data-sortkey]:hover { color: var(--text); }
-table.sortable thead th[data-dir="asc"]::after { content: " ▲"; font-size: 9px; color: var(--accent); }
-table.sortable thead th[data-dir="desc"]::after { content: " ▼"; font-size: 9px; color: var(--accent); }
+/* Sorted column: brighten + bold the header text as well as the arrow, so the
+   active sort is distinguishable without relying on a tiny coloured glyph. */
+table.sortable thead th[data-dir="asc"], table.sortable thead th[data-dir="desc"] { color: var(--text); font-weight: 700; }
+table.sortable thead th[data-dir="asc"]::after { content: " ▲"; font-size: 10px; color: var(--accent); }
+table.sortable thead th[data-dir="desc"]::after { content: " ▼"; font-size: 10px; color: var(--accent); }
 
 /* Expandable rows */
 tr.exp-row { cursor: pointer; }
@@ -395,10 +416,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   outline: 2px solid var(--accent); outline-offset: 2px;
 }
 @media (prefers-reduced-motion: reduce) {
-  td.flash-up, td.flash-down, .toast, .skel, .meter > span,
+  td.flash-up, td.flash-down, .toast, .skel, .meter > span, .btn-primary,
   .stale-data #positions-body, .stale-data #orders-body, .stale-data .topbar-stats {
     animation: none !important; transition: none !important;
   }
+  .btn-primary:active { transform: none !important; }
 }
 
 /* ===== Responsive (mobile) ===== */
@@ -759,3 +781,25 @@ body.privacy-on .raw-json > summary::after {
 /* Positive / negative PnL split bar (History analytics) — mirrors .wl-bar. */
 .posneg-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: var(--border); margin-top: 4px; }
 .posneg-bar .p { background: var(--pos); } .posneg-bar .n { background: var(--neg); }
+
+/* ---- Skip-to-content link (visible only on keyboard focus) ---- */
+.skip-link {
+  position: absolute; left: 8px; top: -48px; z-index: 3000;
+  background: var(--accent); color: #fff; padding: 10px 14px; border-radius: 8px;
+  font-size: 13px; font-weight: 600; text-decoration: none; transition: top .15s ease;
+}
+.skip-link:focus { top: 8px; outline: 2px solid #fff; outline-offset: 2px; }
+/* #main is programmatically focused via the skip link (tabindex="-1") — don't
+   draw a focus ring around the whole page region when it receives that focus. */
+main#main:focus { outline: none; }
+
+/* ---- Enriched empty-state cells (positions / orders) ---- */
+.empty-cell { padding: 26px 12px; }
+.empty-hint { font-size: 12px; color: var(--muted); margin-top: 6px; opacity: 0.85; }
+
+/* ---- Order-book unit chip (rail book always quotes USDT, even in INR lens) ---- */
+.panel-head-meta { display: flex; align-items: baseline; gap: 7px; }
+.book-unit {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em; color: var(--muted);
+  padding: 1px 6px; border-radius: 20px; background: var(--panel-2); border: 1px solid var(--border);
+}

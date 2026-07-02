@@ -256,14 +256,42 @@ async def transfer_funds(direction: str, amount, quote_asset: str, client_txn_id
     }
     data = await _request("POST", "/dma/api/v1/funds/transfer", body=body)
     # This endpoint uses a non-v5 envelope (no retCode), so _request can't
-    # auto-detect a business rejection. Conservatively flag common failure
-    # shapes so a DECLINED transfer is never reported to the operator as
-    # success. (Unknown success shapes still pass through — see the softened
-    # "verify your balance" wording in the UI.)
-    if isinstance(data, dict):
-        if data.get("success") is False or data.get("error"):
-            raise DMAError(400, data.get("error") or data.get("message") or data)
-        status = str(data.get("status", "")).lower()
-        if status in ("failed", "failure", "error", "rejected", "declined", "cancelled"):
-            raise DMAError(400, data.get("message") or data.get("retMsg") or data)
-    return data
+    # auto-detect a business rejection. Money-path rule: only a POSITIVELY
+    # CONFIRMED transfer may be reported as success; everything else raises so the
+    # operator verifies rather than trusting a false "done". A confirmed real
+    # response looks like:
+    #   {"data": {..., "txn_id": "<uuid>"}, "message": "transfer successful"}
+    # so the exchange-assigned txn_id is the reliable success signal (a declined
+    # transfer gets none). client_txn_id idempotency makes a retry-after-error safe.
+    if not isinstance(data, dict):
+        raise DMAError(502, "unexpected transfer response from the exchange")
+
+    inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+    message = str(data.get("message") or data.get("retMsg") or "").strip()
+
+    # 1) Explicit failure -> raise. Substring STEMS (not exact words) over the
+    #    message + any status field, so novel declines (denied, insufficient_balance,
+    #    "transfer unsuccessful", processing_failed, …) are caught. "unsuccess" is
+    #    listed so an "...unsuccessful" message can never fall through to the
+    #    "success" allowlist below.
+    if data.get("success") is False or data.get("error"):
+        raise DMAError(400, data.get("error") or message or data)
+    _FAIL_STEMS = (
+        "fail", "error", "reject", "declin", "cancel",
+        "denied", "insufficient", "invalid", "refus", "unsuccess",
+    )
+    haystack = " ".join(
+        str(x) for x in (message, data.get("status", ""), inner.get("status", ""))
+    ).lower()
+    if any(stem in haystack for stem in _FAIL_STEMS):
+        raise DMAError(400, message or data)
+
+    # 2) POSITIVE confirmation (allowlist): an exchange-assigned txn_id, or an
+    #    explicit boolean success. Only these are reported to the operator as done.
+    txn_id = inner.get("txn_id") or inner.get("txnId") or data.get("txn_id")
+    if txn_id not in (None, "") or data.get("success") is True:
+        return data
+
+    # 3) Neither confirmed nor an explicit failure -> INDETERMINATE. Never assert a
+    #    money move we can't confirm; make the operator check (retry is idempotent).
+    raise DMAError(502, "transfer status could not be confirmed — check your balance before retrying")

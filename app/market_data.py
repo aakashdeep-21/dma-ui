@@ -166,5 +166,8 @@ async def get_kline(symbol: str, interval: str, limit=None) -> dict:
             # NOTE: the cached payload is SHARED by reference across concurrent
             # callers; it is read-only here (the route only serializes it) and
             # must never be mutated in place by a future consumer.
-            _cache[key] = (now, data)
+            # Stamp from fetch COMPLETION (not the pre-await `now`): a slow upstream
+            # fetch (up to 10s) would otherwise mark a just-fetched payload as
+            # already several seconds old and force an immediate refetch.
+            _cache[key] = (time.monotonic(), data)
         return data

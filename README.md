@@ -112,23 +112,32 @@ accidental double-submission.
   The custom `X-Trade-Token` header also blocks cross-site (CSRF) writes.
 - Session cookie is `HttpOnly` + `Secure` + `SameSite=Lax`; the WebSocket
   rejects cross-origin handshakes.
-- **Single active session (global):** only one login is active at a time across
-  the whole terminal. Any new login (any account, any tab, any device)
-  immediately evicts the previous one — the old tab is redirected to `/login`
-  (within one live-feed cycle, ~`POLL_INTERVAL`s, or on its next request). The
-  active session id is tracked **in memory**, which means: run exactly **one
-  Railway replica**, and a restart/redeploy logs everyone out (just log back
-  in). No security downside — the cookie itself stays cryptographically signed.
-- The original `sign_server.py` and `dma-api.json` (kept out of git) had real
-  third-party secrets; those were replaced with placeholders. **Rotate any
-  exposed keys** regardless.
-- **Brute force:** credential and trade-token checks are constant-time, but the
-  app does **not** rate-limit `/api/login` (an in-app limiter on Railway would
-  either key on the shared proxy IP or the spoofable `X-Forwarded-For`). Put
-  brute-force protection at the **edge** (Cloudflare / Railway) and use
-  **strong, high-entropy** values for `ADMIN_PASSWORD`, `VIEWER_PASSWORD` and
-  `TRADE_TOKEN` (the trade token in particular should stay a long random
-  string, e.g. `secrets.token_hex(24)`).
+- **Single active session per role:** at most one `admin` and one `viewer`
+  session are active at once. A new login evicts the previous session **of the
+  same role only** — the old tab is redirected to `/login` (within one live-feed
+  cycle, ~`POLL_INTERVAL`s, or on its next request) — so a viewer login can
+  never knock the trading admin offline. The active session id is tracked **in
+  memory**, which means: run exactly **one Railway replica**, and a
+  restart/redeploy logs everyone out (just log back in). No security downside —
+  the cookie itself stays cryptographically signed.
+- The signing scheme was ported into `app/signer.py`; the old standalone
+  `sign_server.py` helper is **not** part of the app (not imported, not in the
+  Procfile, not in `requirements.txt`) and has been removed from the working
+  tree. `dma-api.json` remains as a gitignored local reference copy of the API
+  spec. If a real secret ever lived in either file, **rotate it** regardless.
+- **Brute force:** credential and trade-token checks are constant-time, **and**
+  `/api/login` + `/api/verify-trade-token` are rate-limited in-app (failed
+  attempts per client IP; cleared on success so a legitimate operator is never
+  locked out). Behind Railway's single proxy the client IP is taken from the
+  **rightmost** `X-Forwarded-For` hop (the value the trusted proxy appends),
+  which the client cannot forge. **If you put an edge proxy in front** (e.g.
+  Cloudflare → Railway), set `TRUSTED_PROXY_HOPS=2` so the real client IP is used
+  instead of collapsing every client into one shared bucket (which one attacker
+  could then use to lock everyone out). An edge limiter (Cloudflare / Railway) is
+  still recommended as defense in depth, along with **strong, high-entropy**
+  values for `ADMIN_PASSWORD`, `VIEWER_PASSWORD` and `TRADE_TOKEN` (the trade
+  token in particular should stay a long random string, e.g.
+  `secrets.token_hex(24)`).
 
 ## Integrated endpoints
 
