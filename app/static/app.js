@@ -2043,6 +2043,13 @@ function renderInstruments(data) {
 function renderClosedPnl(data) {
   const list = listOf(data);
   if (!list.length) return emptyMsg("No closed PnL records");
+  // The server merges several <=7-day windows (a month by default). `truncated`
+  // means a safety cap stopped it short, so this total may be incomplete — say so
+  // rather than presenting a partial figure as the full picture.
+  const truncated = !!(data && data.result && data.result.truncated);
+  const truncNote = truncated
+    ? ` · <span class="neg" title="A fetch cap was hit; some older records may be missing.">⚠ partial</span>`
+    : "";
   const total = list.reduce((s, r) => s + (Number(r.closedPnl) || 0), 0);
   const table = buildTable(list, [
     { label: "Closed At", get: (r) => fmtTime(r.updatedTime ?? r.createdTime) },
@@ -2055,7 +2062,7 @@ function renderClosedPnl(data) {
     { label: "Leverage", get: (r) => r.leverage, priv: true },
   ]);
   return (
-    `<div class="explorer-summary">Total closed PnL: <span class="${pnlClass(total)} priv">${fmtMoney(total)} ${esc(curUnit())}</span> · ${list.length} record(s)</div>` +
+    `<div class="explorer-summary">Total closed PnL: <span class="${pnlClass(total)} priv">${fmtMoney(total)} ${esc(curUnit())}</span> · ${list.length} record(s)${truncNote}</div>` +
     table
   );
 }
@@ -2284,7 +2291,11 @@ function onMarketsActive() {
 let _historyLoaded = false;
 async function fetchHistory() {
   const filter = (document.getElementById("history-filter").value || "").trim().toUpperCase();
-  const symParam = filter ? `?symbol=${encodeURIComponent(filter)}` : "";
+  // Fetch closed PnL and executions over the SAME window (a month) so the fee
+  // tally lines up with the PnL period. `days` is clamped server-side (1..31).
+  const histQuery = filter
+    ? `?days=30&symbol=${encodeURIComponent(filter)}`
+    : "?days=30";
   const closedEl = document.getElementById("history-closed");
   const execEl = document.getElementById("history-exec");
   const sumEl = document.getElementById("history-summary");
@@ -2292,7 +2303,7 @@ async function fetchHistory() {
   closedEl.innerHTML = `<p class="muted" style="padding:14px">Loading…</p>`;
   let closedListForAnalytics = [];
   try {
-    const closed = await api("/api/closed-pnl" + symParam);
+    const closed = await api("/api/closed-pnl" + histQuery);
     const list = listOf(closed);
     closedListForAnalytics = list;
     const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
@@ -2318,7 +2329,7 @@ async function fetchHistory() {
     closedEl.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(e.message)}</p>`;
   }
   try {
-    const exec = await api("/api/executions" + symParam);
+    const exec = await api("/api/executions" + histQuery);
     const execList = listOf(exec);
     let fees = 0, maker = 0, taker = 0;
     execList.forEach((r) => {

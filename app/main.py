@@ -531,8 +531,14 @@ async def api_instruments(symbol: str | None = None, user: dict = Depends(curren
 
 
 @app.get("/api/closed-pnl")
-async def api_closed_pnl(symbol: str | None = None, user: dict = Depends(current_user)):
-    return await dma_client.get_closed_pnl(_norm_symbol_opt(symbol))
+async def api_closed_pnl(
+    symbol: str | None = None,
+    days: int | None = None,
+    user: dict = Depends(current_user),
+):
+    # `days` is clamped inside the client (1..31); default there is 30 (a month),
+    # fetched as several <=7-day windows and merged.
+    return await dma_client.get_closed_pnl(_norm_symbol_opt(symbol), days)
 
 
 @app.get("/api/withdrawable")
@@ -546,8 +552,16 @@ async def api_executions(
     limit: str | None = None,
     startTime: str | None = None,
     endTime: str | None = None,
+    days: int | None = None,
     user: dict = Depends(current_user),
 ):
+    # When `days` is given (the History tab), return the windowed multi-week
+    # backfill (merged <=7-day windows, clamped 1..31 in the client) so the fee /
+    # maker-taker analytics cover the SAME period as closed PnL. Otherwise keep the
+    # single-call behaviour used by the API Explorer; the Telegram notifier calls
+    # dma_client.get_executions directly and is unaffected either way.
+    if days is not None:
+        return await dma_client.get_executions_history(_norm_symbol_opt(symbol), days)
     return await dma_client.get_executions(_norm_symbol_opt(symbol), limit, startTime, endTime)
 
 

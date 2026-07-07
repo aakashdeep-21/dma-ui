@@ -5,12 +5,16 @@ the API key/secret never leave the backend. Convenience wrappers cover the
 endpoints used by the dashboard and the trading panel.
 """
 import json
+import logging
+import time
 import uuid
 
 import httpx
 
 from .config import settings
 from .signer import build_signed_request
+
+logger = logging.getLogger(__name__)
 
 
 class DMAError(Exception):
@@ -145,11 +149,161 @@ async def get_instruments(symbol: str | None = None):
     return await _request("GET", "/v5/market/instruments-info", params=params)
 
 
-async def get_closed_pnl(symbol: str | None = None):
-    params = {"category": settings.CATEGORY}
+# --- Windowed history (closed-PnL & executions): cursor-free, time-windowed ---
+# A single closed-pnl / execution-list query is capped at 100 records AND at a
+# 7-day span (endTime - startTime <= 7d), and with NO time range the gateway
+# returns only the last 7 days. To give the dashboard a full month we walk the
+# range as a few <=7-day windows (startTime/endTime in epoch-ms) and merge pages.
+#
+# We deliberately do NOT use cursor pagination. The gateway returns a
+# percent-encoded `nextPageCursor`; our signer would urlencode it (re-encoding
+# the `%` -> `%25`) yet sign the unquote_plus'd form (decoding one level), so the
+# SIGNED and SENT cursor differ -> HTTP 401 "Invalid signature". That mismatch is
+# exactly what sank the earlier history-pagination attempt. A window that hits the
+# 100-record cap is instead subdivided by TIME, which needs no cursor at all.
+_HISTORY_PAGE_LIMIT = 100                     # gateway hard cap per page
+_HISTORY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000  # gateway rule: endTime - startTime <= 7d
+_HISTORY_MIN_WINDOW_MS = 60 * 60 * 1000       # stop bisecting below 1h (density backstop)
+_HISTORY_MAX_REQUESTS = 60                    # total upstream GETs per fetch (backstop)
+_HISTORY_DEFAULT_DAYS = 30
+_HISTORY_MAX_DAYS = 31                        # hard cap: never look back past ~1 month
+
+
+def _to_int_ms(value) -> int:
+    """Parse a millisecond-timestamp-ish value to int, else 0 (sorts oldest)."""
+    try:
+        if value in (None, ""):
+            return 0
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _time_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
+    """Non-overlapping (w_start, w_end) pairs covering [start_ms, end_ms], each
+    spanning at most 7 days, NEWEST-first. Consecutive windows never overlap
+    (next start = prev end + 1) so a boundary record can't be fetched twice."""
+    windows: list[tuple[int, int]] = []
+    w_start = start_ms
+    while w_start <= end_ms:
+        w_end = min(w_start + _HISTORY_WINDOW_MS, end_ms)
+        windows.append((w_start, w_end))
+        if w_end >= end_ms:
+            break
+        w_start = w_end + 1
+    windows.reverse()  # newest window first (most decision-relevant)
+    return windows
+
+
+async def _fetch_time_range(path: str, base_params: dict, start_ms: int, end_ms: int, state: dict) -> list:
+    """Return every record from `path` in [start_ms, end_ms]. If a query saturates
+    (returns the full page limit, so more may exist), bisect the range by TIME and
+    refetch each half — completeness without cursor pagination. `state` carries the
+    shared request budget, the discovered `category`, and a `truncated` flag set if
+    any backstop (request budget or minimum window span) prevents full coverage."""
+    if state["requests"] >= _HISTORY_MAX_REQUESTS:
+        state["truncated"] = True
+        return []
+
+    params = dict(base_params)
+    params["limit"] = str(_HISTORY_PAGE_LIMIT)
+    params["startTime"] = str(start_ms)
+    params["endTime"] = str(end_ms)
+    payload = await _request("GET", path, params=params)
+    state["requests"] += 1
+
+    if state["category"] is None and isinstance(payload, dict):
+        result = payload.get("result")
+        if isinstance(result, dict):
+            state["category"] = result.get("category")
+
+    records = extract_list(payload)
+    if len(records) < _HISTORY_PAGE_LIMIT:
+        return records  # whole window fit in one page
+
+    # Saturated: there may be more records than one page can show. Split the
+    # window in half by time and refetch — the two halves fully tile this range,
+    # so we DISCARD this capped page and use the sub-windows' results instead.
+    span = end_ms - start_ms
+    if span <= _HISTORY_MIN_WINDOW_MS:
+        state["truncated"] = True  # too dense to split further without a cursor
+        return records
+    mid = start_ms + span // 2
+    left = await _fetch_time_range(path, base_params, start_ms, mid, state)
+    right = await _fetch_time_range(path, base_params, mid + 1, end_ms, state)
+    return left + right
+
+
+async def _paginate_history(path, base_params, days, dedup_key, time_key, label):
+    """Walk the last `days` days (clamped 1..31) of `path` as merged <=7-day windows
+    and return a synthesized v5 envelope
+    {"retCode":0,"result":{"list":[...],"category":...,"truncated":bool}} so the
+    dashboard's existing renderers work unchanged. `dedup_key(record)` yields a
+    hashable identity (or None to keep unconditionally); `time_key(record)` yields
+    the ms used for the newest-first sort; `label` names the endpoint in the
+    truncation log. `list` is newest-first, matching a single-page response."""
+    lookback_days = max(1, min(int(days or _HISTORY_DEFAULT_DAYS), _HISTORY_MAX_DAYS))
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - lookback_days * 24 * 60 * 60 * 1000
+    state = {"requests": 0, "truncated": False, "category": None}
+
+    records: list = []
+    for w_start, w_end in _time_windows(start_ms, now_ms):
+        records.extend(await _fetch_time_range(path, base_params, w_start, w_end, state))
+
+    # Dedup safety net: windows/bisections are non-overlapping, so this only guards
+    # against a boundary record surfacing twice; it must NEVER merge two DISTINCT
+    # records — hence per-endpoint keys (closing orderId+updatedTime for closed-pnl,
+    # the globally unique execId for executions). Records without a key are kept.
+    seen: set = set()
+    deduped: list = []
+    for record in records:
+        key = dedup_key(record) if isinstance(record, dict) else None
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        deduped.append(record)
+
+    deduped.sort(key=lambda r: time_key(r) if isinstance(r, dict) else 0, reverse=True)
+
+    if state["truncated"]:
+        logger.warning(
+            "%s backfill truncated for %s over %dd: kept %d records in %d requests "
+            "(caps: %d requests / %.0fh min window)",
+            label, base_params.get("symbol", "ALL"), lookback_days, len(deduped),
+            state["requests"], _HISTORY_MAX_REQUESTS, _HISTORY_MIN_WINDOW_MS / 3_600_000,
+        )
+
+    result: dict = {"list": deduped, "truncated": state["truncated"]}
+    if state["category"] is not None:
+        result["category"] = state["category"]
+    return {"retCode": 0, "retMsg": "OK", "result": result}
+
+
+def _closed_pnl_dedup_key(record: dict):
+    """Dedup identity for a closed-pnl record: closing orderId + updatedTime. None
+    keeps the record unconditionally. Must never merge two distinct closes."""
+    oid, upd = record.get("orderId"), record.get("updatedTime")
+    return (oid, upd) if (oid is not None or upd is not None) else None
+
+
+async def get_closed_pnl(symbol: str | None = None, days: int | None = None):
+    """Closed PnL over the last `days` days (default 30), merged from several
+    <=7-day windows so the dashboard sees a full month instead of just the
+    gateway's default last-7-days page (see the notes above on why this is
+    windowed-by-time rather than cursor-paginated). Newest-first; `truncated` is
+    set only if a safety backstop stopped short of full coverage, and the UI
+    surfaces it so a partial total is never shown as complete."""
+    base_params = {"category": settings.CATEGORY}
     if symbol:
-        params["symbol"] = symbol
-    return await _request("GET", "/v5/position/closed-pnl", params=params)
+        base_params["symbol"] = symbol
+    return await _paginate_history(
+        "/v5/position/closed-pnl", base_params, days,
+        dedup_key=_closed_pnl_dedup_key,
+        time_key=lambda r: _to_int_ms(r.get("updatedTime") or r.get("createdTime")),
+        label="closed-pnl",
+    )
 
 
 async def get_withdrawable(coin: str | None = None):
@@ -177,6 +331,24 @@ async def get_executions(
     if end_time:
         params["endTime"] = str(end_time)
     return await _request("GET", "/v5/execution/list", params=params)
+
+
+async def get_executions_history(symbol: str | None = None, days: int | None = None):
+    """Executions/fills over the last `days` days (default 30), merged from several
+    <=7-day windows so the History tab's fees / maker-taker analytics cover the SAME
+    period as closed PnL. Kept SEPARATE from get_executions (which stays a single
+    recent-fills call for the Telegram notifier and the API Explorer, so neither
+    fans out). Dedups on the globally unique execId — NEVER on orderId, since one
+    order legitimately produces many fills that must all be counted."""
+    base_params = {"category": settings.CATEGORY}
+    if symbol:
+        base_params["symbol"] = symbol
+    return await _paginate_history(
+        "/v5/execution/list", base_params, days,
+        dedup_key=lambda r: r.get("execId"),
+        time_key=lambda r: _to_int_ms(r.get("execTime")),
+        label="executions",
+    )
 
 
 async def get_account_info():
