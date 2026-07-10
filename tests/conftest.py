@@ -14,12 +14,18 @@ os.environ["VIEWER_USERNAME"] = "vwr"
 os.environ["VIEWER_PASSWORD"] = "Str0ng-Viewer-Pass-7c1d4e"
 os.environ["SESSION_SECRET"] = "unit-test-session-secret-0123456789abcdef"
 os.environ["TRADE_TOKEN"] = "unit-test-trade-token-0123456789abcdef"
+# Mongo config: client construction is lazy (no I/O), and port 1 refuses
+# instantly with tiny timeouts, so any test that accidentally reaches an
+# UNMOCKED db helper fails fast instead of hanging on a real connection.
+os.environ["MONGO_URI"] = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=100&connectTimeoutMS=100"
+os.environ["MONGO_USERNAME"] = "unit-test-mongo-user"
+os.environ["MONGO_PASSWORD"] = "Str0ng-Mongo-Pass-5e8b1c"
 
 import json  # noqa: E402
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app import dma_client, main as main_mod  # noqa: E402
+from app import db as db_mod, dma_client, main as main_mod  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +66,46 @@ def fake_upstream(monkeypatch):
     monkeypatch.setattr(dma_client._client, "post", fake_post)
     monkeypatch.setattr(dma_client._client, "get", fake_get)
     return calls
+
+
+@pytest.fixture
+def fake_db(monkeypatch):
+    """In-memory stand-in for app.db's data helpers, keyed by _id like Mongo.
+    Reproduces the real filter / newest-first sort / limit / projection
+    semantics so the sync and read paths are exercised without a server.
+    Returns the backing store: {kind: {_id: full stored doc}}."""
+    store: dict[str, dict[str, dict]] = {db_mod.TRADES: {}, db_mod.CLOSED_PNL: {}}
+
+    async def latest_ts_ms(kind):
+        docs = store[kind].values()
+        return max((d["tsMs"] for d in docs), default=None)
+
+    async def bulk_upsert(kind, docs):
+        upserted = matched = 0
+        for d in docs:
+            if d["_id"] in store[kind]:
+                # $setOnInsert semantics: an existing doc is never touched.
+                matched += 1
+            else:
+                upserted += 1
+                store[kind][d["_id"]] = dict(d)
+        return (upserted, matched)
+
+    async def query_history(kind, *, symbol, start_ms, end_ms, limit):
+        rows = [
+            d for d in store[kind].values()
+            if start_ms <= d["tsMs"] <= end_ms and (not symbol or d.get("symbol") == symbol)
+        ]
+        rows.sort(key=lambda d: d["tsMs"], reverse=True)
+        return [
+            {k: v for k, v in d.items() if k not in ("_id", "tsMs", "syncedAt")}
+            for d in rows[:limit]
+        ]
+
+    monkeypatch.setattr(db_mod, "latest_ts_ms", latest_ts_ms)
+    monkeypatch.setattr(db_mod, "bulk_upsert", bulk_upsert)
+    monkeypatch.setattr(db_mod, "query_history", query_history)
+    return store
 
 
 @pytest.fixture

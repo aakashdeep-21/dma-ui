@@ -2289,6 +2289,16 @@ function onMarketsActive() {
 }
 
 let _historyLoaded = false;
+function fmtSynced(ms, serverNowMs) {
+  // History is served from the server's MongoDB mirror (synced ~every minute).
+  // Flag a stamp that has stopped advancing — stale data on a money view must
+  // never look current. Staleness is measured against the SERVER's clock
+  // (result.nowMs) so a skewed browser clock can't fake or mask it.
+  if (!isFinite(ms) || ms <= 0) return "syncing…";
+  const now = isFinite(serverNowMs) && serverNowMs > 0 ? serverNowMs : Date.now();
+  const stale = now - ms > 15 * 60 * 1000;
+  return fmtTime(ms) + (stale ? " ⚠ stale" : "");
+}
 async function fetchHistory() {
   const filter = (document.getElementById("history-filter").value || "").trim().toUpperCase();
   // Fetch closed PnL and executions over the SAME window (a month) so the fee
@@ -2302,6 +2312,8 @@ async function fetchHistory() {
   const analyticsEl = document.getElementById("history-analytics");
   closedEl.innerHTML = `<p class="muted" style="padding:14px">Loading…</p>`;
   let closedListForAnalytics = [];
+  let closedSyncedMs = NaN;
+  let serverNowMs = NaN;
   try {
     const closed = await api("/api/closed-pnl" + histQuery);
     const list = listOf(closed);
@@ -2317,10 +2329,13 @@ async function fetchHistory() {
       if (isFinite(t) && t >= todayMs) today += v;
     });
     sumEl.hidden = false;
+    closedSyncedMs = Number(closed && closed.result && closed.result.lastSyncedMs);
+    serverNowMs = Number(closed && closed.result && closed.result.nowMs);
     sumEl.innerHTML =
       `Realized today: <span class="${pnlClass(today)} priv">${fmtMoneySigned(today)} ${esc(curUnit())}</span> · ` +
       `Total (recent ${list.length}): <span class="${pnlClass(total)} priv">${fmtMoneySigned(total)}</span> · ` +
-      `Win rate: <span class="priv">${list.length ? Math.round((wins / list.length) * 100) : 0}%</span>`;
+      `Win rate: <span class="priv">${list.length ? Math.round((wins / list.length) * 100) : 0}%</span> · ` +
+      `Last synced: <span id="history-synced" class="muted">${fmtSynced(closedSyncedMs, serverNowMs)}</span>`;
     renderHistoryAnalytics(list); // curve + win/loss now; fees fill in after execs load
     closedEl.innerHTML = renderClosedPnl(closed);
   } catch (e) {
@@ -2340,6 +2355,18 @@ async function fetchHistory() {
     });
     renderHistoryAnalytics(closedListForAnalytics, fees, maker, taker);
     execEl.innerHTML = renderExecutions(exec);
+    // The tab renders BOTH mirrors (closed-PnL rows + trade fee analytics),
+    // so show the OLDER of the two sync stamps — the label must never claim
+    // more freshness than the stalest data on screen.
+    const execSyncedMs = Number(exec && exec.result && exec.result.lastSyncedMs);
+    const execNowMs = Number(exec && exec.result && exec.result.nowMs);
+    if (isFinite(execNowMs) && execNowMs > 0) serverNowMs = execNowMs;
+    const syncedEl = document.getElementById("history-synced");
+    if (syncedEl) {
+      const stamps = [closedSyncedMs, execSyncedMs].filter((v) => isFinite(v) && v > 0);
+      syncedEl.textContent =
+        stamps.length === 2 ? fmtSynced(Math.min(...stamps), serverNowMs) : "syncing…";
+    }
   } catch (e) {
     execEl.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(e.message)}</p>`;
   }

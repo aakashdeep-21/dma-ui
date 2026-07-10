@@ -4,6 +4,7 @@ Every call is signed server-side with the Ed25519 key from the environment;
 the API key/secret never leave the backend. Convenience wrappers cover the
 endpoints used by the dashboard and the trading panel.
 """
+import asyncio
 import json
 import logging
 import time
@@ -169,14 +170,46 @@ _HISTORY_DEFAULT_DAYS = 30
 _HISTORY_MAX_DAYS = 31                        # hard cap: never look back past ~1 month
 
 
+def new_history_state(
+    *,
+    max_requests: int = _HISTORY_MAX_REQUESTS,
+    min_window_ms: int = _HISTORY_MIN_WINDOW_MS,
+    pace_s: float = 0.0,
+) -> dict:
+    """Shared per-fetch state for the windowed history machinery. The defaults
+    reproduce the interactive dashboard behaviour; the background sync passes a
+    bigger request budget, a finer minimum window and a pacing delay. Two flags
+    distinguish WHY coverage stopped short, because the sync must react in
+    opposite ways ("truncated at all" is their OR — see _paginate_history):
+      - budget_exhausted: transient — a fresh run's budget can finish the job,
+        so the sync stops its run and resumes later;
+      - density_truncated: permanent — a <=min-window span still saturates the
+        page cap, so retrying can never help and the sync must move on."""
+    return {
+        "requests": 0,
+        "category": None,
+        "budget_exhausted": False,
+        "density_truncated": False,
+        "max_requests": max_requests,
+        "min_window_ms": min_window_ms,
+        "pace_s": pace_s,
+    }
+
+
 def _to_int_ms(value) -> int:
-    """Parse a millisecond-timestamp-ish value to int, else 0 (sorts oldest)."""
+    """Parse a millisecond-timestamp-ish value to int, else 0 (sorts oldest).
+    Tolerates decimal formatting ("1699999999999.0") by truncating: this value
+    is also the STORED range/index key in MongoDB (app/history_sync.py), where
+    a 0 would make a real fill invisible to every dashboard read."""
     try:
         if value in (None, ""):
             return 0
         return int(value)
     except (TypeError, ValueError):
-        return 0
+        try:
+            return int(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
 
 def _time_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
@@ -198,11 +231,12 @@ def _time_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
 async def _fetch_time_range(path: str, base_params: dict, start_ms: int, end_ms: int, state: dict) -> list:
     """Return every record from `path` in [start_ms, end_ms]. If a query saturates
     (returns the full page limit, so more may exist), bisect the range by TIME and
-    refetch each half — completeness without cursor pagination. `state` carries the
-    shared request budget, the discovered `category`, and a `truncated` flag set if
-    any backstop (request budget or minimum window span) prevents full coverage."""
-    if state["requests"] >= _HISTORY_MAX_REQUESTS:
-        state["truncated"] = True
+    refetch each half — completeness without cursor pagination. `state` (see
+    new_history_state) carries the shared request budget, minimum window span,
+    optional pacing delay, the discovered `category`, and the truncation flags set
+    if a backstop prevents full coverage."""
+    if state["requests"] >= state["max_requests"]:
+        state["budget_exhausted"] = True
         return []
 
     params = dict(base_params)
@@ -211,6 +245,9 @@ async def _fetch_time_range(path: str, base_params: dict, start_ms: int, end_ms:
     params["endTime"] = str(end_ms)
     payload = await _request("GET", path, params=params)
     state["requests"] += 1
+    if state["pace_s"]:
+        # Background sync: spread upstream calls out instead of bursting.
+        await asyncio.sleep(state["pace_s"])
 
     if state["category"] is None and isinstance(payload, dict):
         result = payload.get("result")
@@ -225,10 +262,13 @@ async def _fetch_time_range(path: str, base_params: dict, start_ms: int, end_ms:
     # window in half by time and refetch — the two halves fully tile this range,
     # so we DISCARD this capped page and use the sub-windows' results instead.
     span = end_ms - start_ms
-    if span <= _HISTORY_MIN_WINDOW_MS:
-        state["truncated"] = True  # too dense to split further without a cursor
+    if span <= state["min_window_ms"]:
+        state["density_truncated"] = True  # too dense to split further without a cursor
         return records
     mid = start_ms + span // 2
+    # Left half strictly BEFORE right half: the background sync's crash-safety
+    # relies on any interrupted fetch having covered a contiguous ASCENDING
+    # time-prefix of the range (see app/history_sync.py). Do not reorder.
     left = await _fetch_time_range(path, base_params, start_ms, mid, state)
     right = await _fetch_time_range(path, base_params, mid + 1, end_ms, state)
     return left + right
@@ -245,7 +285,7 @@ async def _paginate_history(path, base_params, days, dedup_key, time_key, label)
     lookback_days = max(1, min(int(days or _HISTORY_DEFAULT_DAYS), _HISTORY_MAX_DAYS))
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - lookback_days * 24 * 60 * 60 * 1000
-    state = {"requests": 0, "truncated": False, "category": None}
+    state = new_history_state()
 
     records: list = []
     for w_start, w_end in _time_windows(start_ms, now_ms):
@@ -267,7 +307,8 @@ async def _paginate_history(path, base_params, days, dedup_key, time_key, label)
 
     deduped.sort(key=lambda r: time_key(r) if isinstance(r, dict) else 0, reverse=True)
 
-    if state["truncated"]:
+    truncated = state["budget_exhausted"] or state["density_truncated"]
+    if truncated:
         logger.warning(
             "%s backfill truncated for %s over %dd: kept %d records in %d requests "
             "(caps: %d requests / %.0fh min window)",
@@ -275,7 +316,7 @@ async def _paginate_history(path, base_params, days, dedup_key, time_key, label)
             state["requests"], _HISTORY_MAX_REQUESTS, _HISTORY_MIN_WINDOW_MS / 3_600_000,
         )
 
-    result: dict = {"list": deduped, "truncated": state["truncated"]}
+    result: dict = {"list": deduped, "truncated": truncated}
     if state["category"] is not None:
         result["category"] = state["category"]
     return {"retCode": 0, "retMsg": "OK", "result": result}
@@ -348,6 +389,26 @@ async def get_executions_history(symbol: str | None = None, days: int | None = N
         dedup_key=lambda r: r.get("execId"),
         time_key=lambda r: _to_int_ms(r.get("execTime")),
         label="executions",
+    )
+
+
+# --- Window primitives for the background history sync (app/history_sync.py) ---
+# Account-wide (no symbol filter — the dashboard filters at read time from
+# MongoDB) and raw: they return the records of ONE <=7-day window, leaving
+# window-walking, retries and persistence to the sync service. `state` comes
+# from new_history_state so the sync controls budget / min window / pacing and
+# reads back the budget_exhausted / density_truncated flags. Cursor-free like
+# everything above.
+
+async def get_executions_window(start_ms: int, end_ms: int, state: dict) -> list:
+    return await _fetch_time_range(
+        "/v5/execution/list", {"category": settings.CATEGORY}, start_ms, end_ms, state
+    )
+
+
+async def get_closed_pnl_window(start_ms: int, end_ms: int, state: dict) -> list:
+    return await _fetch_time_range(
+        "/v5/position/closed-pnl", {"category": settings.CATEGORY}, start_ms, end_ms, state
     )
 
 

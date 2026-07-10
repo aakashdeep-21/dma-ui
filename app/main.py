@@ -29,10 +29,12 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from bson.errors import BSONError
 from pathlib import Path
+from pymongo.errors import PyMongoError
 from starlette.responses import Response as StarletteResponse
 
-from . import auth, dma_client, market_data, notifier, signer
+from . import auth, db, dma_client, history_sync, market_data, notifier, signer
 from .config import settings
 
 def _configure_logging() -> None:
@@ -74,21 +76,42 @@ logger = logging.getLogger("dma-ui")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # MongoDB (history store): verify connectivity and indexes as a BACKGROUND
+    # task so a down/slow Mongo can never delay serving the trading routes.
+    # History endpoints return 503 until it recovers; missing CONFIG still
+    # fails fast at import, and the sync scheduler re-runs ensure_indexes
+    # before each run so a failed boot-time attempt self-heals.
+    async def _init_db() -> None:
+        try:
+            await db.ping()
+            await db.ensure_indexes()
+            logger.info("mongo connected db=%s", settings.MONGO_DB_NAME)
+        except Exception:
+            logger.exception(
+                "mongo unavailable at startup — history reads/sync degraded until it recovers"
+            )
+
+    db_init = asyncio.create_task(_init_db())
     # Background execution-alert watcher (Telegram). Runs for the app's lifetime,
     # independent of any browser; a no-op if alerts aren't configured.
     watcher = asyncio.create_task(notifier.run_watcher())
+    # Background history sync: the ONLY place the exchange's trade/closed-PnL
+    # history is fetched from; the dashboard reads MongoDB.
+    syncer = asyncio.create_task(history_sync.run_scheduler())
     try:
         yield
     finally:
-        watcher.cancel()
-        try:
-            await watcher
-        except asyncio.CancelledError:
-            pass
-        # Cleanly close the shared upstream HTTP clients on shutdown.
+        for task in (db_init, watcher, syncer):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        # Cleanly close the shared upstream HTTP clients and the DB client.
         await dma_client.aclose()
         await market_data.aclose()
         await notifier.aclose()
+        await db.aclose()
 
 
 app = FastAPI(title="DMA Trading UI", lifespan=lifespan)
@@ -116,6 +139,26 @@ if _insecure_env:
 # A malformed signing key must fail the deploy, not the first live trade.
 if not signer.secret_is_valid_ed25519_hex(settings.DMA_API_SECRET):
     raise RuntimeError("Refusing to start — DMA_API_SECRET is not a valid Ed25519 hex key")
+
+# Misconfigured Mongo TLS would fail every connection at runtime with a much
+# murkier error — fail the deploy instead. Exactly one of PATH (a PEM-encoded
+# file on disk, .pem/.crt alike; never committed — see .gitignore) or CONTENT
+# (pasted PEM text, for hosts like Railway with no file on disk) may be set.
+if settings.MONGO_TLS_CA_FILE and settings.MONGO_TLS_CA_PEM:
+    raise RuntimeError(
+        "Refusing to start — set only ONE of MONGO_TLS_CA_FILE / MONGO_TLS_CA_PEM"
+    )
+if settings.MONGO_TLS_CA_FILE and not Path(settings.MONGO_TLS_CA_FILE).is_file():
+    raise RuntimeError(
+        "Refusing to start — MONGO_TLS_CA_FILE points to a missing file: "
+        + settings.MONGO_TLS_CA_FILE
+    )
+if settings.MONGO_TLS_CA_PEM and "-----BEGIN" not in settings.MONGO_TLS_CA_PEM:
+    raise RuntimeError(
+        "Refusing to start — MONGO_TLS_CA_PEM is set but does not look like PEM "
+        "certificate content (expected '-----BEGIN CERTIFICATE-----'); did you "
+        "paste a file PATH instead? Use MONGO_TLS_CA_FILE for paths."
+    )
 
 for _w in settings.warn_weak():
     logger.warning("config: %s", _w)
@@ -530,15 +573,82 @@ async def api_instruments(symbol: str | None = None, user: dict = Depends(curren
     return await dma_client.get_instruments(_norm_symbol_opt(symbol))
 
 
+# --- History reads (MongoDB-backed) ---
+# /api/closed-pnl and /api/executions serve the dashboard from the MongoDB
+# mirror maintained by app/history_sync.py; the exchange is no longer called on
+# the read path (only the sync — and the Telegram notifier's live fill poll —
+# talk to it). Responses keep the exact upstream v5 envelope
+# {"retCode":0,"result":{"list":[...],"truncated":...,"category":...}} so the
+# frontend renders unchanged.
+
+_HISTORY_READ_MAX = 10_000  # superset of the old ~6k effective ceiling
+# The gateway's default span when no range is given = its 7-day window rule.
+_EXPLORER_LOOKBACK_MS = dma_client._HISTORY_WINDOW_MS
+
+
+def _clamp_days(days: int | None) -> int:
+    # Parity with the exchange-side clamp (None/0 -> default, bounded 1..max),
+    # sourced from the same constants so the two can never drift apart.
+    return max(1, min(int(days or dma_client._HISTORY_DEFAULT_DAYS), dma_client._HISTORY_MAX_DAYS))
+
+
+def _parse_ms(value: str | None, name: str) -> int | None:
+    if value is None or value.strip() == "":
+        return None
+    if not re.fullmatch(r"\d{1,17}", value.strip()):
+        raise HTTPException(status_code=400, detail=f"{name} must be an epoch-milliseconds integer")
+    return int(value.strip())
+
+
+def _history_envelope(rows: list, truncated: bool, kind: str) -> dict:
+    return {
+        "retCode": 0,
+        "retMsg": "OK",
+        "result": {
+            "category": settings.CATEGORY,
+            "list": rows,
+            "truncated": truncated,
+            # Epoch-ms of the last completed sync for this collection (None
+            # until the first run after boot) — the dashboard shows it so the
+            # user knows how fresh the history is. nowMs is the SERVER clock
+            # at response time: the browser measures staleness against it so
+            # a skewed client clock can neither cry wolf nor hide staleness.
+            "lastSyncedMs": history_sync.last_synced_ms(kind),
+            "nowMs": int(time.time() * 1000),
+        },
+    }
+
+
+async def _query_history_or_503(kind: str, *, symbol, start_ms: int, end_ms: int, limit: int) -> list:
+    """History reads fail soft: a Mongo outage yields 503 for these endpoints
+    while every trading function keeps working off the live exchange."""
+    try:
+        return await db.query_history(
+            kind, symbol=symbol, start_ms=start_ms, end_ms=end_ms, limit=limit
+        )
+    except (PyMongoError, BSONError, OSError):
+        # OSError covers the lazy client construction path too (TLS CA temp
+        # file I/O, ssl.SSLError) — those must degrade to the same sanitized
+        # 503, never a raw 500 with internal detail.
+        logger.exception("history read failed (%s): mongo unavailable", kind)
+        raise HTTPException(status_code=503, detail="history database unavailable")
+
+
 @app.get("/api/closed-pnl")
 async def api_closed_pnl(
     symbol: str | None = None,
     days: int | None = None,
     user: dict = Depends(current_user),
 ):
-    # `days` is clamped inside the client (1..31); default there is 30 (a month),
-    # fetched as several <=7-day windows and merged.
-    return await dma_client.get_closed_pnl(_norm_symbol_opt(symbol), days)
+    # Same lookback semantics the exchange fetch had (default 30d, clamp 1..31),
+    # now served from MongoDB.
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - _clamp_days(days) * 86_400_000
+    rows = await _query_history_or_503(
+        db.CLOSED_PNL, symbol=_norm_symbol_opt(symbol),
+        start_ms=start_ms, end_ms=end_ms, limit=_HISTORY_READ_MAX,
+    )
+    return _history_envelope(rows, len(rows) >= _HISTORY_READ_MAX, db.CLOSED_PNL)
 
 
 @app.get("/api/withdrawable")
@@ -555,14 +665,43 @@ async def api_executions(
     days: int | None = None,
     user: dict = Depends(current_user),
 ):
-    # When `days` is given (the History tab), return the windowed multi-week
-    # backfill (merged <=7-day windows, clamped 1..31 in the client) so the fee /
-    # maker-taker analytics cover the SAME period as closed PnL. Otherwise keep the
-    # single-call behaviour used by the API Explorer; the Telegram notifier calls
-    # dma_client.get_executions directly and is unaffected either way.
+    # When `days` is given (the History tab), cover the same period as closed
+    # PnL (default 30d, clamp 1..31; limit/startTime/endTime ignored — exactly
+    # the old behaviour). Otherwise mirror the gateway's single-page semantics
+    # the API Explorer relied on: limit 1..100 (default 50), default span the
+    # last 7 days. Both read MongoDB; the Telegram notifier still calls
+    # dma_client.get_executions directly for its live fill alerts.
+    sym = _norm_symbol_opt(symbol)
+    now_ms = int(time.time() * 1000)
     if days is not None:
-        return await dma_client.get_executions_history(_norm_symbol_opt(symbol), days)
-    return await dma_client.get_executions(_norm_symbol_opt(symbol), limit, startTime, endTime)
+        start_ms = now_ms - _clamp_days(days) * 86_400_000
+        rows = await _query_history_or_503(
+            db.TRADES, symbol=sym, start_ms=start_ms, end_ms=now_ms,
+            limit=_HISTORY_READ_MAX,
+        )
+        return _history_envelope(rows, len(rows) >= _HISTORY_READ_MAX, db.TRADES)
+
+    try:
+        cap = int(limit) if limit not in (None, "") else 50
+    except ValueError:
+        raise HTTPException(status_code=400, detail="limit must be an integer")
+    cap = max(1, min(cap, 100))
+    start_ms = _parse_ms(startTime, "startTime")
+    end_ms = _parse_ms(endTime, "endTime")
+    if start_ms is None and end_ms is None:
+        start_ms, end_ms = now_ms - _EXPLORER_LOOKBACK_MS, now_ms
+    elif start_ms is None:
+        start_ms = max(0, end_ms - _EXPLORER_LOOKBACK_MS)
+    elif end_ms is None:
+        end_ms = start_ms + _EXPLORER_LOOKBACK_MS
+    if start_ms > end_ms:
+        # The old gateway rejected inverted ranges; a silent empty list here
+        # could be misread as "the account had no fills".
+        raise HTTPException(status_code=400, detail="startTime must not exceed endTime")
+    rows = await _query_history_or_503(
+        db.TRADES, symbol=sym, start_ms=start_ms, end_ms=end_ms, limit=cap
+    )
+    return _history_envelope(rows, len(rows) >= cap, db.TRADES)
 
 
 @app.get("/api/account-info")

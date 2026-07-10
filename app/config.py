@@ -141,6 +141,29 @@ class Settings:
         self.NOTIFY_POLL_INTERVAL: float = _float_env("NOTIFY_POLL_INTERVAL", 10.0)
         self.NOTIFY_EXEC_LIMIT: int = max(1, _int_env("NOTIFY_EXEC_LIMIT", 50))
 
+        # --- MongoDB history store (trades & closed PnL) ---
+        # A background sync (app/history_sync.py, every SYNC_INTERVAL_SECONDS —
+        # default one minute) mirrors the account's executions and closed-PnL
+        # from the exchange into MongoDB; the dashboard's history endpoints
+        # read ONLY from Mongo (app/db.py). Credentials go in
+        # separate vars (not the URI) so passwords never need URL-escaping. The TLS
+        # CA is a FILE PATH on disk — the cert itself must never be committed.
+        self.MONGO_URI: str = os.environ.get("MONGO_URI", "")
+        self.MONGO_USERNAME: str = os.environ.get("MONGO_USERNAME", "")
+        self.MONGO_PASSWORD: str = os.environ.get("MONGO_PASSWORD", "")
+        self.MONGO_DB_NAME: str = os.environ.get("MONGO_DB_NAME", "DMA-trading")
+        self.MONGO_TLS_CA_FILE: str = os.environ.get("MONGO_TLS_CA_FILE", "")
+        # Alternative to MONGO_TLS_CA_FILE for hosts with no file on disk
+        # (e.g. Railway): paste the CA certificate CONTENT (PEM text — a .crt
+        # with "-----BEGIN CERTIFICATE-----" is the same format) and app/db.py
+        # materialises it into a runtime temp file. Set exactly ONE of the two.
+        # A CA certificate is public material, so an env var is safe for it.
+        self.MONGO_TLS_CA_PEM: str = os.environ.get("MONGO_TLS_CA_PEM", "")
+        # How often the history sync runs (seconds; default one minute) and how
+        # far back a cold-start backfill reaches (days).
+        self.SYNC_INTERVAL_SECONDS: float = _float_env("SYNC_INTERVAL_SECONDS", 60.0)
+        self.SYNC_BACKFILL_DAYS: int = max(1, _int_env("SYNC_BACKFILL_DAYS", 730))
+
     def missing_required(self) -> list[str]:
         """Return the names of required vars that are not set."""
         required = {
@@ -152,8 +175,14 @@ class Settings:
             "VIEWER_PASSWORD": self.VIEWER_PASSWORD,
             "SESSION_SECRET": self.SESSION_SECRET,
             "TRADE_TOKEN": self.TRADE_TOKEN,
+            "MONGO_URI": self.MONGO_URI,
         }
-        return [name for name, value in required.items() if not value]
+        missing = [name for name, value in required.items() if not value]
+        # Mongo credentials may live inside MONGO_URI (both vars empty) or in the
+        # dedicated pair — but setting exactly ONE of the pair is always a mistake.
+        if bool(self.MONGO_USERNAME) != bool(self.MONGO_PASSWORD):
+            missing.append("MONGO_PASSWORD" if self.MONGO_USERNAME else "MONGO_USERNAME")
+        return missing
 
     def insecure_required(self) -> list[str]:
         """Return human-readable problems with WEAK/PLACEHOLDER secrets.
@@ -169,6 +198,7 @@ class Settings:
         placeholders = {
             "change_this_admin_password",
             "change_this_viewer_password",
+            "change_this_mongo_password",
             "generate_a_long_random_string",
             "generate_another_long_random_string",
             "changeme", "change_this", "password", "secret", "token",
@@ -180,6 +210,7 @@ class Settings:
             ("VIEWER_PASSWORD", self.VIEWER_PASSWORD),
             ("SESSION_SECRET", self.SESSION_SECRET),
             ("TRADE_TOKEN", self.TRADE_TOKEN),
+            ("MONGO_PASSWORD", self.MONGO_PASSWORD),
         ):
             if value and value.strip().lower() in placeholders:
                 problems.append(f"{name} is set to a placeholder/weak value; use a unique high-entropy secret")

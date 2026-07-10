@@ -3,10 +3,16 @@
 .env.*
 !.env.example
 
+# TLS certificates / CA bundles (e.g. the MongoDB CA file) — never commit
+*.pem
+*.crt
+certs/
+
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
 .venv/
 venv/
 env/
