@@ -600,16 +600,12 @@ def _parse_ms(value: str | None, name: str) -> int | None:
     return int(value.strip())
 
 
-# Custom From/To reads (the History tab's date picker). Span-capped so a typo
-# can never ask Mongo to walk years of documents in one request.
-_RANGE_MAX_SPAN_MS = 366 * 24 * 3600 * 1000
-
-
 def _validate_range(start_ms: int, end_ms: int) -> None:
+    # No span cap on purpose: the read walks the tsMs index newest-first and
+    # stops at the row cap, so a wide range (incl. the History tab's "Overall"
+    # = epoch 0 → now) costs the same as a narrow one.
     if start_ms > end_ms:
         raise HTTPException(status_code=400, detail="startTime must not exceed endTime")
-    if end_ms - start_ms > _RANGE_MAX_SPAN_MS:
-        raise HTTPException(status_code=400, detail="time range too large (max 366 days)")
 
 
 def _parse_range(startTime: str | None, endTime: str | None) -> tuple[int, int] | None:

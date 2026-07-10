@@ -2301,7 +2301,12 @@ function historyQuery() {
   const filter = (document.getElementById("history-filter").value || "").trim().toUpperCase();
   const rangeEl = document.getElementById("history-range");
   const params = new URLSearchParams();
-  if (rangeEl && rangeEl.value === "custom") {
+  if (rangeEl && rangeEl.value === "all") {
+    // Overall = everything the mirror holds (epoch 0 → now); the server's
+    // 10k row cap + `truncated` flag still bound the response.
+    params.set("startTime", "0");
+    params.set("endTime", String(Date.now()));
+  } else if (rangeEl && rangeEl.value === "custom") {
     const fromEl = document.getElementById("history-from");
     const toEl = document.getElementById("history-to");
     const from = fromEl && fromEl.value ? new Date(fromEl.value + "T00:00:00") : null;

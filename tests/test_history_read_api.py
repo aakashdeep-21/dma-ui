@@ -180,14 +180,19 @@ def test_custom_range_mode_reads_full_window(admin_client, monkeypatch):
 
 def test_custom_range_validation(admin_client, monkeypatch):
     _freeze_now(monkeypatch)
-    _capture_query(monkeypatch)
+    captured = _capture_query(monkeypatch)
 
     assert admin_client.get("/api/closed-pnl?startTime=1000").status_code == 400, \
         "one-sided range is a caller error on closed-pnl"
     assert admin_client.get("/api/closed-pnl?startTime=2000&endTime=1000").status_code == 400
-    span = 400 * 24 * 3600 * 1000
-    assert admin_client.get(f"/api/closed-pnl?startTime=0&endTime={span}").status_code == 400
-    assert admin_client.get(f"/api/executions?startTime=0&endTime={span}").status_code == 400
+
+    # "Overall" (epoch 0 -> now) is a legitimate range: the indexed, row-capped
+    # read makes a wide span cost the same as a narrow one — never a 400.
+    for path in ("/api/closed-pnl", "/api/executions"):
+        resp = admin_client.get(f"{path}?startTime=0&endTime={FIXED_NOW_MS}")
+        assert resp.status_code == 200, path
+        assert (captured["start_ms"], captured["end_ms"]) == (0, FIXED_NOW_MS)
+        assert captured["limit"] == main_mod._HISTORY_READ_MAX
 
 
 def test_mongo_outage_maps_to_503(admin_client, monkeypatch):
