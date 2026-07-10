@@ -600,6 +600,32 @@ def _parse_ms(value: str | None, name: str) -> int | None:
     return int(value.strip())
 
 
+# Custom From/To reads (the History tab's date picker). Span-capped so a typo
+# can never ask Mongo to walk years of documents in one request.
+_RANGE_MAX_SPAN_MS = 366 * 24 * 3600 * 1000
+
+
+def _validate_range(start_ms: int, end_ms: int) -> None:
+    if start_ms > end_ms:
+        raise HTTPException(status_code=400, detail="startTime must not exceed endTime")
+    if end_ms - start_ms > _RANGE_MAX_SPAN_MS:
+        raise HTTPException(status_code=400, detail="time range too large (max 366 days)")
+
+
+def _parse_range(startTime: str | None, endTime: str | None) -> tuple[int, int] | None:
+    """Explicit [startTime, endTime] pair, or None when neither is given.
+    One-sided input is a caller error here (the explorer branch of
+    /api/executions keeps its own one-sided defaults for parity)."""
+    start_ms = _parse_ms(startTime, "startTime")
+    end_ms = _parse_ms(endTime, "endTime")
+    if start_ms is None and end_ms is None:
+        return None
+    if start_ms is None or end_ms is None:
+        raise HTTPException(status_code=400, detail="startTime and endTime must be provided together")
+    _validate_range(start_ms, end_ms)
+    return (start_ms, end_ms)
+
+
 def _history_envelope(rows: list, truncated: bool, kind: str) -> dict:
     return {
         "retCode": 0,
@@ -638,12 +664,19 @@ async def _query_history_or_503(kind: str, *, symbol, start_ms: int, end_ms: int
 async def api_closed_pnl(
     symbol: str | None = None,
     days: int | None = None,
+    startTime: str | None = None,
+    endTime: str | None = None,
     user: dict = Depends(current_user),
 ):
-    # Same lookback semantics the exchange fetch had (default 30d, clamp 1..31),
-    # now served from MongoDB.
-    end_ms = int(time.time() * 1000)
-    start_ms = end_ms - _clamp_days(days) * 86_400_000
+    # Preset mode keeps the old lookback semantics (default 30d, clamp 1..31);
+    # the History tab's custom picker sends an explicit startTime/endTime pair
+    # instead. `days`, when given, wins (mirrors /api/executions).
+    rng = _parse_range(startTime, endTime) if days is None else None
+    if rng:
+        start_ms, end_ms = rng
+    else:
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - _clamp_days(days) * 86_400_000
     rows = await _query_history_or_503(
         db.CLOSED_PNL, symbol=_norm_symbol_opt(symbol),
         start_ms=start_ms, end_ms=end_ms, limit=_HISTORY_READ_MAX,
@@ -665,12 +698,12 @@ async def api_executions(
     days: int | None = None,
     user: dict = Depends(current_user),
 ):
-    # When `days` is given (the History tab), cover the same period as closed
-    # PnL (default 30d, clamp 1..31; limit/startTime/endTime ignored — exactly
-    # the old behaviour). Otherwise mirror the gateway's single-page semantics
-    # the API Explorer relied on: limit 1..100 (default 50), default span the
-    # last 7 days. Both read MongoDB; the Telegram notifier still calls
-    # dma_client.get_executions directly for its live fill alerts.
+    # Three modes, all reading MongoDB: `days` (History presets — covers the
+    # same period as closed PnL; other params ignored, the old behaviour);
+    # BOTH startTime+endTime (History custom range — full-window read); else
+    # the API Explorer's single-page semantics (limit 1..100 default 50,
+    # one-sided/no bounds defaulting to a 7-day span). The Telegram notifier
+    # still calls dma_client.get_executions directly for its live fill alerts.
     sym = _norm_symbol_opt(symbol)
     now_ms = int(time.time() * 1000)
     if days is not None:
@@ -681,23 +714,29 @@ async def api_executions(
         )
         return _history_envelope(rows, len(rows) >= _HISTORY_READ_MAX, db.TRADES)
 
+    start_ms = _parse_ms(startTime, "startTime")
+    end_ms = _parse_ms(endTime, "endTime")
+    if start_ms is not None and end_ms is not None:
+        # Both bounds = the History tab's custom range: a full-window read,
+        # not the single-page explorer call.
+        _validate_range(start_ms, end_ms)
+        rows = await _query_history_or_503(
+            db.TRADES, symbol=sym, start_ms=start_ms, end_ms=end_ms,
+            limit=_HISTORY_READ_MAX,
+        )
+        return _history_envelope(rows, len(rows) >= _HISTORY_READ_MAX, db.TRADES)
+
     try:
         cap = int(limit) if limit not in (None, "") else 50
     except ValueError:
         raise HTTPException(status_code=400, detail="limit must be an integer")
     cap = max(1, min(cap, 100))
-    start_ms = _parse_ms(startTime, "startTime")
-    end_ms = _parse_ms(endTime, "endTime")
     if start_ms is None and end_ms is None:
         start_ms, end_ms = now_ms - _EXPLORER_LOOKBACK_MS, now_ms
     elif start_ms is None:
         start_ms = max(0, end_ms - _EXPLORER_LOOKBACK_MS)
-    elif end_ms is None:
+    else:
         end_ms = start_ms + _EXPLORER_LOOKBACK_MS
-    if start_ms > end_ms:
-        # The old gateway rejected inverted ranges; a silent empty list here
-        # could be misread as "the account had no fills".
-        raise HTTPException(status_code=400, detail="startTime must not exceed endTime")
     rows = await _query_history_or_503(
         db.TRADES, symbol=sym, start_ms=start_ms, end_ms=end_ms, limit=cap
     )

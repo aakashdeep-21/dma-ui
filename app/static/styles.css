@@ -352,12 +352,16 @@ main { display: block; }
 .trade-grid .token-panel { grid-column: 1 / -1; }
 
 /* Panel head action controls (filters, refresh) */
-.panel-head-actions { display: flex; gap: 8px; align-items: center; }
-.panel-head-actions input {
+.panel-head-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.panel-head-actions input, .panel-head-actions select {
   background: var(--bg); border: 1px solid var(--border); color: var(--text);
   padding: 6px 10px; border-radius: 8px; font-size: 13px;
 }
-.panel-head-actions input:focus { outline: none; border-color: var(--accent); }
+.panel-head-actions input:focus, .panel-head-actions select:focus {
+  outline: none; border-color: var(--accent);
+}
+/* Native date pickers keep the dark scheme's own calendar/glyph colors */
+.panel-head-actions input[type="date"] { color-scheme: dark; }
 
 /* Toasts — a fixed bottom-right column holding the assertive + polite regions.
    pointer-events:none on the wrapper (auto on each toast) so a transient stack
@@ -481,6 +485,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .form-grid input:focus, .form-grid select:focus,
 .modal input:focus, .modal select:focus,
 #explorer-symbol:focus, .panel-head-actions input:focus,
+.panel-head-actions select:focus,
 .login-card input:focus, .sizing input:focus {
   box-shadow: 0 0 0 3px rgba(59,130,246,0.28);
   background: var(--panel-2);

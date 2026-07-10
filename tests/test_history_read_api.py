@@ -155,6 +155,41 @@ def test_executions_explorer_defaults_mimic_the_old_gateway_call(admin_client, m
     ).status_code == 400
 
 
+def test_custom_range_mode_reads_full_window(admin_client, monkeypatch):
+    _freeze_now(monkeypatch)
+    captured = _capture_query(monkeypatch)
+
+    resp = admin_client.get("/api/closed-pnl?startTime=1000&endTime=2000&symbol=solusdt")
+    assert resp.status_code == 200
+    assert captured["kind"] == db_mod.CLOSED_PNL
+    assert captured["symbol"] == "SOLUSDT"
+    assert (captured["start_ms"], captured["end_ms"]) == (1000, 2000)
+    assert captured["limit"] == main_mod._HISTORY_READ_MAX
+
+    resp = admin_client.get("/api/executions?startTime=1000&endTime=2000")
+    assert resp.status_code == 200
+    assert captured["kind"] == db_mod.TRADES
+    assert (captured["start_ms"], captured["end_ms"]) == (1000, 2000)
+    assert captured["limit"] == main_mod._HISTORY_READ_MAX, \
+        "both bounds = History custom range, NOT the 50-row explorer page"
+
+    # days still wins over an accompanying range (both endpoints agree).
+    admin_client.get("/api/closed-pnl?days=7&startTime=1000&endTime=2000")
+    assert captured["start_ms"] == FIXED_NOW_MS - 7 * DAY_MS
+
+
+def test_custom_range_validation(admin_client, monkeypatch):
+    _freeze_now(monkeypatch)
+    _capture_query(monkeypatch)
+
+    assert admin_client.get("/api/closed-pnl?startTime=1000").status_code == 400, \
+        "one-sided range is a caller error on closed-pnl"
+    assert admin_client.get("/api/closed-pnl?startTime=2000&endTime=1000").status_code == 400
+    span = 400 * 24 * 3600 * 1000
+    assert admin_client.get(f"/api/closed-pnl?startTime=0&endTime={span}").status_code == 400
+    assert admin_client.get(f"/api/executions?startTime=0&endTime={span}").status_code == 400
+
+
 def test_mongo_outage_maps_to_503(admin_client, monkeypatch):
     _freeze_now(monkeypatch)
 

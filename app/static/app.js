@@ -2289,6 +2289,35 @@ function onMarketsActive() {
 }
 
 let _historyLoaded = false;
+function toDateInputValue(d) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+function historyQuery() {
+  // Presets ride the server's `days` param (1 = last 24h, 7 = 168h, 30 = 720h);
+  // Custom sends explicit epoch-ms bounds — From at local midnight, To at local
+  // end-of-day, so a single-day pick covers that whole day. Returns null when
+  // the custom range is missing/inverted (caller shows the error).
+  const filter = (document.getElementById("history-filter").value || "").trim().toUpperCase();
+  const rangeEl = document.getElementById("history-range");
+  const params = new URLSearchParams();
+  if (rangeEl && rangeEl.value === "custom") {
+    const fromEl = document.getElementById("history-from");
+    const toEl = document.getElementById("history-to");
+    const from = fromEl && fromEl.value ? new Date(fromEl.value + "T00:00:00") : null;
+    const to = toEl && toEl.value ? new Date(toEl.value + "T23:59:59.999") : null;
+    if (!from || !to || !isFinite(from.getTime()) || !isFinite(to.getTime()) ||
+        from.getTime() > to.getTime()) {
+      return null;
+    }
+    params.set("startTime", String(from.getTime()));
+    params.set("endTime", String(to.getTime()));
+  } else {
+    params.set("days", rangeEl ? rangeEl.value : "30");
+  }
+  if (filter) params.set("symbol", filter);
+  return "?" + params.toString();
+}
 function fmtSynced(ms, serverNowMs) {
   // History is served from the server's MongoDB mirror (synced ~every minute).
   // Flag a stamp that has stopped advancing — stale data on a money view must
@@ -2300,16 +2329,18 @@ function fmtSynced(ms, serverNowMs) {
   return fmtTime(ms) + (stale ? " ⚠ stale" : "");
 }
 async function fetchHistory() {
-  const filter = (document.getElementById("history-filter").value || "").trim().toUpperCase();
-  // Fetch closed PnL and executions over the SAME window (a month) so the fee
-  // tally lines up with the PnL period. `days` is clamped server-side (1..31).
-  const histQuery = filter
-    ? `?days=30&symbol=${encodeURIComponent(filter)}`
-    : "?days=30";
   const closedEl = document.getElementById("history-closed");
   const execEl = document.getElementById("history-exec");
   const sumEl = document.getElementById("history-summary");
   const analyticsEl = document.getElementById("history-analytics");
+  // Both fetches share ONE window (a preset or the custom From/To range) so
+  // the fee tally lines up with the PnL period; the symbol filter narrows both.
+  const histQuery = historyQuery();
+  if (!histQuery) {
+    sumEl.hidden = false;
+    sumEl.textContent = "Pick a valid From/To range (From must not be after To).";
+    return;
+  }
   closedEl.innerHTML = `<p class="muted" style="padding:14px">Loading…</p>`;
   let closedListForAnalytics = [];
   let closedSyncedMs = NaN;
@@ -2384,6 +2415,23 @@ function wireMarketsHistory() {
   if (hr) hr.addEventListener("click", fetchHistory);
   const hf = document.getElementById("history-filter");
   if (hf) hf.addEventListener("keydown", (e) => { if (e.key === "Enter") fetchHistory(); });
+  const hrange = document.getElementById("history-range");
+  const hfrom = document.getElementById("history-from");
+  const hto = document.getElementById("history-to");
+  if (hrange) hrange.addEventListener("change", () => {
+    const custom = hrange.value === "custom";
+    if (hfrom && hto) {
+      hfrom.hidden = hto.hidden = !custom;
+      if (custom && !hfrom.value && !hto.value) {
+        // Prefill the last 30 days so the pickers open on a valid range.
+        const now = new Date();
+        hto.value = toDateInputValue(now);
+        hfrom.value = toDateInputValue(new Date(now.getTime() - 30 * 86400000));
+      }
+    }
+    fetchHistory();
+  });
+  [hfrom, hto].forEach((el) => { if (el) el.addEventListener("change", fetchHistory); });
   const ar = document.getElementById("account-refresh");
   if (ar) ar.addEventListener("click", loadAccountOverview);
 }
