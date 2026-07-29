@@ -924,6 +924,124 @@ table.kv td { text-align: left; }
 .error-msg { color: var(--neg); font-size: 12.5px; min-height: 18px; margin-top: 10px; }
 .brand { display: flex; align-items: center; gap: 10px; }
 
+/* ---------- 17b. Workspace system (collapse / reorder) ---------- */
+.wpanel-tools { display: flex; gap: 4px; margin-left: 8px; flex: 0 0 auto; }
+.wpanel-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 22px; padding: 0;
+  background: rgba(255,255,255,0.025); border: 1px solid var(--border-soft); color: var(--muted);
+  border-radius: 6px; cursor: pointer; font-size: 11px; line-height: 1;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.wpanel-btn:hover { color: var(--text); border-color: var(--border); background: rgba(255,255,255,0.05); }
+.wpanel-drag { cursor: grab; }
+.wpanel-drag:active { cursor: grabbing; }
+.panel.collapsed > :not(.panel-head) { display: none; }
+.panel.collapsed .panel-head { border-bottom: none; }
+.panel.dragging { opacity: 0.55; outline: 1.5px dashed var(--accent-2); outline-offset: 2px; }
+
+/* ---------- 17c. Risk overview ---------- */
+.risk-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.risk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(152px, 1fr)); gap: 9px; }
+.risk-split {
+  display: flex; height: 9px; border-radius: 5px; overflow: hidden;
+  background: rgba(255,255,255,0.06); box-shadow: inset 0 1px 2px rgba(0,0,0,0.4);
+}
+.risk-split .rs-long { background: linear-gradient(90deg, #00e0a0, var(--pos)); }
+.risk-split .rs-short { background: linear-gradient(90deg, var(--neg), #ff7285); }
+.risk-split-labels { display: flex; justify-content: space-between; font-size: 10.5px;
+  font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* ---------- 17d. Journal breakdown (symbols + weekday) ---------- */
+.journal-breakdown { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.jb-card {
+  background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.004)), rgba(0,0,0,0.25);
+  border: 1px solid var(--border-soft); border-radius: 10px; padding: 10px 12px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+}
+.jb-row { display: flex; align-items: baseline; gap: 10px; padding: 3.5px 0;
+  border-bottom: 1px solid var(--border-soft); font-size: 12px; }
+.jb-row:last-child { border-bottom: none; }
+.jb-sym { flex: 1; }
+.jb-n { font-size: 10.5px; }
+.jb-v { font-variant-numeric: tabular-nums; font-family: var(--mono); font-weight: 700; }
+.wd-bars { display: flex; align-items: flex-end; gap: 7px; height: 66px; padding-top: 6px; }
+.wd-col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 4px; }
+.wd-col i { display: block; width: 100%; border-radius: 3px 3px 0 0; }
+.wd-col i.up { background: linear-gradient(180deg, #00e0a0, var(--pos)); }
+.wd-col i.down { background: linear-gradient(180deg, #ff7285, var(--neg)); }
+.wd-col span { font-size: 9px; color: var(--muted); font-weight: 700; }
+
+/* ---------- 17e. Notification center ---------- */
+.notif-wrap { position: relative; display: inline-flex; }
+.notif-badge {
+  position: absolute; top: -5px; right: -5px; z-index: 1;
+  min-width: 16px; height: 16px; padding: 0 4px; border-radius: 9px;
+  background: linear-gradient(180deg, #ff5f77, #ee3550); color: #fff;
+  font-size: 9.5px; font-weight: 800; line-height: 16px; text-align: center;
+  box-shadow: 0 2px 8px -2px var(--neg-glow);
+  pointer-events: none;
+}
+.notif-panel {
+  position: absolute; top: calc(100% + 10px); right: 0; z-index: 900;
+  width: 336px; max-height: 380px; display: flex; flex-direction: column;
+  background: linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0) 120px), var(--surface-2);
+  border: 1px solid var(--border); border-radius: 14px; overflow: hidden;
+  box-shadow: var(--shadow-pop);
+  animation: modalIn 0.18s var(--ease-out);
+}
+.notif-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 13px; border-bottom: 1px solid var(--border-soft);
+  font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-2);
+}
+.notif-list { overflow-y: auto; padding: 6px; }
+.notif-item { display: flex; gap: 9px; padding: 8px 9px; border-radius: 8px; align-items: flex-start; }
+.notif-item:hover { background: rgba(255,255,255,0.03); }
+.notif-item .dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; margin-top: 5px; background: var(--accent-2); }
+.notif-item .dot.pos { background: var(--pos); box-shadow: 0 0 6px var(--pos-glow); }
+.notif-item .dot.neg { background: var(--neg); box-shadow: 0 0 6px var(--neg-glow); }
+.notif-item .dot.warn { background: var(--warn); }
+.notif-item .nt { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.notif-item .msg { font-size: 12px; line-height: 1.4; color: var(--text); overflow-wrap: break-word; }
+.notif-item .t { font-size: 10px; color: var(--muted); font-family: var(--mono); }
+.notif-empty { padding: 20px; text-align: center; font-size: 12px; }
+
+/* ---------- 17f. Shortcuts reference ---------- */
+.keys-modal { width: 380px; }
+.keys-grid { display: grid; grid-template-columns: auto 1fr; gap: 9px 16px; align-items: center; }
+.keys-grid kbd {
+  font-family: var(--mono); font-size: 11px; color: var(--text-2);
+  padding: 3px 8px; border-radius: 6px; text-align: center;
+  background: rgba(255,255,255,0.05);
+  box-shadow: inset 0 0 0 1px var(--border), inset 0 -2px 0 rgba(0,0,0,0.4);
+}
+.keys-grid span { font-size: 12.5px; color: var(--text-2); }
+.keys-note { margin: 14px 0 0; font-size: 11px; }
+
+/* ---------- 17g. Density modes ---------- */
+body.density-compact th, body.density-compact td { padding-top: 4.5px; padding-bottom: 4.5px; }
+body.density-compact td { font-size: 12px; }
+body.density-compact .cell-sub, body.density-compact .pnl-hint { font-size: 10px; margin-top: 1px; }
+
+/* ---------- 17h. TP/SL modal presets ---------- */
+.tpsl-presets { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; margin: 4px 0 2px; }
+.tpsl-presets:empty { display: none; }
+.tpsl-presets .pp-k {
+  font-size: 9.5px; font-weight: 800; letter-spacing: 0.08em; color: var(--muted);
+  text-transform: uppercase; margin: 0 2px 0 4px;
+}
+.tpsl-presets .pp-k:first-child { margin-left: 0; }
+.tpsl-presets button {
+  background: rgba(255,255,255,0.03); border: 1px solid var(--border); color: var(--text-2);
+  padding: 4px 9px; border-radius: 6px; font-size: 11px; font-weight: 700; cursor: pointer;
+  font-family: var(--mono);
+  transition: all 0.14s var(--ease-out);
+}
+.tpsl-presets button:hover { border-color: var(--accent-2); color: var(--text);
+  background: var(--accent-tint); transform: translateY(-1px); }
+.tpsl-presets button:active { transform: translateY(0) scale(0.96); }
+
 /* ---------- 18. Stale-feed dimming [contract] ---------- */
 .stale-data #positions-body, .stale-data #orders-body,
 .stale-data .topbar-stats { opacity: 0.55; transition: opacity 0.3s ease; }
@@ -954,6 +1072,9 @@ body.privacy-on #margin-meter > span,
 body.privacy-on .analytics .wl-bar > span,
 body.privacy-on .analytics .posneg-bar > span { visibility: hidden !important; }
 body.privacy-on .analytics .chart-card svg { visibility: hidden !important; }
+/* New money-encoding visuals are masked too: risk split, weekday bars. */
+body.privacy-on .risk-split > span,
+body.privacy-on .wd-bars i { visibility: hidden !important; }
 body.privacy-on td.flash-up, body.privacy-on td.flash-down { animation: none !important; }
 body.privacy-on .json-view { display: none !important; }
 body.privacy-on .raw-json > summary::after {

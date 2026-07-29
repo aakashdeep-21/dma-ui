@@ -36,9 +36,68 @@ const state = {
   frameGaps: [], // recent inter-frame gaps (seconds) for an adaptive threshold
 };
 
+// ---------------------------------------------------------------------------
+// Notification center: every toast is ALSO recorded here (newest first, last
+// 50), so a missed 4.5s toast is never lost information. In-memory only by
+// design — entries can carry money figures, so nothing persists past the tab;
+// rendered text is `.priv` so privacy mode masks the log like everything else.
+// ---------------------------------------------------------------------------
+const _notifLog = [];
+const _NOTIF_MAX = 50;
+let _notifUnread = 0;
+
+function recordNotification(msg, type) {
+  _notifLog.unshift({ ts: Date.now(), type: type || "info", msg: String(msg) });
+  if (_notifLog.length > _NOTIF_MAX) _notifLog.pop();
+  const panel = document.getElementById("notif-panel");
+  if (panel && !panel.hidden) renderNotifList();
+  else { _notifUnread++; paintNotifBadge(); }
+}
+
+function paintNotifBadge() {
+  const badge = document.getElementById("notif-badge");
+  if (!badge) return;
+  badge.hidden = _notifUnread === 0;
+  badge.textContent = _notifUnread > 9 ? "9+" : String(_notifUnread);
+}
+
+function renderNotifList() {
+  const listEl = document.getElementById("notif-list");
+  if (!listEl) return;
+  listEl.innerHTML = _notifLog.length
+    ? _notifLog.map((n) =>
+        `<div class="notif-item"><span class="dot ${esc(n.type)}"></span>` +
+        `<div class="nt"><span class="msg priv">${esc(n.msg)}</span>` +
+        `<span class="t">${new Date(n.ts).toLocaleTimeString()}</span></div></div>`
+      ).join("")
+    : `<div class="notif-empty muted">No notifications this session.</div>`;
+}
+
+function wireNotifCenter() {
+  const btn = document.getElementById("notif-btn");
+  const panel = document.getElementById("notif-panel");
+  if (!btn || !panel) return;
+  const close = () => { panel.hidden = true; };
+  btn.addEventListener("click", () => {
+    if (panel.hidden) {
+      _notifUnread = 0;
+      paintNotifBadge();
+      renderNotifList();
+      panel.hidden = false;
+    } else close();
+  });
+  const clearBtn = document.getElementById("notif-clear");
+  if (clearBtn) clearBtn.addEventListener("click", () => { _notifLog.length = 0; renderNotifList(); });
+  document.addEventListener("click", (e) => {
+    if (!panel.hidden && !panel.contains(e.target) && !btn.contains(e.target)) close();
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !panel.hidden) close(); });
+}
+
 // Non-blocking toast notifications for action outcomes.
 function toast(msg, type = "info", ms = 4500) {
   if (!msg) return;
+  recordNotification(msg, type);
   // Errors/warnings go to an assertive alert region so a failed or blocked action
   // interrupts a screen reader instead of queuing politely (and possibly expiring
   // before it is read); info/success stay polite.
@@ -716,6 +775,7 @@ function renderPositions(positions) {
               leverage: p.leverage,
               avgPrice: p.avgPrice,
               markPrice: p.markPrice,
+              breakEvenPrice: p.breakEvenPrice,
               takeProfit: p.takeProfit,
               stopLoss: p.stopLoss,
             }))}'>TP/SL</button>
@@ -941,6 +1001,72 @@ function renderDashboard(d) {
   renderOrders(d.orders);
   renderErrors(d.errors);
   notifyPositionChanges(d);
+  renderRiskOverview(d);
+}
+
+// ---------------------------------------------------------------------------
+// Risk overview — derived entirely from the snapshot the tables already
+// render (no extra requests): gross/net exposure, long/short split, margin
+// utilization, nearest liquidation, largest position. Every figure is `.priv`.
+// ---------------------------------------------------------------------------
+let _lastRiskHTML = null;
+function renderRiskOverview(d) {
+  const body = document.getElementById("risk-body");
+  if (!body) return;
+  // Partial snapshot (positions read failed upstream): keep the last good view
+  // rather than painting "no exposure" over live risk.
+  if (d.errors && d.errors.positions) return;
+  const rows = (d.positions || []).filter((p) => Number(p.size) !== 0);
+  const num = (v) => (v !== undefined && v !== "" && isFinite(Number(v)) ? Number(v) : null);
+
+  let long = 0, short = 0, largest = null, nearestLiq = null;
+  rows.forEach((p) => {
+    const value = Number(p.positionValue) || 0;
+    if ((p.side || "").toLowerCase() === "buy") long += value; else short += value;
+    if (!largest || value > largest.value) largest = { value, sym: String(p.symbol || "?") };
+    const mark = Number(p.markPrice), liq = Number(p.liqPrice);
+    if (isFinite(mark) && mark > 0 && isFinite(liq) && liq > 0) {
+      const dist = (Math.abs(mark - liq) / mark) * 100;
+      if (!nearestLiq || dist < nearestLiq.dist) nearestLiq = { dist, sym: String(p.symbol || "?") };
+    }
+  });
+  const gross = long + short;
+  const net = long - short;
+  const longPct = gross > 0 ? (long / gross) * 100 : 50;
+  const acct = walletAccount(d.balance);
+  const im = acct ? num(acct.totalInitialMargin) : null;
+  const marginBal = acct ? num(acct.totalMarginBalance) : null;
+  const util = im != null && marginBal && marginBal > 0 ? (im / marginBal) * 100 : null;
+
+  let html;
+  if (!rows.length) {
+    html = `<p class="muted center" style="padding:20px 12px">No open positions — no market exposure.</p>`;
+  } else {
+    const liqCls = nearestLiq ? (nearestLiq.dist < 5 ? "neg" : nearestLiq.dist < 10 ? "warn" : "pos") : "flat";
+    const utilCls = util != null ? (util >= 80 ? "neg" : util >= 50 ? "warn" : "pos") : "flat";
+    html =
+      `<div class="risk-grid">` +
+        jTile("Gross exposure", `${fmtMoney(gross)} ${esc(curUnit())}`, "flat") +
+        jTile("Net exposure", `${fmtMoneySigned(net)}`, pnlClass(net)) +
+        jTile("Margin utilization", util != null ? fmtPct(util, false) : "—", utilCls) +
+        jTile("Nearest liquidation",
+          nearestLiq ? `${esc(nearestLiq.sym)} · ${nearestLiq.dist.toFixed(1)}%` : "—", liqCls) +
+        jTile("Largest position",
+          largest ? `${esc(largest.sym)} · ${fmtMoney(largest.value)}` : "—", "flat") +
+        jTile("Open positions", String(rows.length), "flat") +
+      `</div>` +
+      `<div class="risk-split" role="img" aria-label="Long ${longPct.toFixed(0)} percent of gross exposure">` +
+        `<span class="rs-long" style="width:${longPct.toFixed(1)}%"></span>` +
+        `<span class="rs-short" style="width:${(100 - longPct).toFixed(1)}%"></span>` +
+      `</div>` +
+      `<div class="risk-split-labels">` +
+        `<span class="pos priv">Long ${fmtMoney(long)}</span>` +
+        `<span class="neg priv">Short ${fmtMoney(short)}</span>` +
+      `</div>`;
+  }
+  if (html === _lastRiskHTML) return; // dirty-check like the tables
+  _lastRiskHTML = html;
+  body.innerHTML = html;
 }
 
 // In-app fill/close awareness: announce position open/close/size changes by
@@ -1245,6 +1371,49 @@ function openTpslModal(pos) {
   tpInput.value = cur(pos.takeProfit);
   slInput.value = cur(pos.stopLoss);
   trigger.value = "LastPrice";
+
+  // One-click presets: PRE-FILL only (the user still reviews + applies with the
+  // trade token, and the server re-derives the position — nothing is sent from
+  // here). Direction-aware: SL lands on the losing side of mark, TP on the
+  // winning side; BE = break-even (fees included) with entry as the fallback.
+  const presets = document.getElementById("tpsl-presets");
+  const markPx = Number(pos.markPrice);
+  const isLong = String(pos.side).toLowerCase() === "buy";
+  const bePx = Number(pos.breakEvenPrice) > 0 ? Number(pos.breakEvenPrice) : Number(pos.avgPrice);
+  const tickSize = (state.specs[pos.symbol] || {}).tickSize;
+  const snapPx = (v) => {
+    const snapped = tickSize != null ? snapToStep(v, tickSize) : null;
+    return snapped != null && Number(snapped) > 0 ? snapped : String(Number(v.toFixed(4)));
+  };
+  const onPreset = (ev) => {
+    const b = ev.target.closest("button[data-kind]");
+    if (!b) return;
+    let px;
+    if (b.dataset.be) {
+      px = bePx;
+    } else {
+      const pct = Number(b.dataset.pct) / 100;
+      const dir = b.dataset.kind === "sl" ? (isLong ? -1 : 1) : (isLong ? 1 : -1);
+      px = markPx * (1 + dir * pct);
+    }
+    if (!(px > 0)) return;
+    (b.dataset.kind === "sl" ? slInput : tpInput).value = snapPx(px);
+    updatePreview();
+  };
+  if (presets) {
+    if (isFinite(markPx) && markPx > 0) {
+      const slBtn = (pct) => `<button type="button" data-kind="sl" data-pct="${pct}" title="Stop ${pct}% beyond mark, against the position">${pct}%</button>`;
+      const tpBtn = (pct) => `<button type="button" data-kind="tp" data-pct="${pct}" title="Target ${pct}% beyond mark, in the position's favour">${pct}%</button>`;
+      presets.innerHTML =
+        `<span class="pp-k">SL</span>` +
+        (bePx > 0 ? `<button type="button" data-kind="sl" data-be="1" title="Stop at break-even (fees included)">BE</button>` : "") +
+        [1, 2, 5].map(slBtn).join("") +
+        `<span class="pp-k">TP</span>` + [1, 2, 5].map(tpBtn).join("");
+      presets.addEventListener("click", onPreset);
+    } else {
+      presets.innerHTML = "";
+    }
+  }
   out.textContent = "";
   out.className = "result-msg";
   applyBtn.disabled = false; // clear a stuck-disabled state from a prior write
@@ -1262,6 +1431,10 @@ function openTpslModal(pos) {
     document.removeEventListener("keydown", onKey);
     tpInput.removeEventListener("input", updatePreview);
     slInput.removeEventListener("input", updatePreview);
+    if (presets) {
+      presets.removeEventListener("click", onPreset);
+      presets.innerHTML = ""; // never leak this position's presets into the next open
+    }
     _untrap();
     restoreFocus(_prevFocus);
     _tpslOpen = false;
@@ -3021,6 +3194,8 @@ function startBookPolling() {
     const pane = document.querySelector('[data-pane="dashboard"]');
     if (!state.activeSymbol || !pane || pane.hidden) { stopBookPolling(); return; }
     if (document.hidden) return; // backgrounded browser tab: skip, don't cancel
+    const bookSec = document.querySelector('[data-wpanel="book"]');
+    if (bookSec && bookSec.classList.contains("collapsed")) return; // panel folded away
     loadBook();
   }, 4000);
 }
@@ -3193,6 +3368,42 @@ function renderHistoryAnalytics(closedList, fees, makerCount, takerCount) {
   });
   const avgHoldMs = holdN ? holdSum / holdN : NaN;
 
+  // Risk-adjusted statistics — PER-TRADE variants (each closed trade is one
+  // observation; not annualized, and labeled as such). All guarded against
+  // zero-variance/zero-loss degenerate cases: null renders as "—".
+  const meanPnl = total / list.length;
+  const variance = pnls.reduce((s, v) => s + (v - meanPnl) * (v - meanPnl), 0) / list.length;
+  const stdev = Math.sqrt(variance);
+  const sharpe = stdev > 0 ? meanPnl / stdev : null;
+  const downside = pnls.filter((v) => v < 0);
+  const downsideDev = Math.sqrt(downside.reduce((s, v) => s + v * v, 0) / list.length);
+  const sortino = downsideDev > 0 ? meanPnl / downsideDev : null;
+  const winRate = wins / list.length;
+  const winLossRatio = avgLoss < 0 ? avgWin / Math.abs(avgLoss) : null;
+  const kelly = winLossRatio && winLossRatio > 0
+    ? Math.max(-100, Math.min(100, (winRate - (1 - winRate) / winLossRatio) * 100))
+    : null;
+  const recovery = maxDD > 0 ? total / maxDD : null;
+
+  // Breakdowns for the journal: PnL by symbol (top 5 by magnitude) + weekday.
+  const bySymbol = {};
+  list.forEach((r) => {
+    const sym = String(r.symbol || "?");
+    (bySymbol[sym] = bySymbol[sym] || { pnl: 0, n: 0 });
+    bySymbol[sym].pnl += Number(r.closedPnl) || 0;
+    bySymbol[sym].n++;
+  });
+  const topSymbols = Object.entries(bySymbol)
+    .sort((a, b) => Math.abs(b[1].pnl) - Math.abs(a[1].pnl))
+    .slice(0, 5);
+  const weekday = Array.from({ length: 7 }, () => 0);
+  list.forEach((r) => {
+    const t = Number(r.updatedTime ?? r.createdTime);
+    if (isFinite(t)) weekday[new Date(t).getDay()] += Number(r.closedPnl) || 0;
+  });
+  const weekdayMax = Math.max(1e-9, ...weekday.map(Math.abs));
+  const weekdayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
   const coin = curUnit();
   const feeStr = fees != null && isFinite(fees) ? `${fmtMoney(fees)} ${coin}` : "—";
   const mt = (makerCount != null && takerCount != null) ? `${makerCount} / ${takerCount}` : "—";
@@ -3225,6 +3436,28 @@ function renderHistoryAnalytics(closedList, fees, makerCount, takerCount) {
       jTile("Largest loss", fmtMoneySigned(largestLoss), "neg") +
       jTile("Max drawdown", fmtMoneySigned(-maxDD), maxDD > 0 ? "neg" : "flat") +
       jTile("Avg hold time", esc(fmtDuration(avgHoldMs)), "flat") +
+      jTile("Sharpe (per-trade)", sharpe != null ? sharpe.toFixed(2) : "—", sharpe != null ? pnlClass(sharpe) : "flat") +
+      jTile("Sortino (per-trade)", sortino != null ? sortino.toFixed(2) : "—", sortino != null ? pnlClass(sortino) : "flat") +
+      jTile("Kelly %", kelly != null ? `${kelly.toFixed(0)}%` : "—", kelly != null ? pnlClass(kelly) : "flat") +
+      jTile("Recovery factor", recovery != null ? recovery.toFixed(2) : "—", recovery != null ? pnlClass(recovery) : "flat") +
+    `</div>` +
+    // Breakdown row: where the PnL came from (symbols) and when (weekdays).
+    `<div class="journal-breakdown">` +
+      `<div class="jb-card"><div class="chart-title">PnL by symbol · top ${topSymbols.length}</div>` +
+        topSymbols.map(([sym, s]) =>
+          `<div class="jb-row"><span class="jb-sym mono">${esc(sym)}</span>` +
+          `<span class="jb-n muted">${s.n}×</span>` +
+          `<span class="jb-v priv ${pnlClass(s.pnl)}">${fmtMoneySigned(s.pnl)}</span></div>`
+        ).join("") +
+      `</div>` +
+      `<div class="jb-card"><div class="chart-title">PnL by weekday</div><div class="wd-bars">` +
+        weekday.map((v, i) => {
+          const h = Math.max(3, (Math.abs(v) / weekdayMax) * 46);
+          return `<div class="wd-col" title="${weekdayNames[i]}">` +
+            `<i class="${v >= 0 ? "up" : "down"}" style="height:${h.toFixed(0)}px"></i>` +
+            `<span>${weekdayNames[i][0]}</span></div>`;
+        }).join("") +
+      `</div></div>` +
     `</div>`;
 }
 
@@ -3738,7 +3971,10 @@ async function fetchCharts() {
 
 function chartsVisible() {
   const pane = document.querySelector('[data-pane="dashboard"]');
-  return !!pane && !pane.hidden && !document.hidden;
+  const panel = document.getElementById("charts-panel");
+  // A collapsed charts panel shows nothing — polling for it is pure waste.
+  const collapsed = panel && panel.classList.contains("collapsed");
+  return !!pane && !pane.hidden && !document.hidden && !collapsed;
 }
 // True when the on-screen candles already match the current interval + view, so
 // a start (tab switch / visibility flap) can reuse them instead of firing a fresh
@@ -3839,6 +4075,139 @@ function wireCharts() {
 }
 
 // ---------------------------------------------------------------------------
+// Workspace system — collapse any panel; drag (or Arrow-key) the dashboard's
+// main panels into your own order; both persist locally. PRESENTATION ONLY:
+// panels keep their ids and inner DOM, so every renderer and poller is
+// untouched; collapsing charts/book additionally pauses their polling.
+// ---------------------------------------------------------------------------
+const _WS_KEY = "dma.workspace.v1";
+function _wsState() {
+  try { return JSON.parse(localStorage.getItem(_WS_KEY) || "{}") || {}; } catch (e) { return {}; }
+}
+function _wsSave(st) {
+  try { localStorage.setItem(_WS_KEY, JSON.stringify(st)); } catch (e) {}
+}
+
+function wireWorkspace() {
+  const main = document.querySelector(".workspace-main");
+  const st = _wsState();
+
+  // Restore the saved order of the main panels (unknown ids are ignored, so a
+  // stale saved layout can never lose a panel).
+  if (main && Array.isArray(st.order)) {
+    st.order.forEach((id) => {
+      const sec = main.querySelector(`:scope > [data-wpanel="${CSS.escape(id)}"]`);
+      if (sec) main.appendChild(sec);
+    });
+  }
+  const persistOrder = () => {
+    if (!main) return;
+    const next = _wsState();
+    next.order = Array.from(main.querySelectorAll(":scope > [data-wpanel]")).map((s) => s.dataset.wpanel);
+    _wsSave(next);
+  };
+
+  document.querySelectorAll("[data-wpanel]").forEach((sec) => {
+    const head = sec.querySelector(".panel-head");
+    const id = sec.dataset.wpanel;
+    if (!head) return;
+    const reorderable = main && sec.parentElement === main;
+    const tools = document.createElement("span");
+    tools.className = "wpanel-tools";
+    tools.innerHTML =
+      (reorderable
+        ? `<button type="button" class="wpanel-btn wpanel-drag" draggable="true" title="Drag to reorder (Arrow keys work too)" aria-label="Reorder ${esc(id)} panel">⁙</button>`
+        : "") +
+      `<button type="button" class="wpanel-btn wpanel-collapse" title="Collapse panel" aria-expanded="true" aria-label="Collapse ${esc(id)} panel">▾</button>`;
+    head.appendChild(tools);
+
+    const collapseBtn = tools.querySelector(".wpanel-collapse");
+    const applyCollapsed = (on) => {
+      sec.classList.toggle("collapsed", on);
+      collapseBtn.setAttribute("aria-expanded", String(!on));
+      collapseBtn.textContent = on ? "▸" : "▾";
+      // Collapsed panels stop paying for data they don't show.
+      if (id === "charts") { if (on) stopChartPolling(); else startChartPolling(); }
+    };
+    if (st.collapsed && st.collapsed[id]) applyCollapsed(true);
+    collapseBtn.addEventListener("click", () => {
+      const on = !sec.classList.contains("collapsed");
+      applyCollapsed(on);
+      const next = _wsState();
+      next.collapsed = next.collapsed || {};
+      next.collapsed[id] = on;
+      _wsSave(next);
+    });
+
+    const dragBtn = tools.querySelector(".wpanel-drag");
+    if (dragBtn) {
+      dragBtn.addEventListener("dragstart", (e) => {
+        e.dataTransfer.setData("text/plain", id);
+        e.dataTransfer.effectAllowed = "move";
+        sec.classList.add("dragging");
+      });
+      dragBtn.addEventListener("dragend", () => { sec.classList.remove("dragging"); persistOrder(); });
+      // Keyboard parity for reordering (a11y): Arrow keys swap with a sibling.
+      dragBtn.addEventListener("keydown", (e) => {
+        if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+        e.preventDefault();
+        const sib = e.key === "ArrowUp" ? sec.previousElementSibling : sec.nextElementSibling;
+        if (!sib || !sib.dataset || !sib.dataset.wpanel) return;
+        if (e.key === "ArrowUp") main.insertBefore(sec, sib);
+        else main.insertBefore(sib, sec);
+        persistOrder();
+        dragBtn.focus();
+      });
+    }
+  });
+
+  if (main) {
+    main.addEventListener("dragover", (e) => {
+      const dragging = main.querySelector(":scope > .dragging");
+      if (!dragging) return;
+      e.preventDefault();
+      const over = e.target.closest("[data-wpanel]");
+      if (!over || over === dragging || over.parentElement !== main) return;
+      const rect = over.getBoundingClientRect();
+      const before = e.clientY < rect.top + rect.height / 2;
+      main.insertBefore(dragging, before ? over : over.nextSibling);
+    });
+    main.addEventListener("drop", (e) => e.preventDefault());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Table density — compact mode for information-dense sessions; persisted.
+// ---------------------------------------------------------------------------
+function applyDensity() {
+  let compact = false;
+  try { compact = localStorage.getItem("dma.density") === "compact"; } catch (e) {}
+  document.body.classList.toggle("density-compact", compact);
+}
+function toggleDensity() {
+  const compact = !document.body.classList.contains("density-compact");
+  document.body.classList.toggle("density-compact", compact);
+  try { localStorage.setItem("dma.density", compact ? "compact" : "comfortable"); } catch (e) {}
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard shortcuts reference ("?")
+// ---------------------------------------------------------------------------
+function wireKeysHelp() {
+  const overlay = document.getElementById("keys-overlay");
+  if (!overlay) return;
+  const close = () => { overlay.hidden = true; };
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  const btn = document.getElementById("keys-close");
+  if (btn) btn.addEventListener("click", close);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !overlay.hidden) close(); });
+}
+function openKeysHelp() {
+  const overlay = document.getElementById("keys-overlay");
+  if (overlay) overlay.hidden = false;
+}
+
+// ---------------------------------------------------------------------------
 // Command palette (Ctrl/Cmd + K) — navigation & display actions ONLY. Every
 // action just .click()s an existing on-screen control, so no new code path
 // can ever reach a write endpoint; the standing rule that no keyboard
@@ -3886,6 +4255,23 @@ function wireCommandPalette() {
      ["account-refresh", "Refresh account"]].forEach(([id, label]) => {
       const b = document.getElementById(id);
       if (b) acts.push({ label, hint: "read-only", run: () => b.click() });
+    });
+    acts.push({
+      label: document.body.classList.contains("density-compact")
+        ? "Table density: comfortable" : "Table density: compact",
+      hint: "display", run: toggleDensity,
+    });
+    acts.push({
+      label: "Notifications", hint: "log",
+      run: () => { const b = document.getElementById("notif-btn"); if (b) b.click(); },
+    });
+    acts.push({ label: "Keyboard shortcuts", hint: "?", run: openKeysHelp });
+    acts.push({
+      label: "Reset workspace layout", hint: "reload",
+      run: () => {
+        try { localStorage.removeItem(_WS_KEY); } catch (e) {}
+        toast("Workspace layout reset — reload to apply", "info");
+      },
     });
     const logout = document.getElementById("logout-btn");
     if (logout) acts.push({ label: "Log out", hint: "session", run: () => logout.click() });
@@ -3951,16 +4337,19 @@ function wireCommandPalette() {
 }
 
 // ---------------------------------------------------------------------------
-// Keyboard shortcut: "/" jumps to the order-ticket symbol field from anywhere
-// (switching to the Dashboard first if another tab is showing) — the trader's
-// most frequent entry point, now zero-mouse. NAVIGATION ONLY: no keyboard
-// shortcut ever triggers a write. Ignored while typing in any field so "/"
-// remains typeable, and inert for viewers (no ticket exists for them).
+// Global keys — "/" jumps to the ticket, "B"/"S" jump to it with the side
+// pre-selected (form state only — identical to clicking the segment), "?"
+// opens the shortcut reference. NAVIGATION/PREFILL ONLY: no keyboard shortcut
+// ever submits, modifies or cancels anything. All ignored while typing, and
+// the ticket keys are inert for viewers (no ticket exists for them).
 // ---------------------------------------------------------------------------
 document.addEventListener("keydown", (e) => {
-  if (e.key !== "/" || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
   const t = e.target;
   if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+  if (e.key === "?") { e.preventDefault(); openKeysHelp(); return; }
+  const key = e.key.toLowerCase();
+  if (e.key !== "/" && key !== "b" && key !== "s") return;
   const form = document.getElementById("order-form");
   if (!form) return;
   e.preventDefault();
@@ -3969,10 +4358,31 @@ document.addEventListener("keydown", (e) => {
     const dashTab = document.querySelector('#tabs .tab[data-tab="dashboard"]');
     if (dashTab) dashTab.click();
   }
+  if (key === "b" || key === "s") {
+    form.side.value = key === "b" ? "Buy" : "Sell";
+    form.side.dispatchEvent(new Event("change", { bubbles: true })); // repaints segment + submit
+  }
   try {
-    form.symbol.focus();
-    form.symbol.select();
+    // "/" (or an empty ticket) → symbol; a ready ticket with B/S → quantity.
+    const target = e.key === "/" || !form.symbol.value.trim() ? form.symbol : form.qty;
+    target.focus();
+    if (target === form.symbol) target.select();
   } catch (err) { /* focus is best-effort */ }
+});
+
+// Arrow-key navigation between focused table rows (dashboard grids): the rows
+// are already focusable buttons (Enter expands); ↑/↓ now moves between them.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+  const row = e.target && e.target.closest &&
+    e.target.closest("#positions-body tr.exp-row, #orders-body tr.exp-row");
+  if (!row || e.target !== row) return;
+  e.preventDefault();
+  let next = row;
+  do {
+    next = e.key === "ArrowDown" ? next.nextElementSibling : next.previousElementSibling;
+  } while (next && !next.classList.contains("exp-row"));
+  if (next) next.focus();
 });
 
 // ---------------------------------------------------------------------------
@@ -3990,7 +4400,11 @@ document.addEventListener("keydown", (e) => {
   wireTabs();
   wireMarketsHistory();
   wireCharts(); // live candlestick charts (read-only; polls while dashboard visible)
+  wireWorkspace(); // panel collapse/reorder, persisted locally (display-only)
   wireCommandPalette(); // Ctrl/Cmd+K — navigation & display actions only
+  wireNotifCenter(); // session notification log (every toast, recoverable)
+  wireKeysHelp(); // "?" shortcut reference
+  applyDensity(); // restore saved table density
   wirePrivacyToggle(); // restore saved privacy state BEFORE the first render (no flash)
   wireCurrencyToggle(); // restore saved currency BEFORE the first render
   renderLoading(); // skeleton rows until the first snapshot lands
