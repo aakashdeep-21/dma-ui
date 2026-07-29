@@ -174,7 +174,8 @@
             <div class="panel-head"><h2>Place Order</h2><span class="muted" style="font-size:11px">prices &amp; amounts in USDT</span></div>
             <form id="order-form" class="form-grid">
               <label>Symbol
-                <input name="symbol" placeholder="SOLUSDT" required autocomplete="off" />
+                <input name="symbol" placeholder="SOLUSDT" required autocomplete="off"
+                       title="Press / anywhere to jump here" />
               </label>
               <div class="spec-strip" id="order-spec" hidden></div>
               <label>Side
@@ -241,23 +242,34 @@
               <label class="limit-only">Price
                 <input name="price" placeholder="limit price" inputmode="decimal" autocomplete="off" />
               </label>
-              <label class="limit-only">Time in force
-                <select name="timeInForce">
-                  <option value="GTC">GTC — good till cancelled</option>
-                  <option value="PostOnly">Post-Only — maker only, never takes</option>
-                  <option value="IOC">IOC — immediate or cancel</option>
-                  <option value="FOK">FOK — fill or kill</option>
-                </select>
-              </label>
-              <label>Take Profit <span class="muted">(optional)</span>
-                <input name="takeProfit" placeholder="TP trigger price" inputmode="decimal" autocomplete="off" />
-              </label>
-              <label>Stop Loss <span class="muted">(optional)</span>
-                <input name="stopLoss" placeholder="SL trigger price" inputmode="decimal" autocomplete="off" />
-              </label>
-              <label class="checkbox">
-                <input type="checkbox" name="reduceOnly" /> Reduce only
-              </label>
+              <!-- Advanced order options behind a disclosure so the default
+                   ticket stays short (Submit reachable without scrolling).
+                   PRESENTATION ONLY: the inputs remain ordinary members of
+                   #order-form, so every existing handler, validation and
+                   payload is unchanged — and the typed-confirm modal always
+                   lists TP/SL/TIF values whether this is open or collapsed. -->
+              <details class="ticket-adv">
+                <summary>TP / SL &amp; advanced <span class="muted">optional</span></summary>
+                <div class="adv-body">
+                  <label class="limit-only">Time in force
+                    <select name="timeInForce">
+                      <option value="GTC">GTC — good till cancelled</option>
+                      <option value="PostOnly">Post-Only — maker only, never takes</option>
+                      <option value="IOC">IOC — immediate or cancel</option>
+                      <option value="FOK">FOK — fill or kill</option>
+                    </select>
+                  </label>
+                  <label>Take Profit <span class="muted">(optional)</span>
+                    <input name="takeProfit" placeholder="TP trigger price" inputmode="decimal" autocomplete="off" />
+                  </label>
+                  <label>Stop Loss <span class="muted">(optional)</span>
+                    <input name="stopLoss" placeholder="SL trigger price" inputmode="decimal" autocomplete="off" />
+                  </label>
+                  <label class="checkbox">
+                    <input type="checkbox" name="reduceOnly" /> Reduce only
+                  </label>
+                </div>
+              </details>
               <div id="order-pnl-preview" class="pnl-preview"></div>
               <button type="submit" class="btn-primary">Submit order</button>
             </form>
@@ -290,7 +302,7 @@
             <button id="markets-refresh" class="btn-ghost sm">Refresh</button>
           </div>
         </div>
-        <div id="markets-body" class="explorer-result"><p class="muted" style="padding:14px">Loading markets…</p></div>
+        <div id="markets-body" class="explorer-result"><p class="loading-msg muted">Loading markets…</p></div>
       </section>
     </div>
 

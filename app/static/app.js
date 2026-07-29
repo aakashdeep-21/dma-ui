@@ -2097,6 +2097,16 @@ function pct(v) {
 function emptyMsg(msg) {
   return `<p class="muted center" style="padding:18px">${esc(msg || "No data")}</p>`;
 }
+// Standard ERROR block for panel bodies: bordered + tinted so a failure reads
+// as a failure at a glance (not as data or an empty state), and role="alert"
+// so screen readers announce it with the same urgency as the error toasts.
+function errorMsg(msg) {
+  return `<div class="error-block" role="alert">⚠ ${esc(msg || "Request failed")}</div>`;
+}
+// Standard LOADING line (subtle pulse via CSS; stilled under reduced motion).
+function loadingMsg(label) {
+  return `<p class="loading-msg muted">${esc(label || "Loading…")}</p>`;
+}
 function listOf(data) {
   const r = data && data.result;
   if (r && Array.isArray(r.list)) return r.list;
@@ -2417,12 +2427,12 @@ function wireExplorer() {
     btn.addEventListener("click", async () => {
       const symbol = $("#explorer-symbol").value.trim().toUpperCase();
       if (q.symRequired && !symbol) {
-        out.innerHTML = `<p class="neg" style="padding:14px">"${esc(q.label)}" requires a symbol.</p>`;
+        out.innerHTML = errorMsg(`"${q.label}" requires a symbol.`);
         return;
       }
       let url = q.path;
       if (q.sym && symbol) url += `?symbol=${encodeURIComponent(symbol)}`;
-      out.innerHTML = `<p class="muted" style="padding:14px">Loading ${esc(q.label)}…</p>`;
+      out.innerHTML = loadingMsg(`Loading ${q.label}…`);
       try {
         const data = await api(url);
         // Cache so a currency toggle can re-render this result in the new unit.
@@ -2430,7 +2440,7 @@ function wireExplorer() {
         renderExplorerOutput(out, state.lastExplorer.render, data);
       } catch (err) {
         state.lastExplorer = null;
-        out.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(err.message)}</p>`;
+        out.innerHTML = errorMsg(err.message);
       }
     });
     container.appendChild(btn);
@@ -2491,7 +2501,7 @@ async function fetchMarkets() {
     _marketsData = await api("/api/tickers");
     renderMarkets();
   } catch (e) {
-    if (body) body.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(e.message)}</p>`;
+    if (body) body.innerHTML = errorMsg(e.message);
   }
 }
 function renderMarkets() {
@@ -2598,8 +2608,8 @@ async function fetchHistory() {
   }
   const seq = ++_historySeq;
   _historyLoadedAt = Date.now();
-  closedEl.innerHTML = `<p class="muted" style="padding:14px">Loading…</p>`;
-  execEl.innerHTML = `<p class="muted" style="padding:14px">Loading…</p>`;
+  closedEl.innerHTML = loadingMsg();
+  execEl.innerHTML = loadingMsg();
   // Parallel: the two reads are independent Mongo queries, so waiting for one
   // before starting the other only added latency.
   const [closed, exec] = await Promise.allSettled([
@@ -2677,13 +2687,13 @@ function renderHistoryResults(res) {
   } else {
     sumEl.hidden = true;
     if (analyticsEl) { analyticsEl.hidden = true; analyticsEl.innerHTML = ""; }
-    closedEl.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(res.closedErr && res.closedErr.message)}</p>`;
+    closedEl.innerHTML = errorMsg(res.closedErr && res.closedErr.message);
   }
 
   if (res.exec) {
     execEl.innerHTML = renderExecutions(res.exec);
   } else {
-    execEl.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(res.execErr && res.execErr.message)}</p>`;
+    execEl.innerHTML = errorMsg(res.execErr && res.execErr.message);
   }
 }
 function onHistoryActive() {
@@ -3164,7 +3174,7 @@ function onAccountActive() { if (!_accountLoaded) { _accountLoaded = true; loadA
 async function loadAccountOverview() {
   const el = document.getElementById("account-overview");
   if (!el) return;
-  el.innerHTML = `<p class="muted" style="padding:14px">Loading account…</p>`;
+  el.innerHTML = loadingMsg("Loading account…");
   try {
     const [bal, info, withdraw] = await Promise.all([
       api("/api/balance").catch(() => null),
@@ -3199,7 +3209,7 @@ async function loadAccountOverview() {
     const wdTbl = withdraw ? `<div class="explorer-summary">Withdrawable (${esc(curUnit())})</div>${renderWithdrawable(withdraw)}` : "";
     el.innerHTML = (head + walletTbl + infoTbl + wdTbl) || emptyMsg("No account data");
   } catch (e) {
-    el.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(e.message)}</p>`;
+    el.innerHTML = errorMsg(e.message);
   }
 }
 
@@ -3683,6 +3693,31 @@ function wireCharts() {
 
   startChartPolling();
 }
+
+// ---------------------------------------------------------------------------
+// Keyboard shortcut: "/" jumps to the order-ticket symbol field from anywhere
+// (switching to the Dashboard first if another tab is showing) — the trader's
+// most frequent entry point, now zero-mouse. NAVIGATION ONLY: no keyboard
+// shortcut ever triggers a write. Ignored while typing in any field so "/"
+// remains typeable, and inert for viewers (no ticket exists for them).
+// ---------------------------------------------------------------------------
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "/" || e.ctrlKey || e.metaKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+  const form = document.getElementById("order-form");
+  if (!form) return;
+  e.preventDefault();
+  const pane = document.querySelector('[data-pane="dashboard"]');
+  if (pane && pane.hidden) {
+    const dashTab = document.querySelector('#tabs .tab[data-tab="dashboard"]');
+    if (dashTab) dashTab.click();
+  }
+  try {
+    form.symbol.focus();
+    form.symbol.select();
+  } catch (err) { /* focus is best-effort */ }
+});
 
 // ---------------------------------------------------------------------------
 // Boot
