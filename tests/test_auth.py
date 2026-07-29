@@ -52,3 +52,12 @@ def test_trade_token_fail_closed_when_unset(monkeypatch):
     assert auth.verify_trade_token("the-secret") is True
     assert auth.verify_trade_token("nope") is False
     assert auth.verify_trade_token(None) is False
+
+
+def test_me_serves_configured_inr_rate(admin_client, monkeypatch):
+    # The frontend's display-only INR lens reads its rate from /api/me so the
+    # deployed rate is configured in one place (env INR_RATE), not in app.js.
+    monkeypatch.setattr(settings, "INR_RATE", 87.5)
+    body = admin_client.get("/api/me").json()
+    assert body["inrRate"] == 87.5
+    assert body["role"] == "admin"

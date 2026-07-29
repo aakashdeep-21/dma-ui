@@ -111,6 +111,19 @@ function detailGrid(pairs) {
   return `<div class="detail-grid">${items || '<span class="muted">No extra detail.</span>'}</div>`;
 }
 
+// Assign a tbody's HTML only when it actually CHANGED. The live feed re-renders
+// every poll tick, but between ticks the markup is often byte-identical (idle
+// orders table, PnL flat at display precision) — and a needless innerHTML swap
+// tears down the DOM subtree, kills any text selection the user has open, and
+// costs a reparse+layout for zero visual change. Building the string is cheap;
+// comparing it is the dirty-check (same pattern as the chart SVG signature).
+const _tbodyCache = new WeakMap();
+function setTbodyHTML(body, html) {
+  if (_tbodyCache.get(body) === html) return;
+  _tbodyCache.set(body, html);
+  body.innerHTML = html;
+}
+
 // Skeleton shimmer rows for the initial loading state.
 function renderLoading() {
   const skel = (cols) =>
@@ -120,8 +133,8 @@ function renderLoading() {
   const admin = state.role === "admin";
   const pb = document.getElementById("positions-body");
   const ob = document.getElementById("orders-body");
-  if (pb) pb.innerHTML = skel(admin ? 12 : 11);
-  if (ob) ob.innerHTML = skel(admin ? 8 : 7);
+  if (pb) setTbodyHTML(pb, skel(admin ? 12 : 11));
+  if (ob) setTbodyHTML(ob, skel(admin ? 8 : 7));
 }
 
 // Pick the account object from a wallet-balance payload that actually carries
@@ -196,7 +209,9 @@ function fmtSigned(value, digits = 2) {
 // stay in USDT, because orders are sent to the exchange in USDT. Only currency
 // amounts and prices convert — never quantities (base coin), leverage, counts,
 // times, or percentages/ratios (which are currency-invariant).
-const INR_RATE = 94;
+// Default matches the server's INR_RATE default; overwritten from /api/me at
+// boot (loadMe) so the deployed rate is configured in ONE place (the env).
+let INR_RATE = 94;
 function rate() { return state.currency === "INR" ? INR_RATE : 1; }
 function curUnit() { return state.currency === "INR" ? "INR" : settleCoin(); }
 function cvtNum(v) { const n = Number(v); return isFinite(n) ? n * rate() : NaN; }
@@ -341,7 +356,11 @@ async function api(path, options = {}) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const detail = data.detail || data.error || `Request failed (${res.status})`;
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    const err = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    // Money-path callers need to distinguish a DEFINITIVE 4xx rejection from an
+    // INDETERMINATE 5xx (e.g. the transfer idempotency-key lifecycle below).
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
@@ -360,18 +379,38 @@ async function writeApi(path, body) {
   });
 }
 
-// Client-owned idempotency keys for fund transfers (see the transfer form). Held
-// per transfer INTENT until that transfer confirms success, so a timeout-retry
-// reuses the same key (exchange dedups) but a later identical transfer is fresh.
-const _transferTxnIds = {};
+// Client-owned idempotency keys for fund transfers, keyed by transfer INTENT
+// (direction|amount|asset) and kept until that transfer resolves DEFINITIVELY:
+//  * confirmed success  -> cleared (a later identical transfer is a new intent);
+//  * definitive 4xx     -> cleared (the exchange evaluated and REFUSED — reusing
+//    the key after fixing the cause could be replay-deduped into a no-op);
+//  * indeterminate 5xx / network error -> KEPT, so the retry reuses the SAME
+//    key and the exchange dedups instead of moving funds twice.
+// Persisted per-tab in sessionStorage so a page refresh during that uncertainty
+// window cannot mint a fresh key for the same unresolved intent.
+const _TXN_STORE_KEY = "dma.transferTxnIds";
+const _transferTxnIds = (() => {
+  try { return JSON.parse(sessionStorage.getItem(_TXN_STORE_KEY) || "{}") || {}; }
+  catch (e) { return {}; }
+})();
+function _persistTxnIds() {
+  try { sessionStorage.setItem(_TXN_STORE_KEY, JSON.stringify(_transferTxnIds)); } catch (e) {}
+}
 function _uuid() {
   if (window.crypto && typeof crypto.randomUUID === "function") return crypto.randomUUID();
   // Fallback (non-secure contexts): unique enough for a client idempotency key.
   return "txn-" + Date.now() + "-" + Math.random().toString(16).slice(2);
 }
 function transferTxnId(intentKey) {
-  if (!_transferTxnIds[intentKey]) _transferTxnIds[intentKey] = _uuid();
+  if (!_transferTxnIds[intentKey]) {
+    _transferTxnIds[intentKey] = _uuid();
+    _persistTxnIds();
+  }
   return _transferTxnIds[intentKey];
+}
+function clearTransferTxnId(intentKey) {
+  delete _transferTxnIds[intentKey];
+  _persistTxnIds();
 }
 
 // Build the confirm-modal body. A plain string is shown as-is (textContent,
@@ -418,9 +457,13 @@ function restoreFocus(prev) {
 }
 
 // Typed-confirm modal: the user must type the word "confirm" to proceed.
-// Returns a Promise<boolean>.
+// Resolves false on cancel; on proceed resolves { percent } (100 unless the
+// caller passed opts.percents and the user picked a different portion) — an
+// object, so every existing truthiness check (`if (!ok)`) works unchanged.
+// opts.percents: optional array of portion buttons (e.g. [25,50,75,100]);
+// opts.hint(pct): optional per-selection helper line rendered under them.
 let _confirmOpen = false;
-function typedConfirm(message) {
+function typedConfirm(message, opts = {}) {
   return new Promise((resolve) => {
     // Only one confirm modal may be open at a time. A second trigger (e.g.
     // clicking another Close button) is ignored rather than stacking listeners
@@ -434,8 +477,44 @@ function typedConfirm(message) {
     const input = $("#confirm-input");
     const proceed = $("#confirm-proceed");
     const cancel = $("#confirm-cancel");
+    const choices = $("#confirm-choices");
     const prevFocus = document.activeElement;
     setConfirmMessage(message);
+
+    // Optional portion buttons (percent values are our own constants, not data).
+    let percent = 100;
+    const paintChoices = () => {
+      choices.querySelectorAll("button[data-pct]").forEach((b) => {
+        const on = Number(b.dataset.pct) === percent;
+        b.classList.toggle("active", on);
+        b.setAttribute("aria-pressed", String(on));
+      });
+      const hintEl = choices.querySelector(".choices-hint");
+      if (hintEl) hintEl.textContent = opts.hint ? opts.hint(percent) : "";
+    };
+    const onChoice = (e) => {
+      const b = e.target.closest("button[data-pct]");
+      if (!b) return;
+      percent = Number(b.dataset.pct);
+      paintChoices();
+    };
+    if (choices) {
+      if (Array.isArray(opts.percents) && opts.percents.length) {
+        choices.hidden = false;
+        choices.innerHTML =
+          `<div class="choices-btns" role="group" aria-label="Portion to apply">` +
+          opts.percents
+            .map((p) => `<button type="button" data-pct="${Number(p)}" aria-pressed="${Number(p) === 100}">${Number(p) === 100 ? "Full" : Number(p) + "%"}</button>`)
+            .join("") +
+          `</div><div class="choices-hint muted"></div>`;
+        choices.addEventListener("click", onChoice);
+        paintChoices();
+      } else {
+        choices.hidden = true;
+        choices.innerHTML = "";
+      }
+    }
+
     input.value = "";
     proceed.disabled = true;
     overlay.hidden = false;
@@ -449,10 +528,15 @@ function typedConfirm(message) {
       cancel.removeEventListener("click", onCancel);
       input.removeEventListener("keydown", onKey);
       overlay.removeEventListener("click", onOverlay);
+      if (choices) {
+        choices.removeEventListener("click", onChoice);
+        choices.hidden = true;
+        choices.innerHTML = ""; // never leak stale portion buttons into the next confirm
+      }
       untrap();
       restoreFocus(prevFocus);
       _confirmOpen = false;
-      resolve(result);
+      resolve(result ? { percent } : false);
     };
     const isValid = () => input.value.trim().toLowerCase() === "confirm";
     const onInput = () => { proceed.disabled = !isValid(); };
@@ -478,6 +562,9 @@ function typedConfirm(message) {
 async function loadMe() {
   const me = await api("/api/me");
   state.role = me.role;
+  // Display-only USDT→INR lens rate, configured server-side (env INR_RATE).
+  const inr = Number(me.inrRate);
+  if (isFinite(inr) && inr > 0) INR_RATE = inr;
   $("#user-name").textContent = me.username;
   const rolePill = $("#user-role");
   rolePill.textContent = me.role;
@@ -506,6 +593,13 @@ function renderSummary(d) {
   pnlEl.textContent = `${fmtMoneySigned(summary.totalUnrealisedPnl)} ${curUnit()}`;
   // `priv` kept on every reassignment so the privacy mask survives re-renders.
   pnlEl.className = "stat-value priv " + pnlClass(summary.totalUnrealisedPnl);
+
+  // Live PnL in the tab title so the terminal is glanceable from another
+  // window. Suppressed in privacy mode — window titles leak to task switchers,
+  // window lists and screen shares, which is exactly what that mode hides from.
+  document.title = document.body.classList.contains("privacy-on") || !isFinite(upl)
+    ? "DMA Terminal — Dashboard"
+    : `${fmtMoneySigned(summary.totalUnrealisedPnl)} ${curUnit()} · DMA Terminal`;
 
   $("#stat-positions").textContent = summary.openPositions ?? "—";
   $("#stat-orders").textContent = summary.openOrders ?? "—";
@@ -596,14 +690,14 @@ function renderPositions(positions) {
     const hint = state.role === "admin"
       ? `<div class="empty-hint">Use the order ticket on the right to open a position.</div>`
       : "";
-    body.innerHTML = `<tr><td colspan="99" class="muted center empty-cell">No open positions${hint}</td></tr>`;
+    setTbodyHTML(body, `<tr><td colspan="99" class="muted center empty-cell">No open positions${hint}</td></tr>`);
     return;
   }
   const isAdmin = state.role === "admin";
   const hasVal = (v) => v !== undefined && v !== null && v !== "" && Number(v) !== 0;
   const nextPrev = {};
   const sorted = applySort(rows, state.sortPos);
-  body.innerHTML = sorted
+  const html = sorted
     .map((p) => {
       const pnl = p.unrealisedPnl;
       const key = `${p.symbol}/${p.positionIdx ?? 0}`;
@@ -711,6 +805,7 @@ function renderPositions(positions) {
       <tr class="detail-row"${expanded ? "" : " hidden"}><td colspan="99">${detail}</td></tr>`;
     })
     .join("");
+  setTbodyHTML(body, html);
   state.prevPos = nextPrev;
   // Drop expanded-state for positions that no longer exist (avoid unbounded growth).
   const liveKeys = new Set(sorted.map((p) => `${p.symbol}/${p.positionIdx ?? 0}`));
@@ -730,21 +825,30 @@ function renderOrders(orders) {
     const hint = state.role === "admin"
       ? `<div class="empty-hint">Place an order from the ticket to see it here.</div>`
       : "";
-    body.innerHTML = `<tr><td colspan="99" class="muted center empty-cell">No open orders${hint}</td></tr>`;
+    setTbodyHTML(body, `<tr><td colspan="99" class="muted center empty-cell">No open orders${hint}</td></tr>`);
     updateSortIndicators();
     return;
   }
   const isAdmin = state.role === "admin";
   const sorted = applySort(rows, state.sortOrders);
-  body.innerHTML = sorted
+  const html = sorted
     .map((o) => {
       const key = o.orderId || `${o.symbol}/${o.orderLinkId || ""}`;
       const expanded = state.expandedOrders.has(key);
       const actions = isAdmin
-        ? `<td class="row-actions"><button class="btn-danger sm" data-cancel='${esc(JSON.stringify({
-            symbol: o.symbol,
-            orderId: o.orderId,
-          }))}'>Cancel</button></td>`
+        ? `<td class="row-actions">
+            <button class="btn-ghost sm" data-amend='${esc(JSON.stringify({
+              symbol: o.symbol,
+              orderId: o.orderId,
+              side: o.side,
+              // Amend the UNFILLED remainder when the order is partially filled.
+              qty: Number(o.leavesQty) > 0 ? o.leavesQty : o.qty,
+              price: o.price,
+            }))}' title="Cancel this order and edit it in the ticket">✎</button>
+            <button class="btn-danger sm" data-cancel='${esc(JSON.stringify({
+              symbol: o.symbol,
+              orderId: o.orderId,
+            }))}'>Cancel</button></td>`
         : "";
 
       // Fill progress + flags as small badges under the type cell.
@@ -788,6 +892,13 @@ function renderOrders(orders) {
       <tr class="detail-row"${expanded ? "" : " hidden"}><td colspan="99">${detail}</td></tr>`;
     })
     .join("");
+  // The upstream open-orders call is capped at 50 — a full page means MORE may
+  // exist on the exchange that this table cannot show. Never present a capped
+  // page as the complete set.
+  const capNote = rows.length >= 50
+    ? `<tr><td colspan="99" class="muted center">Showing 50 open orders (the feed's cap) — more may be open on the exchange.</td></tr>`
+    : "";
+  setTbodyHTML(body, html + capNote);
   const liveKeys = new Set(sorted.map((o) => o.orderId || `${o.symbol}/${o.orderLinkId || ""}`));
   state.expandedOrders.forEach((k) => { if (!liveKeys.has(k)) state.expandedOrders.delete(k); });
   updateSortIndicators();
@@ -826,6 +937,47 @@ function renderDashboard(d) {
   renderPositions(d.positions);
   renderOrders(d.orders);
   renderErrors(d.errors);
+  notifyPositionChanges(d);
+}
+
+// In-app fill/close awareness: announce position open/close/size changes by
+// diffing consecutive snapshots, so a TP firing while the user is on another
+// tab (or a limit entry filling) is surfaced without needing Telegram. Only
+// POSITIONS are diffed — an order-row disappearance is ambiguous (fill vs
+// cancel vs expiry), but a position change is an unambiguous money-state fact.
+// key -> {size, side, symbol}; null until the first full snapshot (baseline).
+let _posChangeBaseline = null;
+function notifyPositionChanges(d) {
+  // A PARTIAL snapshot (the positions read failed upstream this cycle) must
+  // never be diffed: its empty list would read as "everything closed".
+  if (d.errors && d.errors.positions) return;
+  const cur = {};
+  (d.positions || []).forEach((p) => {
+    const size = Number(p.size);
+    if (isFinite(size) && size !== 0) {
+      cur[`${p.symbol}/${p.positionIdx ?? 0}`] = { size, side: p.side, symbol: p.symbol };
+    }
+  });
+  if (_posChangeBaseline === null) { _posChangeBaseline = cur; return; }
+  const prev = _posChangeBaseline;
+  _posChangeBaseline = cur;
+  // Privacy mode: announce the event, never the figures (toasts are on-screen).
+  const priv = document.body.classList.contains("privacy-on");
+  for (const k in cur) {
+    if (!prev[k]) {
+      toast(`Position opened: ${cur[k].side} ${cur[k].symbol}${priv ? "" : " " + fmtNum(cur[k].size, 4)}`, "info", 6000);
+    } else if (prev[k].size !== cur[k].size) {
+      toast(
+        priv
+          ? `${cur[k].symbol} position size changed`
+          : `${cur[k].symbol} size ${fmtNum(prev[k].size, 4)} → ${fmtNum(cur[k].size, 4)}`,
+        "info", 6000
+      );
+    }
+  }
+  for (const k in prev) {
+    if (!cur[k]) toast(`Position closed: ${prev[k].symbol}`, "info", 6000);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -882,28 +1034,75 @@ document.addEventListener("click", async (e) => {
       const lines = [
         ["Symbol", payload.symbol],
         ["Action", "Close · market reduce-only"],
-        ["Size", String(payload.qty)],
+        ["Size (live)", String(payload.qty)],
       ];
       if (pos && isFinite(Number(pos.unrealisedPnl))) {
         lines.push(["Unrealised PnL to realise", `${fmtSigned(pos.unrealisedPnl)} ${settleCoin()}`]);
       }
+      const liveQty = Number(payload.qty);
       const ok = await typedConfirm({
         head: `Close ${payload.symbol}`,
         lines,
         note: "Sends a market order on the opposite side; reduce-only can only shrink the position.",
+      }, {
+        // Partial close: pick the portion of the LIVE position to exit. The
+        // server re-derives the size from the exchange and floors the slice to
+        // the lot step — the figure here is a preview, never the payload qty.
+        percents: [25, 50, 75, 100],
+        hint: (pct) =>
+          pct === 100
+            ? "Closes the entire position."
+            : `Closes ≈ ${isFinite(liveQty) ? fmtNum((liveQty * pct) / 100, 4) : "…"} of ${payload.qty} (exact size floors to the lot step server-side).`,
       });
       if (!ok) return;
+      const pct = Number(ok.percent) > 0 && Number(ok.percent) < 100 ? Number(ok.percent) : 100;
       closeBtn.disabled = true;
       const row = closeBtn.closest("tr");
       try {
-        await writeApi("/api/position/close", payload);
-        toast(`✓ Close order sent for ${payload.symbol}`, "pos");
-        if (row) row.style.opacity = "0.45"; // optimistic: this row is on its way out
+        // percent omitted on a full close — the request stays byte-identical to
+        // the pre-partial-close behaviour (server echoes the exact live size).
+        await writeApi("/api/position/close", pct < 100 ? { ...payload, percent: pct } : payload);
+        toast(`✓ Close order sent for ${payload.symbol}${pct < 100 ? ` (${pct}%)` : ""}`, "pos");
+        // Optimistic dim only when the whole row is on its way out.
+        if (row && pct === 100) row.style.opacity = "0.45";
         refreshDashboardSoon();
       } catch (err) {
         toast("Close failed: " + err.message, "neg");
       } finally {
         closeBtn.disabled = false;
+      }
+    });
+    return;
+  }
+
+  const amendBtn = e.target.closest("[data-amend]");
+  if (amendBtn) {
+    const payload = parseRowData(amendBtn, "data-amend");
+    if (!payload) return;
+    if (!ensureToken()) return;
+    await withWriteLock(async () => {
+      // Amend = cancel + edit in the ticket. The venue exposes no verified
+      // in-place amend on this gateway, and cancel-then-resubmit keeps the
+      // ticket as the ONE write surface; nothing is re-placed until submit.
+      const ok = await typedConfirm({
+        head: `Amend ${payload.symbol} order`,
+        lines: [
+          ["Order", String(payload.orderId)],
+          ["Current", `${payload.side} ${payload.qty}${payload.price && Number(payload.price) ? " @ " + payload.price : ""}`],
+        ],
+        note: "Cancels this order and loads its parameters into the ticket to adjust and resubmit. Nothing is re-placed until you submit.",
+      });
+      if (!ok) return;
+      amendBtn.disabled = true;
+      try {
+        await writeApi("/api/order/cancel", { symbol: payload.symbol, orderId: payload.orderId });
+        toast("✓ Order cancelled — adjust and resubmit from the ticket", "pos");
+        prefillTicketFromOrder(payload);
+        refreshDashboardSoon();
+      } catch (err) {
+        toast("Amend failed: " + err.message, "neg");
+      } finally {
+        amendBtn.disabled = false;
       }
     });
     return;
@@ -1147,6 +1346,9 @@ async function runWrite(submitBtn, out, gather) {
     } catch (err) {
       if (out) { out.textContent = "✗ " + err.message; out.classList.add("neg"); }
       toast(err.message, "neg");
+      if (spec.onError) {
+        try { spec.onError(err); } catch (e) { /* never mask the original failure */ }
+      }
     } finally {
       if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = prevLabel; }
     }
@@ -1197,11 +1399,11 @@ function wireAdminForms() {
 
   wireTradeToken();
 
-  // Toggle the price field for limit orders.
+  // Toggle the limit-only fields (price + time-in-force) for limit orders.
   const orderType = $("#order-type");
-  const limitField = document.querySelector(".limit-only");
+  const limitFields = document.querySelectorAll(".limit-only");
   const syncLimit = () => {
-    limitField.style.display = orderType.value === "Limit" ? "" : "none";
+    limitFields.forEach((el) => { el.style.display = orderType.value === "Limit" ? "" : "none"; });
   };
   orderType.addEventListener("change", syncLimit);
   syncLimit();
@@ -1234,6 +1436,10 @@ function wireAdminForms() {
       if (f.orderType.value === "Limit") {
         body.price = f.price.value.trim();
         if (!body.price) throw new Error("limit price is required for a Limit order");
+        // GTC is the exchange default — omitted so a default order's payload
+        // stays byte-identical to before the TIF control existed.
+        const tif = f.timeInForce.value;
+        if (tif && tif !== "GTC") body.timeInForce = tif;
       }
       if (f.reduceOnly.checked) body.reduceOnly = true;
 
@@ -1264,6 +1470,21 @@ function wireAdminForms() {
           specWarnings.push(`Qty ${body.qty} is below the ${body.symbol} minimum (${spec.minOrderQty}); the exchange may reject it.`);
         if (spec.maxOrderQty != null && Number(spec.maxOrderQty) > 0 && qn > Number(spec.maxOrderQty))
           specWarnings.push(`Qty ${body.qty} exceeds the ${body.symbol} maximum (${spec.maxOrderQty}); the exchange may reject it.`);
+        // Off-tick prices are rejected by the exchange only AFTER the whole
+        // confirm ceremony — warn up front instead. snapToStep returns the
+        // floored on-grid multiple, so any difference means off-grid. Advisory
+        // only, like every spec check (the server/exchange stay authoritative).
+        if (spec.tickSize != null) {
+          const offTick = (v) => {
+            const snapped = snapToStep(v, spec.tickSize);
+            return snapped != null && Number(snapped) !== Number(v);
+          };
+          [["Price", body.price], ["Take Profit", body.takeProfit], ["Stop Loss", body.stopLoss]]
+            .forEach(([name, v]) => {
+              if (v && offTick(v))
+                specWarnings.push(`${name} ${v} is not a multiple of the ${body.symbol} tick size (${spec.tickSize}); the exchange may reject it.`);
+            });
+        }
       }
 
       // A Market order sized by margin derives qty from the last fetched price,
@@ -1306,6 +1527,7 @@ function wireAdminForms() {
         lines.push(["Margin (requested)", `${fmtNum(Number(f.margin.value.trim()))} ${settleCoin()} (${lev}×)`]);
       }
       if (body.price) lines.push(["Limit price", String(body.price)]);
+      if (body.timeInForce) lines.push(["Time in force", body.timeInForce]);
       if (entry && Number(body.qty) > 0) {
         const notional = Number(body.qty) * entry;
         lines.push(["Notional", `${fmtNum(notional)} ${settleCoin()}${body.price ? "" : " (est.)"}`]);
@@ -1837,7 +2059,13 @@ function wireAdminForms() {
           const txn = res && res.data && (res.data.txn_id || res.data.txnId);
           return "✓ Transfer completed" + (txn ? ` (txn ${txn})` : "");
         },
-        onSuccess: () => { delete _transferTxnIds[intentKey]; f.reset(); refreshDashboardSoon(); },
+        onSuccess: () => { clearTransferTxnId(intentKey); f.reset(); refreshDashboardSoon(); },
+        // Definitive 4xx = the exchange evaluated and refused this transfer —
+        // rotate the key so a corrected retry isn't replay-deduped into a no-op.
+        // 5xx/network errors keep the key: that retry MUST dedup.
+        onError: (err) => {
+          if (err && err.status >= 400 && err.status < 500) clearTransferTxnId(intentKey);
+        },
       };
     });
   });
@@ -2040,6 +2268,17 @@ function renderInstruments(data) {
   ]);
 }
 
+// Cap the number of ROWS painted into the DOM for history tables. An "Overall"
+// read can return up to 10k rows per mirror; rendering them all in one
+// innerHTML janks for seconds (and can OOM a phone tab). Totals and analytics
+// are always computed over the FULL list — only the visible rows are capped.
+const HISTORY_RENDER_MAX = 500;
+
+function _renderCapNote(total) {
+  if (total <= HISTORY_RENDER_MAX) return "";
+  return `<p class="muted" style="padding:8px 16px">Showing the ${HISTORY_RENDER_MAX} newest of ${total} records — totals above cover all of them. Narrow the range or filter by symbol to see older rows.</p>`;
+}
+
 function renderClosedPnl(data) {
   const list = listOf(data);
   if (!list.length) return emptyMsg("No closed PnL records");
@@ -2051,7 +2290,7 @@ function renderClosedPnl(data) {
     ? ` · <span class="neg" title="A fetch cap was hit; some older records may be missing.">⚠ partial</span>`
     : "";
   const total = list.reduce((s, r) => s + (Number(r.closedPnl) || 0), 0);
-  const table = buildTable(list, [
+  const table = buildTable(list.slice(0, HISTORY_RENDER_MAX), [
     { label: "Closed At", get: (r) => fmtTime(r.updatedTime ?? r.createdTime) },
     { label: "Symbol", get: (r) => r.symbol },
     { label: "Side", get: (r) => r.side, cls: (r) => sideClass(r.side) },
@@ -2063,14 +2302,14 @@ function renderClosedPnl(data) {
   ]);
   return (
     `<div class="explorer-summary">Total closed PnL: <span class="${pnlClass(total)} priv">${fmtMoney(total)} ${esc(curUnit())}</span> · ${list.length} record(s)${truncNote}</div>` +
-    table
+    table + _renderCapNote(list.length)
   );
 }
 
 function renderExecutions(data) {
   const list = listOf(data);
   if (!list.length) return emptyMsg("No trades");
-  return buildTable(list, [
+  return buildTable(list.slice(0, HISTORY_RENDER_MAX), [
     { label: "Time", get: (r) => fmtTime(r.execTime) },
     { label: "Symbol", get: (r) => r.symbol },
     { label: "Side", get: (r) => r.side, cls: (r) => sideClass(r.side) },
@@ -2080,7 +2319,7 @@ function renderExecutions(data) {
     { label: "Exec Value", get: (r) => r.execValue, money: true, digits: 2, priv: true },
     { label: "Fee", get: (r) => r.execFee, money: true, digits: 4, priv: true },
     { label: "Maker", get: (r) => r.isMaker },
-  ]);
+  ]) + _renderCapNote(list.length);
 }
 
 function renderTickers(data) {
@@ -2282,8 +2521,11 @@ function onMarketsActive() {
   // not whatever _marketsTimer happens to point at after a re-entry.
   const id = setInterval(() => {
     const pane = document.querySelector('[data-pane="markets"]');
-    if (pane && !pane.hidden) fetchMarkets();
-    else clearInterval(id);
+    if (!pane || pane.hidden) { clearInterval(id); return; }
+    // Skip (don't cancel) the tick while the BROWSER tab is backgrounded — the
+    // full-tickers poll is pure waste with nothing on screen; it resumes on the
+    // next tick once the tab is visible again.
+    if (!document.hidden) fetchMarkets();
   }, 15000);
   _marketsTimer = id;
 }
@@ -2333,11 +2575,19 @@ function fmtSynced(ms, serverNowMs) {
   const stale = now - ms > 15 * 60 * 1000;
   return fmtTime(ms) + (stale ? " ⚠ stale" : "");
 }
+// Monotonic token: a newer refresh (range/filter change, Refresh click) makes
+// every still-in-flight older fetch drop its results, so two overlapping loads
+// can never interleave rows from different windows on screen.
+let _historySeq = 0;
+// Last fetched payloads — the currency toggle re-renders from here instead of
+// refetching (an "Overall" read can be ~10k rows per collection).
+let _historyCache = null;
+let _historyLoadedAt = 0; // when the on-screen history window was last fetched
+
 async function fetchHistory() {
   const closedEl = document.getElementById("history-closed");
   const execEl = document.getElementById("history-exec");
   const sumEl = document.getElementById("history-summary");
-  const analyticsEl = document.getElementById("history-analytics");
   // Both fetches share ONE window (a preset or the custom From/To range) so
   // the fee tally lines up with the PnL period; the symbol filter narrows both.
   const histQuery = historyQuery();
@@ -2346,69 +2596,102 @@ async function fetchHistory() {
     sumEl.textContent = "Pick a valid From/To range (From must not be after To).";
     return;
   }
+  const seq = ++_historySeq;
+  _historyLoadedAt = Date.now();
   closedEl.innerHTML = `<p class="muted" style="padding:14px">Loading…</p>`;
-  let closedListForAnalytics = [];
+  execEl.innerHTML = `<p class="muted" style="padding:14px">Loading…</p>`;
+  // Parallel: the two reads are independent Mongo queries, so waiting for one
+  // before starting the other only added latency.
+  const [closed, exec] = await Promise.allSettled([
+    api("/api/closed-pnl" + histQuery),
+    api("/api/executions" + histQuery),
+  ]);
+  if (seq !== _historySeq) return; // superseded — a newer load owns the screen
+  _historyCache = {
+    closed: closed.status === "fulfilled" ? closed.value : null,
+    closedErr: closed.status === "rejected" ? closed.reason : null,
+    exec: exec.status === "fulfilled" ? exec.value : null,
+    execErr: exec.status === "rejected" ? exec.reason : null,
+  };
+  renderHistoryResults(_historyCache);
+}
+
+// Pure render of already-fetched history payloads (fetchHistory + the currency
+// toggle both come through here so the two views can never diverge).
+function renderHistoryResults(res) {
+  const closedEl = document.getElementById("history-closed");
+  const execEl = document.getElementById("history-exec");
+  const sumEl = document.getElementById("history-summary");
+  const analyticsEl = document.getElementById("history-analytics");
+
+  let closedList = [];
   let closedSyncedMs = NaN;
   let serverNowMs = NaN;
-  try {
-    const closed = await api("/api/closed-pnl" + histQuery);
-    const list = listOf(closed);
-    closedListForAnalytics = list;
+  let fees = null, maker = null, taker = null;
+
+  if (res.exec) {
+    listOf(res.exec).forEach((r) => {
+      const f = Number(r.execFee);
+      if (isFinite(f)) fees = (fees || 0) + f;
+      if (r.isMaker === true || r.isMaker === "true") maker = (maker || 0) + 1;
+      else if (r.isMaker === false || r.isMaker === "false") taker = (taker || 0) + 1;
+    });
+    if (fees == null) fees = 0;
+    maker = maker || 0;
+    taker = taker || 0;
+  }
+
+  if (res.closed) {
+    closedList = listOf(res.closed);
     const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
     const todayMs = startOfDay.getTime();
     let total = 0, today = 0, wins = 0;
-    list.forEach((r) => {
+    closedList.forEach((r) => {
       const v = Number(r.closedPnl) || 0;
       total += v;
       if (v > 0) wins++;
       const t = Number(r.updatedTime ?? r.createdTime);
       if (isFinite(t) && t >= todayMs) today += v;
     });
+    closedSyncedMs = Number(res.closed.result && res.closed.result.lastSyncedMs);
+    serverNowMs = Number(res.closed.result && res.closed.result.nowMs);
+    // The tab renders BOTH mirrors (closed-PnL rows + trade fee analytics), so
+    // show the OLDER of the two sync stamps — the label must never claim more
+    // freshness than the stalest data on screen.
+    let syncedLabel = fmtSynced(closedSyncedMs, serverNowMs);
+    if (res.exec) {
+      const execSyncedMs = Number(res.exec.result && res.exec.result.lastSyncedMs);
+      const execNowMs = Number(res.exec.result && res.exec.result.nowMs);
+      if (isFinite(execNowMs) && execNowMs > 0) serverNowMs = execNowMs;
+      const stamps = [closedSyncedMs, execSyncedMs].filter((v) => isFinite(v) && v > 0);
+      syncedLabel = stamps.length === 2 ? fmtSynced(Math.min(...stamps), serverNowMs) : "syncing…";
+    }
     sumEl.hidden = false;
-    closedSyncedMs = Number(closed && closed.result && closed.result.lastSyncedMs);
-    serverNowMs = Number(closed && closed.result && closed.result.nowMs);
     sumEl.innerHTML =
       `Realized today: <span class="${pnlClass(today)} priv">${fmtMoneySigned(today)} ${esc(curUnit())}</span> · ` +
-      `Total (recent ${list.length}): <span class="${pnlClass(total)} priv">${fmtMoneySigned(total)}</span> · ` +
-      `Win rate: <span class="priv">${list.length ? Math.round((wins / list.length) * 100) : 0}%</span> · ` +
-      `Last synced: <span id="history-synced" class="muted">${fmtSynced(closedSyncedMs, serverNowMs)}</span>`;
-    renderHistoryAnalytics(list); // curve + win/loss now; fees fill in after execs load
-    closedEl.innerHTML = renderClosedPnl(closed);
-  } catch (e) {
+      `Total (recent ${closedList.length}): <span class="${pnlClass(total)} priv">${fmtMoneySigned(total)}</span> · ` +
+      `Win rate: <span class="priv">${closedList.length ? Math.round((wins / closedList.length) * 100) : 0}%</span> · ` +
+      `Last synced: <span id="history-synced" class="muted">${syncedLabel}</span> · times local`;
+    renderHistoryAnalytics(closedList, fees, maker, taker);
+    closedEl.innerHTML = renderClosedPnl(res.closed);
+  } else {
     sumEl.hidden = true;
     if (analyticsEl) { analyticsEl.hidden = true; analyticsEl.innerHTML = ""; }
-    closedEl.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(e.message)}</p>`;
+    closedEl.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(res.closedErr && res.closedErr.message)}</p>`;
   }
-  try {
-    const exec = await api("/api/executions" + histQuery);
-    const execList = listOf(exec);
-    let fees = 0, maker = 0, taker = 0;
-    execList.forEach((r) => {
-      const f = Number(r.execFee);
-      if (isFinite(f)) fees += f;
-      if (r.isMaker === true || r.isMaker === "true") maker++;
-      else if (r.isMaker === false || r.isMaker === "false") taker++;
-    });
-    renderHistoryAnalytics(closedListForAnalytics, fees, maker, taker);
-    execEl.innerHTML = renderExecutions(exec);
-    // The tab renders BOTH mirrors (closed-PnL rows + trade fee analytics),
-    // so show the OLDER of the two sync stamps — the label must never claim
-    // more freshness than the stalest data on screen.
-    const execSyncedMs = Number(exec && exec.result && exec.result.lastSyncedMs);
-    const execNowMs = Number(exec && exec.result && exec.result.nowMs);
-    if (isFinite(execNowMs) && execNowMs > 0) serverNowMs = execNowMs;
-    const syncedEl = document.getElementById("history-synced");
-    if (syncedEl) {
-      const stamps = [closedSyncedMs, execSyncedMs].filter((v) => isFinite(v) && v > 0);
-      syncedEl.textContent =
-        stamps.length === 2 ? fmtSynced(Math.min(...stamps), serverNowMs) : "syncing…";
-    }
-  } catch (e) {
-    execEl.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(e.message)}</p>`;
+
+  if (res.exec) {
+    execEl.innerHTML = renderExecutions(res.exec);
+  } else {
+    execEl.innerHTML = `<p class="neg" style="padding:14px">Error: ${esc(res.execErr && res.execErr.message)}</p>`;
   }
 }
 function onHistoryActive() {
-  if (!_historyLoaded) { _historyLoaded = true; fetchHistory(); }
+  if (!_historyLoaded) { _historyLoaded = true; fetchHistory(); return; }
+  // Re-entering the tab later: the mirror syncs every minute, so a view older
+  // than that is quietly stale — refresh it (a cheap Mongo read), instead of
+  // presenting hours-old rows under a frozen "Last synced" stamp.
+  if (Date.now() - _historyLoadedAt > 60_000) fetchHistory();
 }
 
 function wireMarketsHistory() {
@@ -2620,6 +2903,29 @@ function loadSymbolIntoTicket(sym) {
   toast(`Loaded ${symbol} into the order ticket`, "info", 2500);
 }
 
+// Load a (just-cancelled) order's parameters into the ticket for amend-style
+// editing. Display/prefill only — the ticket's normal validate/confirm/submit
+// path is unchanged and nothing is sent until the user submits.
+function prefillTicketFromOrder(o) {
+  const form = document.getElementById("order-form");
+  if (!form) return;
+  const hasPrice = o.price && Number(o.price) > 0;
+  form.symbol.value = String(o.symbol || "").toUpperCase();
+  form.side.value = String(o.side) === "Sell" ? "Sell" : "Buy";
+  form.side.dispatchEvent(new Event("change", { bubbles: true }));
+  form.orderType.value = hasPrice ? "Limit" : "Market";
+  form.orderType.dispatchEvent(new Event("change", { bubbles: true }));
+  if (form.sizeMode.value !== "qty") {
+    form.sizeMode.value = "qty"; // amend edits an explicit qty, never margin-derived
+    form.sizeMode.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  form.qty.value = o.qty != null ? String(o.qty) : "";
+  form.price.value = hasPrice ? String(o.price) : "";
+  form.symbol.dispatchEvent(new Event("input", { bubbles: true })); // spec+leverage+book+preview
+  try { (hasPrice ? form.price : form.qty).focus({ preventScroll: true }); } catch (e) {}
+  form.scrollIntoView({ block: "nearest" });
+}
+
 // --- instrument specs (tick/lot/leverage filters) ---
 async function fetchInstrumentSpec(symbol) {
   const sym = (symbol || "").trim().toUpperCase();
@@ -2687,6 +2993,7 @@ function startBookPolling() {
   _bookTimer = setInterval(() => {
     const pane = document.querySelector('[data-pane="dashboard"]');
     if (!state.activeSymbol || !pane || pane.hidden) { stopBookPolling(); return; }
+    if (document.hidden) return; // backgrounded browser tab: skip, don't cancel
     loadBook();
   }, 4000);
 }
@@ -2801,7 +3108,15 @@ function renderHistoryAnalytics(closedList, fees, makerCount, takerCount) {
   );
   if (!list.length) { el.hidden = true; el.innerHTML = ""; return; }
   let cum = 0;
-  const curve = list.map((r) => (cum += Number(r.closedPnl) || 0));
+  let curve = list.map((r) => (cum += Number(r.closedPnl) || 0));
+  // Downsample very long curves: a 10k-point SVG path janks layout for zero
+  // visual gain in a ~320px-wide chart. Cumulative values are computed over
+  // the FULL list first, so sampling changes resolution, never the shape/end.
+  if (curve.length > 800) {
+    const stride = Math.ceil(curve.length / 600);
+    const lastIdx = curve.length - 1;
+    curve = curve.filter((_, i) => i % stride === 0 || i === lastIdx);
+  }
   const wins = list.filter((r) => (Number(r.closedPnl) || 0) > 0).length;
   const losses = list.length - wins;
   const winPct = list.length ? (wins / list.length) * 100 : 0;
@@ -2908,6 +3223,9 @@ function wirePrivacyToggle() {
     const label = on ? "Show account figures" : "Hide account figures";
     btn.title = label;
     btn.setAttribute("aria-label", label);
+    // The tab title carries live PnL (see renderSummary) — scrub it the moment
+    // privacy turns on; the next snapshot restores it after privacy turns off.
+    if (on) document.title = "DMA Terminal — Dashboard";
   };
   apply(); // restore saved state before the first snapshot renders (no flash)
   btn.addEventListener("click", () => {
@@ -2950,7 +3268,12 @@ function wireCurrencyToggle() {
 function rerenderForCurrency() {
   if (state.lastDashboard) renderDashboard(state.lastDashboard);
   if (_marketsData) renderMarkets();
-  if (_historyLoaded) fetchHistory();
+  // Re-render history from the cached payloads — a currency flip is a pure
+  // display change and must not refetch (an "Overall" read is ~10k rows/mirror).
+  if (_historyLoaded) {
+    if (_historyCache) renderHistoryResults(_historyCache);
+    else fetchHistory();
+  }
   if (_accountLoaded) loadAccountOverview();
   if (state.lastExplorer) {
     const out = document.getElementById("explorer-result");
@@ -2987,6 +3310,11 @@ const CHART_INTERVALS = [
   { code: "15", label: "15m" },
   { code: "60", label: "1H" },
 ];
+// Poll cadence per candle interval: a 1m candle changes every tick, a 1H one
+// barely moves for minutes — matching the request rate to the data's actual
+// change rate cuts most of the continuous load on the public kline proxy
+// (a region-fragile third-party dependency) with no visible latency cost.
+const CHART_POLL_MS = { "1": 2000, "5": 3000, "15": 5000, "60": 10000 };
 const chartState = {
   view: "grid",         // "grid" | "single"
   interval: "15",       // Bybit kline code (1 | 5 | 15 | 60) — the SELECTED interval
@@ -2995,7 +3323,8 @@ const chartState = {
   loadedSingle: null,   // single-view symbol the on-screen candles were fetched for
   single: "BTCUSDT",
   data: {},             // symbol -> ascending candle[] {o,h,l,c,v}
-  fetching: false,      // single-flight guard so 1s ticks never pile up
+  failures: {},         // symbol -> consecutive fetch failures (drives the empty-state note)
+  fetching: false,      // single-flight guard so poll ticks never pile up
   pending: false,       // a control change arrived mid-fetch -> fetch once more after
 };
 let _chartTimer = null;
@@ -3175,7 +3504,16 @@ function buildChartDom() {
 
 function updateChartHeader(sm, suffix) {
   const arr = chartState.data[sm.id];
-  if (!arr || !arr.length) return;
+  if (!arr || !arr.length) {
+    // Never-loaded chart: after repeated failures, say so instead of leaving a
+    // silently blank card (the one known deploy pitfall — a US-region host is
+    // geo-blocked from the public kline API — previously had no on-screen cue).
+    const footEl = document.getElementById(`cfoot-${suffix}`);
+    if (footEl && (chartState.failures[sm.id] || 0) >= 2) {
+      footEl.textContent = "data unavailable — kline source unreachable (region-blocked?)";
+    }
+    return;
+  }
   const last = arr[arr.length - 1], first = arr[0];
   const chg = first.o ? (last.c / first.o - 1) * 100 : 0;
   const lastEl = document.getElementById(`cc-last-${suffix}`);
@@ -3239,8 +3577,12 @@ async function fetchCharts() {
             `/api/klines?symbol=${encodeURIComponent(id)}&interval=${encodeURIComponent(iv)}&limit=${limit}`
           );
           chartState.data[id] = parseKline(data);
+          delete chartState.failures[id];
         } catch (e) {
-          // Keep the previous candles on a transient error — never blank the chart.
+          // Keep the previous candles on a transient error — never blank the
+          // chart — but count the failure so a never-loaded card can say WHY
+          // it is empty (e.g. the US-region kline geo-block).
+          chartState.failures[id] = (chartState.failures[id] || 0) + 1;
         }
       })
     );
@@ -3279,12 +3621,13 @@ function startChartPolling() {
   // view/interval; otherwise repaint from cache and let the interval refresh it.
   if (chartsDataFresh()) renderCharts();
   else fetchCharts();
-  // 2s (not 1s): with the render dirty-check above this keeps the price line
-  // feeling live while halving request volume against the public kline proxy.
+  // Cadence follows the selected candle interval (CHART_POLL_MS): the render
+  // dirty-check makes extra polls cheap to PAINT, but the request itself is
+  // pure waste when the candle can't have changed.
   _chartTimer = setInterval(() => {
     if (!chartsVisible()) { stopChartPolling(); return; }
     fetchCharts();
-  }, 2000);
+  }, CHART_POLL_MS[chartState.interval] || 2000);
 }
 function stopChartPolling() {
   if (_chartTimer) { clearInterval(_chartTimer); _chartTimer = null; }
@@ -3327,7 +3670,9 @@ function wireCharts() {
     if (!b) return;
     chartState.interval = b.getAttribute("data-iv");
     repaintSeg(ivSeg, b);
-    fetchCharts();
+    // Restart (not just fetch): the poll timer must adopt the new interval's
+    // cadence (CHART_POLL_MS); startChartPolling also issues the fresh fetch.
+    startChartPolling();
   });
 
   // Pause polling when the browser tab is backgrounded; resume when visible.

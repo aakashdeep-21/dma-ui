@@ -196,12 +196,26 @@ def test_transient_error_is_retried_then_succeeds(monkeypatch, fake_db):
 @pytest.mark.parametrize("exc,retryable", [
     (dma_client.DMAError(502, "upstream request failed: boom"), True),
     (dma_client.DMAError(429, "slow down"), True),
-    (dma_client.DMAError(400, "Too many visits!"), True),   # v5 rate limit via retCode
+    (dma_client.DMAError(400, "Too many visits!"), True),   # message fallback
+    # NUMERIC ret_code is the primary signal — retryable even when the message
+    # matches no hint string (upstream copy changes must not break this).
+    (dma_client.DMAError(400, "opaque message", ret_code=10006), True),
+    (dma_client.DMAError(400, "opaque message", ret_code=10016), True),
+    (dma_client.DMAError(400, "opaque message", ret_code=10001), False),
     (dma_client.DMAError(400, "params error"), False),
     (dma_client.DMAError(401, "Invalid signature"), False),
 ])
 def test_is_retryable_classification(exc, retryable):
     assert history_sync._is_retryable(exc) is retryable
+
+
+def test_is_rate_limit_classification():
+    assert dma_client.is_rate_limit(dma_client.DMAError(429, "x")) is True
+    assert dma_client.is_rate_limit(dma_client.DMAError(400, "x", ret_code=10006)) is True
+    assert dma_client.is_rate_limit(dma_client.DMAError(400, "Rate limit hit")) is True
+    assert dma_client.is_rate_limit(dma_client.DMAError(400, "params error")) is False
+    assert dma_client.is_rate_limit(dma_client.DMAError(502, "network")) is False
+    assert dma_client.is_rate_limit(RuntimeError("boom")) is False
 
 
 def test_budget_exhaustion_stops_run_and_next_run_completes(monkeypatch, fake_db):

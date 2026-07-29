@@ -31,6 +31,10 @@ import httpx
 from . import dma_client
 from .config import settings
 
+# Extra poll periods to sit out when the EXCHANGE rate-limits the fill poll —
+# alerts are best-effort; hammering a throttled API prolongs the throttle.
+_RATE_LIMIT_EXTRA_POLLS = 2
+
 logger = logging.getLogger("dma-ui.notifier")
 
 # Dedicated outbound client (Telegram only). Closed by the lifespan on shutdown.
@@ -99,6 +103,16 @@ async def _send(text: str) -> str:
         logger.warning("telegram send failed: HTTP %s", resp.status_code)
         return "failed"
     return "rate_limited"
+
+
+async def notify(text: str) -> None:
+    """Out-of-band OPERATIONAL alert (e.g. "history sync is failing") to the same
+    fixed Telegram chat as the fill alerts. No-op when alerts aren't configured;
+    shares _send's guarantees (never raises, never logs the bot token). Fire and
+    forget: callers don't care whether Telegram actually accepted it."""
+    if not _enabled():
+        return
+    await _send(text)
 
 
 def _label(ex: dict) -> str | None:
@@ -194,11 +208,14 @@ async def run_watcher() -> None:
     logger.info("execution alerts enabled; polling executions every %ss", settings.NOTIFY_POLL_INTERVAL)
     baseline = True
     while True:
+        extra = 0.0
         try:
             await _poll_once(baseline)
             baseline = False  # only leave baseline mode after a successful poll
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception("execution-alert poll failed")  # never break the loop
-        await asyncio.sleep(settings.NOTIFY_POLL_INTERVAL)
+            if dma_client.is_rate_limit(exc):
+                extra = settings.NOTIFY_POLL_INTERVAL * _RATE_LIMIT_EXTRA_POLLS
+        await asyncio.sleep(settings.NOTIFY_POLL_INTERVAL + extra)

@@ -1,0 +1,4 @@
+# Bug-class checks only: undefined names, unused imports/variables, syntax
+# errors (F, E9). Style rules are deliberately NOT enabled — the codebase
+# predates the linter and style churn would bury real regressions in noise.
+lint.select = ["F", "E9"]

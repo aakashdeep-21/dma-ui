@@ -38,7 +38,7 @@ def test_order_create_allowlist_and_coercion(admin_client):
     # Stray/forged fields must NOT be forwarded; types must be coerced/normalised.
     r = admin_client.post("/api/order/create", json={
         "symbol": "btcusdt", "side": "buy", "orderType": "Market", "qty": "0.5",
-        "positionIdx": 5,               # invalid -> clamped to 0
+        "positionIdx": "1",             # valid hedge leg, string form -> int
         "reduceOnly": "yes",            # truthy string -> real bool True
         "closeOnTrigger": True,         # stray -> dropped
         "orderLinkId": "attacker",      # stray -> dropped
@@ -48,10 +48,77 @@ def test_order_create_allowlist_and_coercion(admin_client):
     assert body["symbol"] == "BTCUSDT"
     assert body["side"] == "Buy"
     assert body["qty"] == "0.5"
-    assert body["positionIdx"] == 0
+    assert body["positionIdx"] == 1
     assert body["reduceOnly"] is True
     assert "closeOnTrigger" not in body
     assert "orderLinkId" not in body
+
+
+@pytest.mark.parametrize("idx", [5, -1, "x", 3])
+def test_order_create_rejects_invalid_position_idx(admin_client, idx):
+    # A garbled positionIdx is a clean local 400, never a silent clamp to 0
+    # (which would target the wrong semantics on a hedge-mode account).
+    r = admin_client.post("/api/order/create", json={
+        "symbol": "BTCUSDT", "side": "Buy", "orderType": "Market", "qty": "1",
+        "positionIdx": idx,
+    })
+    assert r.status_code == 400
+    assert "positionIdx" in r.text
+
+
+def test_order_create_rejects_underscored_numbers(admin_client):
+    # Python's float() accepts "70_000" but the raw string is forwarded to the
+    # exchange, which does not — reject locally instead.
+    r = admin_client.post("/api/order/create", json={
+        "symbol": "BTCUSDT", "side": "Buy", "orderType": "Market", "qty": "1_0",
+    })
+    assert r.status_code == 400
+
+
+def test_trading_stop_rejects_underscored_price(admin_client):
+    r = admin_client.post("/api/position/trading-stop", json={
+        "symbol": "BTCUSDT", "takeProfit": "70_000",
+    })
+    assert r.status_code == 400
+
+
+# ---- timeInForce allowlist --------------------------------------------------
+
+def test_time_in_force_allowlist(admin_client):
+    base = {"symbol": "BTCUSDT", "side": "Buy", "orderType": "Limit",
+            "qty": "1", "price": "100"}
+    # Bad value -> 400.
+    r = admin_client.post("/api/order/create", json={**base, "timeInForce": "GTX"})
+    assert r.status_code == 400 and "timeInForce" in r.text
+    # PostOnly on a Market order is contradictory -> 400.
+    r = admin_client.post("/api/order/create", json={
+        "symbol": "BTCUSDT", "side": "Buy", "orderType": "Market", "qty": "1",
+        "timeInForce": "PostOnly",
+    })
+    assert r.status_code == 400
+    # PostOnly on Limit is forwarded.
+    r = admin_client.post("/api/order/create", json={**base, "timeInForce": "PostOnly"})
+    assert r.status_code == 200
+    assert admin_client.captured["create_order"]["timeInForce"] == "PostOnly"
+    # GTC is the exchange default: omitted for byte-compat with pre-TIF bodies.
+    r = admin_client.post("/api/order/create", json={**base, "timeInForce": "GTC"})
+    assert r.status_code == 200
+    assert "timeInForce" not in admin_client.captured["create_order"]
+    # Omitted entirely -> omitted.
+    r = admin_client.post("/api/order/create", json=base)
+    assert "timeInForce" not in admin_client.captured["create_order"]
+
+
+# ---- request body size cap --------------------------------------------------
+
+def test_oversized_body_is_rejected_413(admin_client):
+    r = admin_client.post(
+        "/api/login", content=b"x" * (70 * 1024),
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 413
+    # Security headers still wrap the early 413 (middleware ordering).
+    assert r.headers.get("x-frame-options") == "DENY"
 
 
 # ---- set-leverage ---------------------------------------------------------

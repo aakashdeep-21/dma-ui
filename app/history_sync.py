@@ -32,7 +32,7 @@ import random
 import time
 from datetime import datetime, timezone
 
-from . import db, dma_client
+from . import db, dma_client, notifier
 from .config import settings
 
 logger = logging.getLogger("dma-ui.history_sync")
@@ -153,9 +153,9 @@ _last_deep_rescan_ms: dict = {db.TRADES: 0, db.CLOSED_PNL: 0}
 def last_synced_ms(kind: str):
     return _last_synced_ms.get(kind)
 
-# v5 rate-limit rejections arrive as HTTP 200 with retCode!=0, which _request
-# surfaces as DMAError(400, retMsg) — hence the message sniffing alongside the
-# usual 429/5xx statuses.
+# Message-string fallback for transient errors whose v5 retCode we haven't
+# mapped (the primary classification is the NUMERIC ret_code below — strings
+# are brittle against upstream copy changes).
 _RETRYABLE_HINTS = (
     "too many", "rate limit", "timeout", "timed out",
     "system busy", "system error", "service unavailable",
@@ -165,6 +165,8 @@ _RETRYABLE_HINTS = (
 def _is_retryable(exc: dma_client.DMAError) -> bool:
     status = getattr(exc, "status", None)
     if status == 429 or (isinstance(status, int) and status >= 500):
+        return True
+    if getattr(exc, "ret_code", None) in dma_client.RETRYABLE_RET_CODES:
         return True
     detail = str(getattr(exc, "detail", "")).lower()
     return any(hint in detail for hint in _RETRYABLE_HINTS)
@@ -304,6 +306,14 @@ async def sync_kind(kind: str) -> dict:
     return totals
 
 
+# A single failed run is routine (transient upstream/Mongo blips) and only
+# logged; this many CONSECUTIVE failures means the mirror is actually wedged
+# and going stale, so the operator is alerted out-of-band (Telegram) once —
+# and told again when it recovers. At the 1-minute cadence, 3 ≈ 3 minutes.
+_FAILURES_BEFORE_ALERT = 3
+_consecutive_failures: dict = {db.TRADES: 0, db.CLOSED_PNL: 0}
+
+
 async def sync_all() -> None:
     """One scheduled run: each collection independently, under the single-flight
     lock. A failure in one collection is logged and never blocks the other; a
@@ -311,6 +321,7 @@ async def sync_all() -> None:
     run simply resumes."""
     async with _sync_lock:
         for kind in (db.TRADES, db.CLOSED_PNL):
+            label = _KINDS[kind]["label"]
             try:
                 await sync_kind(kind)
             except asyncio.CancelledError:
@@ -319,8 +330,22 @@ async def sync_all() -> None:
                 logger.exception(
                     "history sync %s: run failed; data is intact and the next "
                     "run resumes from the last stored record",
-                    _KINDS[kind]["label"],
+                    label,
                 )
+                _consecutive_failures[kind] += 1
+                # == (not >=): alert exactly once per wedge, not every minute.
+                if _consecutive_failures[kind] == _FAILURES_BEFORE_ALERT:
+                    await notifier.notify(
+                        f"⚠️ DMA terminal: the {label} history sync has failed "
+                        f"{_FAILURES_BEFORE_ALERT} runs in a row — the History tab "
+                        "is going stale. Check the deploy logs."
+                    )
+            else:
+                if _consecutive_failures[kind] >= _FAILURES_BEFORE_ALERT:
+                    await notifier.notify(
+                        f"✅ DMA terminal: the {label} history sync has recovered."
+                    )
+                _consecutive_failures[kind] = 0
 
 
 async def run_scheduler() -> None:

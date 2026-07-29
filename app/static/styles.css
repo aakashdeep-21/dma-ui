@@ -615,6 +615,18 @@ body.viewer .workspace { grid-template-columns: 1fr; }
 .stale-data #positions-body, .stale-data #orders-body,
 .stale-data .topbar-stats { opacity: 0.55; transition: opacity 0.3s ease; }
 
+/* ---- Confirm modal portion buttons (partial close) ---- */
+.confirm-choices { margin: 2px 0 12px; }
+.confirm-choices[hidden] { display: none; }
+.confirm-choices .choices-btns { display: flex; gap: 6px; }
+.confirm-choices .choices-btns button {
+  flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text-secondary);
+  padding: 7px 0; border-radius: 7px; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.confirm-choices .choices-btns button:hover { border-color: var(--accent); color: var(--text); }
+.confirm-choices .choices-btns button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.confirm-choices .choices-hint { font-size: 11px; margin-top: 6px; min-height: 13px; line-height: 1.4; }
+
 /* ---- Confirm modal richer body ---- */
 .confirm-message .cm-line { display: flex; justify-content: space-between; gap: 16px;
   font-size: 13px; padding: 3px 0; border-bottom: 1px solid rgba(35,43,58,0.5); }

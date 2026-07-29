@@ -19,12 +19,35 @@ logger = logging.getLogger(__name__)
 
 
 class DMAError(Exception):
-    """Raised when the exchange returns an error or is unreachable."""
+    """Raised when the exchange returns an error or is unreachable.
 
-    def __init__(self, status: int, detail):
+    `ret_code` is the v5 business code (e.g. 10006 = rate limit) when the
+    failure was an HTTP-200-with-nonzero-retCode rejection, else None. Callers
+    classify retryability/rate-limiting on this NUMBER first — message-string
+    sniffing is only the fallback for codes we haven't mapped."""
+
+    def __init__(self, status: int, detail, ret_code: int | None = None):
         self.status = status
         self.detail = detail
+        self.ret_code = ret_code
         super().__init__(f"DMA error {status}: {detail}")
+
+
+# v5 business codes that a retry can plausibly fix: 10006/10018 are rate
+# limits, 10016 is Bybit's transient "server error".
+_RATE_LIMIT_RET_CODES = frozenset({10006, 10018})
+RETRYABLE_RET_CODES = frozenset({10006, 10016, 10018})
+
+
+def is_rate_limit(exc: Exception) -> bool:
+    """True when `exc` is the exchange telling us to SLOW DOWN — pollers back
+    off extra instead of hammering a throttled API (which extends the ban)."""
+    if not isinstance(exc, DMAError):
+        return False
+    if exc.status == 429 or exc.ret_code in _RATE_LIMIT_RET_CODES:
+        return True
+    detail = str(exc.detail).lower()
+    return "too many" in detail or "rate limit" in detail
 
 
 # One shared async client reused across all calls (connection pooling / keep-alive)
@@ -88,7 +111,11 @@ async def _request(method: str, path: str, params: dict | None = None, body: dic
         ret_code = data.get("retCode")
         if ret_code not in (None, 0, "0"):
             detail = data.get("retMsg") or data
-            raise DMAError(400, detail)
+            try:
+                code = int(ret_code)
+            except (TypeError, ValueError):
+                code = None
+            raise DMAError(400, detail, ret_code=code)
     return data
 
 

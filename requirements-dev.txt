@@ -1,3 +1,5 @@
 # Test-only dependencies (not needed at runtime). Install with:
 #   pip install -r requirements.txt -r requirements-dev.txt
 pytest>=8
+# Lint: bug-class rules only (see ruff.toml) — undefined names, unused imports.
+ruff>=0.4

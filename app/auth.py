@@ -20,7 +20,12 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from .config import settings
 
-COOKIE_NAME = "dma_session"
+# __Host- prefix: the browser refuses to store this cookie unless it is Secure,
+# path=/, and host-locked (no Domain attribute) — so no subdomain or insecure
+# transport can ever plant or override the session cookie. Sessions are
+# in-memory (reset on deploy anyway), so renaming costs nothing. Browsers treat
+# localhost as a secure context, so local dev keeps working.
+COOKIE_NAME = "__Host-dma_session"
 ROLE_ADMIN = "admin"
 ROLE_VIEWER = "viewer"
 

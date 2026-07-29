@@ -241,6 +241,14 @@
               <label class="limit-only">Price
                 <input name="price" placeholder="limit price" inputmode="decimal" autocomplete="off" />
               </label>
+              <label class="limit-only">Time in force
+                <select name="timeInForce">
+                  <option value="GTC">GTC — good till cancelled</option>
+                  <option value="PostOnly">Post-Only — maker only, never takes</option>
+                  <option value="IOC">IOC — immediate or cancel</option>
+                  <option value="FOK">FOK — fill or kill</option>
+                </select>
+              </label>
               <label>Take Profit <span class="muted">(optional)</span>
                 <input name="takeProfit" placeholder="TP trigger price" inputmode="decimal" autocomplete="off" />
               </label>
@@ -411,6 +419,9 @@
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
       <h3 id="confirm-title">Confirm action</h3>
       <div id="confirm-message" class="confirm-message"></div>
+      <!-- Optional quick-portion buttons (e.g. partial close); populated by
+           typedConfirm() only when the caller passes percent choices. -->
+      <div id="confirm-choices" class="confirm-choices" hidden></div>
       <p class="muted">Type <strong>confirm</strong> below to proceed:</p>
       <input id="confirm-input" type="text" autocomplete="off" placeholder="confirm" />
       <div class="modal-actions">

@@ -93,9 +93,25 @@ class Settings:
         self.CATEGORY: str = os.environ.get("CATEGORY", "linear")
         self.SETTLE_COIN: str = os.environ.get("SETTLE_COIN", "USDT")
         self.ACCOUNT_TYPE: str = os.environ.get("ACCOUNT_TYPE", "UNIFIED")
+        # USDT→INR rate for the dashboard's DISPLAY-ONLY currency lens. Served
+        # to the frontend at login; nothing sent to the exchange ever uses it.
+        # A fixed configured rate (not a live feed) is deliberate — the lens is
+        # a mental-model aid, not an FX quote.
+        self.INR_RATE: float = _float_env("INR_RATE", 94.0)
+        # Attach a server-generated `orderLinkId` tag to every created order
+        # (idempotency/forensics: after an ambiguous timeout, the maybe-placed
+        # order can be found by its tag). OFF by default: it is a standard
+        # Bybit-v5 field, but this gateway has deviated from stock v5 before —
+        # place ONE small live order with this enabled to verify acceptance,
+        # then leave it on.
+        self.SEND_ORDER_LINK_ID: bool = (
+            os.environ.get("SEND_ORDER_LINK_ID", "").strip().lower() in ("1", "true", "yes", "on")
+        )
 
         # --- Live dashboard poll interval (seconds) ---
-        self.POLL_INTERVAL: float = _float_env("POLL_INTERVAL", 5.0)
+        # Floored at 1s: each poll is 3 signed exchange reads, so a typo'd
+        # sub-second interval would hammer the venue (and its rate limits).
+        self.POLL_INTERVAL: float = max(1.0, _float_env("POLL_INTERVAL", 5.0))
 
         # --- Number of TRUSTED reverse-proxy hops in front of the app ---
         # The client IP used for rate-limit bucketing is taken this many hops from
@@ -124,10 +140,11 @@ class Settings:
         self.CHART_SYMBOLS: list[str] = _csv_env(
             "CHART_SYMBOLS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
         )
-        # Seconds to cache a kline response in-process. The frontend polls ~1×/s
-        # for live candles; this coalesces that into at most one upstream call per
-        # (symbol, interval, limit) per interval, shielding the public API.
-        self.CHART_CACHE_TTL: float = _float_env("CHART_CACHE_TTL", 1.0)
+        # Seconds to cache a kline response in-process. Coalesces the frontend
+        # chart polling into at most one upstream call per (symbol, interval,
+        # limit) per TTL, shielding the public API. Floored so a typo can't
+        # disable the only upstream back-pressure.
+        self.CHART_CACHE_TTL: float = max(0.5, _float_env("CHART_CACHE_TTL", 1.0))
 
         # --- Execution alerts via Telegram (READ-ONLY, opt-in) ---
         # A background watcher (app/notifier.py) polls the account's executions
@@ -138,7 +155,7 @@ class Settings:
         self.TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "")
         # How often the watcher polls executions (seconds) and how many recent
         # executions to scan each poll.
-        self.NOTIFY_POLL_INTERVAL: float = _float_env("NOTIFY_POLL_INTERVAL", 10.0)
+        self.NOTIFY_POLL_INTERVAL: float = max(5.0, _float_env("NOTIFY_POLL_INTERVAL", 10.0))
         self.NOTIFY_EXEC_LIMIT: int = max(1, _int_env("NOTIFY_EXEC_LIMIT", 50))
 
         # --- MongoDB history store (trades & closed PnL) ---
@@ -161,7 +178,7 @@ class Settings:
         self.MONGO_TLS_CA_PEM: str = os.environ.get("MONGO_TLS_CA_PEM", "")
         # How often the history sync runs (seconds; default one minute) and how
         # far back a cold-start backfill reaches (days).
-        self.SYNC_INTERVAL_SECONDS: float = _float_env("SYNC_INTERVAL_SECONDS", 60.0)
+        self.SYNC_INTERVAL_SECONDS: float = max(10.0, _float_env("SYNC_INTERVAL_SECONDS", 60.0))
         self.SYNC_BACKFILL_DAYS: int = max(1, _int_env("SYNC_BACKFILL_DAYS", 730))
 
     def missing_required(self) -> list[str]:

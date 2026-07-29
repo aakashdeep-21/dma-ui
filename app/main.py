@@ -10,12 +10,15 @@ Security model:
     Writes are fail-closed: no token configured -> no writes possible.
 """
 import asyncio
+import json
 import logging
 import math
 import re
 import sys
 import time
+import uuid
 from contextlib import asynccontextmanager
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from urllib.parse import urlparse
 
 from fastapi import (
@@ -101,7 +104,12 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        for task in (db_init, watcher, syncer):
+        # The WS broadcaster is started lazily on the first client (so tests and
+        # idle deploys never spin it); include it here if it is running.
+        tasks = [db_init, watcher, syncer]
+        if _ws_broadcast_task is not None:
+            tasks.append(_ws_broadcast_task)
+        for task in tasks:
             task.cancel()
             try:
                 await task
@@ -162,6 +170,41 @@ if settings.MONGO_TLS_CA_PEM and "-----BEGIN" not in settings.MONGO_TLS_CA_PEM:
 
 for _w in settings.warn_weak():
     logger.warning("config: %s", _w)
+
+# Four subsystems assume EXACTLY ONE replica: in-memory sessions (per-role
+# eviction), the in-process rate limiter, the history sync's single-flight
+# lock, and the notifier's seen-fill dedup. A second replica silently degrades
+# all four (split sessions, halved lockout, doubled sync load, duplicate
+# Telegram alerts) — say so at every boot where an operator reads logs.
+logger.info(
+    "single-replica design: sessions, rate limiting, history sync and alert "
+    "dedup are in-process — run exactly ONE replica of this service"
+)
+
+
+# --------------------------------------------------------------------------
+# Request body size cap — every legitimate payload here (login, order, TP/SL,
+# transfer) is under 1 KB, and FastAPI buffers bodies fully in memory, so an
+# UNAUTHENTICATED multi-GB POST to /api/login is otherwise a memory-DoS on the
+# single process that also runs the sync and alerts. Content-Length covers the
+# practical attack; a chunked body without the header is not intercepted here
+# (streaming caps need receive-wrapping complexity) — the platform edge is the
+# backstop for that residual. Registered BEFORE security_headers so the 413
+# still carries the security headers (later-registered middleware wraps this).
+# --------------------------------------------------------------------------
+_MAX_BODY_BYTES = 64 * 1024
+
+
+@app.middleware("http")
+async def body_size_limit(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > _MAX_BODY_BYTES:
+                return JSONResponse(status_code=413, content={"error": "request body too large"})
+        except ValueError:
+            return JSONResponse(status_code=400, content={"error": "invalid Content-Length"})
+    return await call_next(request)
 
 
 # --------------------------------------------------------------------------
@@ -229,7 +272,12 @@ def _client_ip(request: Request) -> str:
 def _rate_limited(bucket_key: str) -> bool:
     now = time.monotonic()
     times = [t for t in _auth_failures.get(bucket_key, []) if now - t < _FAIL_WINDOW]
-    _auth_failures[bucket_key] = times
+    if times:
+        _auth_failures[bucket_key] = times
+    else:
+        # Drop fully-expired buckets: keeping an empty list per client IP would
+        # let the dict grow one entry per unique visitor for the process lifetime.
+        _auth_failures.pop(bucket_key, None)
     return len(times) >= _FAIL_MAX
 
 
@@ -300,6 +348,25 @@ def _safe_float(value) -> float:
     return result if math.isfinite(result) else 0.0
 
 
+def _strip_non_finite(value):
+    """Replace non-finite floats ANYWHERE in a payload with their string form.
+
+    Python's json.loads accepts literal NaN/Infinity (non-standard), so a
+    degraded exchange response can smuggle float('nan') into the raw records
+    that _safe_float never touches. Serialized as-is, that frame is invalid
+    JSON — the browser drops it silently and the dashboard freezes at "stale"
+    (WS path), or the REST path 500s (Starlette uses allow_nan=False). The
+    STRING form ("nan"/"inf") is deliberate: the frontend's fmt* helpers render
+    it as "—", whereas null would coerce to a fake 0.00 on a money cell."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _strip_non_finite(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_strip_non_finite(v) for v in value]
+    return value
+
+
 # Single source, shared with the alert watcher (app/notifier.py). Aliased rather
 # than wrapped so there is no needless indirection.
 _extract_list = dma_client.extract_list
@@ -348,8 +415,12 @@ def _positive_finite(value) -> bool:
 
     Money-path guard: a bare `float(x) <= 0` check lets 'inf'/'1e400' through
     (inf <= 0 is False), which would serialise as invalid JSON to the exchange.
-    Requiring math.isfinite closes that.
+    Requiring math.isfinite closes that. Underscored spellings ("70_000") are
+    also rejected: Python's float() accepts them but the validated STRING is
+    forwarded verbatim to the exchange, which does not.
     """
+    if isinstance(value, str) and "_" in value:
+        return False
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -402,7 +473,7 @@ async def build_dashboard() -> dict:
     global _dashboard_gen
     _dashboard_gen += 1
 
-    return {
+    return _strip_non_finite({
         "type": "dashboard",
         "gen": _dashboard_gen,
         "positions": positions,
@@ -416,7 +487,7 @@ async def build_dashboard() -> dict:
             "settleCoin": settings.SETTLE_COIN,
         },
         "errors": errors,
-    }
+    })
 
 
 # Force browsers to revalidate the HTML shell on every load so a deploy's new
@@ -445,11 +516,33 @@ def index(request: Request):
 
 @app.get("/healthz")
 def healthz():
+    # NOTE: the "unconfigured"/503 branch is vestigial defense-in-depth — the
+    # module-level startup checks refuse to boot on missing config, so a
+    # RUNNING process always reports ok here. Kept in case those checks are
+    # ever relaxed; the useful live signal is historySyncAgeSeconds below.
     missing = settings.missing_required()
     code = 200 if not missing else 503
+    now_ms = int(time.time() * 1000)
+
+    def _sync_age_s(kind: str) -> int | None:
+        # Seconds since this history mirror last completed a run that reached
+        # "now"; null until the first run after boot. A healthy sync sits under
+        # ~2× SYNC_INTERVAL_SECONDS — a climbing value means it is wedged (the
+        # UI shows "⚠ stale" too, but this is watchable by a monitor). Ages are
+        # not sensitive, so the unauthenticated health endpoint may carry them.
+        ts = history_sync.last_synced_ms(kind)
+        return round((now_ms - ts) / 1000) if ts else None
+
     return JSONResponse(
         status_code=code,
-        content={"status": "ok" if not missing else "unconfigured", "missing": missing},
+        content={
+            "status": "ok" if not missing else "unconfigured",
+            "missing": missing,
+            "historySyncAgeSeconds": {
+                "trades": _sync_age_s(db.TRADES),
+                "closedPnl": _sync_age_s(db.CLOSED_PNL),
+            },
+        },
     )
 
 
@@ -469,8 +562,15 @@ def api_login(request: Request, payload: dict = Body(...)):
     role = auth.authenticate(username, password)
     if not role:
         _record_failure(f"login:{ip}")
+        # Audit failed logins (below the 429 threshold they were invisible).
+        # Deliberately WITHOUT the attempted username: failed usernames are
+        # frequently mistyped passwords, which must never reach a log.
+        _audit_log.warning("%s", json.dumps({"audit": "auth.login", "ip": ip, "outcome": "invalid"}))
         raise HTTPException(status_code=401, detail="Invalid username or password")
     _clear_failures(f"login:{ip}")
+    _audit_log.info("%s", json.dumps(
+        {"audit": "auth.login", "user": username, "role": role, "ip": ip, "outcome": "ok"}
+    ))
 
     # Mint a new session id and make it THE active session FOR THIS ROLE — this
     # evicts any other same-role session, but never the other role's.
@@ -482,9 +582,10 @@ def api_login(request: Request, payload: dict = Body(...)):
         key=auth.COOKIE_NAME,
         value=token,
         max_age=settings.SESSION_MAX_AGE,
+        path="/",       # explicit: required for the __Host- prefix contract
         httponly=True,
         samesite="lax",
-        secure=True,  # Railway serves over HTTPS
+        secure=True,    # Railway serves over HTTPS; also required by __Host-
     )
     return resp
 
@@ -503,7 +604,9 @@ def api_logout(request: Request):
 
 @app.get("/api/me")
 def api_me(user: dict = Depends(current_user)):
-    return {"username": user.get("u"), "role": user.get("r")}
+    # inrRate feeds the frontend's display-only INR lens (see config.INR_RATE);
+    # served here so a rate change is an env edit + restart, not a code deploy.
+    return {"username": user.get("u"), "role": user.get("r"), "inrRate": settings.INR_RATE}
 
 
 @app.post("/api/verify-trade-token")
@@ -774,10 +877,63 @@ async def api_klines(
 
 
 # --------------------------------------------------------------------------
+# Audit trail — one append-only line per money operation, success AND failure.
+#
+# The exchange's records show WHAT happened; only this log shows WHO asked for
+# it (session, role, client IP) and with WHICH exact outbound body — the
+# forensic difference between "operator did it" and "trade token compromised".
+# Lines are single JSON objects on the "dma-ui.audit" logger (INFO->stdout, so
+# Railway retains them with the app logs). The logged body is the sanitized
+# ALLOWLISTED body we send upstream — never the raw client payload and never
+# any secret (the trade token lives in a header nobody logs).
+# --------------------------------------------------------------------------
+_audit_log = logging.getLogger("dma-ui.audit")
+
+
+async def _audited(request: Request, user: dict, action: str, body: dict, call):
+    """Run one exchange write, emitting an audit line for whichever outcome.
+    Exceptions propagate unchanged after being recorded — auditing must never
+    alter control flow on the money path."""
+    entry = {
+        "audit": action,
+        "user": user.get("u"),
+        "role": user.get("r"),
+        "ip": _client_ip(request),
+        "body": body,
+    }
+    try:
+        result = await call()
+    except dma_client.DMAError as exc:
+        entry["outcome"] = "rejected"
+        entry["status"] = exc.status
+        entry["error"] = _upstream_error_message(exc.detail)
+        _audit_log.warning("%s", json.dumps(entry, default=str))
+        raise
+    except Exception as exc:
+        # Unexpected local failure: record the TYPE only (a repr could embed
+        # request internals); the root logger still gets the full traceback
+        # from FastAPI's own error handling.
+        entry["outcome"] = "exception"
+        entry["error"] = type(exc).__name__
+        _audit_log.warning("%s", json.dumps(entry, default=str))
+        raise
+    entry["outcome"] = "ok"
+    if isinstance(result, dict):
+        inner = result.get("result")
+        if isinstance(inner, dict) and inner.get("orderId"):
+            entry["orderId"] = inner.get("orderId")
+        data = result.get("data")
+        if isinstance(data, dict) and data.get("txn_id"):
+            entry["txnId"] = data.get("txn_id")
+    _audit_log.info("%s", json.dumps(entry, default=str))
+    return result
+
+
+# --------------------------------------------------------------------------
 # Write API (admin only)
 # --------------------------------------------------------------------------
 @app.post("/api/order/create")
-async def api_create_order(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
+async def api_create_order(request: Request, payload: dict = Body(...), user: dict = Depends(require_trade_token)):
     symbol = payload.get("symbol")
     side = payload.get("side")
     order_type = payload.get("orderType")
@@ -807,12 +963,17 @@ async def api_create_order(payload: dict = Body(...), user: dict = Depends(requi
         "qty": str(qty).strip(),
     }
 
-    # positionIdx: one-way mode uses 0. Accept only 0/1/2; default to 0.
+    # positionIdx: 0 = one-way, 1/2 = hedge legs. Anything else is a REJECT,
+    # not a silent clamp: coercing a garbled idx to 0 on a hedge-mode account
+    # would target the wrong leg's semantics and surface only as a confusing
+    # exchange error after the confirm ceremony.
     try:
         pos_idx = int(payload.get("positionIdx", 0))
     except (TypeError, ValueError):
-        pos_idx = 0
-    order["positionIdx"] = pos_idx if pos_idx in (0, 1, 2) else 0
+        raise HTTPException(status_code=400, detail="positionIdx must be 0, 1 or 2")
+    if pos_idx not in (0, 1, 2):
+        raise HTTPException(status_code=400, detail="positionIdx must be 0, 1 or 2")
+    order["positionIdx"] = pos_idx
 
     if order["orderType"] == "Limit":
         price = payload.get("price")
@@ -822,6 +983,24 @@ async def api_create_order(payload: dict = Body(...), user: dict = Depends(requi
                 detail="price must be a finite number greater than 0 for a Limit order",
             )
         order["price"] = str(price).strip()
+
+    # Optional time-in-force (allowlisted like every write field). GTC is the
+    # exchange default — omitted from the body so a default order stays
+    # byte-identical to before this field existed. PostOnly is maker-or-cancel
+    # and only meaningful on a Limit order; catch the Market combination early.
+    tif = payload.get("timeInForce")
+    if tif not in (None, ""):
+        tif = str(tif)
+        if tif not in ("GTC", "IOC", "FOK", "PostOnly"):
+            raise HTTPException(
+                status_code=400, detail="timeInForce must be GTC, IOC, FOK or PostOnly"
+            )
+        if tif == "PostOnly" and order["orderType"] != "Limit":
+            raise HTTPException(
+                status_code=400, detail="PostOnly applies to Limit orders only"
+            )
+        if tif != "GTC":
+            order["timeInForce"] = tif
 
     # reduceOnly must be a real bool (not a truthy string) before it can gate risk.
     reduce_only = bool(payload.get("reduceOnly"))
@@ -848,40 +1027,70 @@ async def api_create_order(payload: dict = Body(...), user: dict = Depends(requi
     if reduce_only:
         order["reduceOnly"] = True
 
-    return await dma_client.create_order(order)
+    # Optional venue-side order tag (idempotency/forensics). SERVER-generated —
+    # a client-supplied orderLinkId stays allowlisted OUT — and env-gated OFF by
+    # default: it is a standard Bybit-v5 field, but this gateway has deviated
+    # from stock v5 before (the cursor-signing incident), so it must be verified
+    # against the live venue once before being switched on. When enabled, an
+    # ambiguous timeout below reports the tag so the maybe-placed order can be
+    # found in Open Orders. 36-char cap per v5: "dma-" + 32-hex = 36.
+    if settings.SEND_ORDER_LINK_ID:
+        order["orderLinkId"] = f"dma-{uuid.uuid4().hex}"
+
+    try:
+        return await _audited(request, user, "order.create", order,
+                              lambda: dma_client.create_order(order))
+    except dma_client.DMAError as exc:
+        # 5xx = the venue never ANSWERED (timeout / gateway error) — unlike a
+        # 4xx business rejection, the order MAY have been accepted before the
+        # failure. Never let the operator read this as "not placed": an instant
+        # manual resubmit is the classic double-execution path.
+        if exc.status >= 500:
+            ref = order.get("orderLinkId")
+            raise dma_client.DMAError(
+                exc.status,
+                "The exchange did not confirm this order — it MAY still have been "
+                "placed. Check Open Orders / Positions before submitting again."
+                + (f" (order tag: {ref})" if ref else ""),
+            ) from exc
+        raise
 
 
 @app.post("/api/order/cancel")
-async def api_cancel_order(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
+async def api_cancel_order(request: Request, payload: dict = Body(...), user: dict = Depends(require_trade_token)):
     symbol = payload.get("symbol")
     order_id = payload.get("orderId")
     if not symbol or not order_id:
         raise HTTPException(status_code=400, detail="symbol and orderId are required")
-    return await dma_client.cancel_order(_require_symbol(symbol), order_id)
+    sym = _require_symbol(symbol)
+    return await _audited(request, user, "order.cancel",
+                          {"symbol": sym, "orderId": order_id},
+                          lambda: dma_client.cancel_order(sym, order_id))
 
 
 @app.post("/api/order/cancel-all")
-async def api_cancel_all(payload: dict = Body(default={}), user: dict = Depends(require_trade_token)):
+async def api_cancel_all(request: Request, payload: dict = Body(default={}), user: dict = Depends(require_trade_token)):
     symbol = _norm_symbol_opt((payload or {}).get("symbol"))
-    return await dma_client.cancel_all(symbol)
+    return await _audited(request, user, "order.cancel-all", {"symbol": symbol},
+                          lambda: dma_client.cancel_all(symbol))
 
 
 @app.post("/api/position/set-leverage")
-async def api_set_leverage(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
+async def api_set_leverage(request: Request, payload: dict = Body(...), user: dict = Depends(require_trade_token)):
     symbol = payload.get("symbol")
     buy = payload.get("buyLeverage")
     sell = payload.get("sellLeverage", buy)
     if not symbol or buy is None:
         raise HTTPException(status_code=400, detail="symbol and buyLeverage are required")
-    symbol = str(symbol).upper()
-    if not _valid_symbol(symbol):
-        raise HTTPException(status_code=400, detail="symbol has an invalid format")
+    symbol = _require_symbol(symbol)
     for name, value in (("buyLeverage", buy), ("sellLeverage", sell)):
         if not _positive_finite(value):
             raise HTTPException(
                 status_code=400, detail=f"{name} must be a finite number greater than 0"
             )
-    return await dma_client.set_leverage(symbol, buy, sell)
+    return await _audited(request, user, "position.set-leverage",
+                          {"symbol": symbol, "buyLeverage": buy, "sellLeverage": sell},
+                          lambda: dma_client.set_leverage(symbol, buy, sell))
 
 
 async def _resolve_open_position(symbol, req_idx=None) -> dict:
@@ -912,36 +1121,101 @@ async def _resolve_open_position(symbol, req_idx=None) -> dict:
     return matches[0]
 
 
+async def _partial_close_qty(pos: dict, percent: float) -> str:
+    """Base-coin qty closing `percent`% of a LIVE position, floored to the
+    instrument's lot step. Money path: all arithmetic is Decimal on the
+    exchange's own strings — float rounding must never mint an off-step qty.
+    Raises 502 when the lot step can't be determined (the operator can always
+    fall back to a full close, which needs no step) and 400 when the requested
+    slice floors to zero lots."""
+    symbol = str(pos.get("symbol", ""))
+    inst = next(iter(_extract_list(await dma_client.get_instruments(symbol))), None)
+    # Money-path paranoia: the qty is derived from THIS instrument's lot step,
+    # so verify the gateway actually answered for the symbol we asked about
+    # (this gateway has deviated from stock v5 filtering semantics before).
+    if not isinstance(inst, dict) or str(inst.get("symbol", "")).upper() != symbol.upper():
+        raise HTTPException(
+            status_code=502,
+            detail=f"could not determine the lot step for {symbol}; close fully instead",
+        )
+    step_raw = inst.get("lotSizeFilter", {}).get("qtyStep")
+    try:
+        step = Decimal(str(step_raw))
+        size = Decimal(str(pos.get("size")).strip())
+        pct = Decimal(str(percent))
+    except (InvalidOperation, TypeError):
+        raise HTTPException(
+            status_code=502,
+            detail=f"could not determine the lot step for {symbol}; close fully instead",
+        )
+    if step <= 0 or size <= 0:
+        raise HTTPException(
+            status_code=502,
+            detail=f"could not determine the lot step for {symbol}; close fully instead",
+        )
+    qty = (size * pct / Decimal(100) / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    if qty <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{percent:g}% of {size} rounds below one lot step ({step}); "
+            "use a larger percent or close fully",
+        )
+    # Flooring a <100% slice can never exceed the live size; format as a plain
+    # decimal string at the step's own precision (str(Decimal) can emit 1E-7).
+    return format(qty.quantize(step), "f")
+
+
 @app.post("/api/position/close")
-async def api_close_position(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
-    """Close a position with a reduce-only market order in the opposite side.
+async def api_close_position(request: Request, payload: dict = Body(...), user: dict = Depends(require_trade_token)):
+    """Close a position — fully, or a percent slice — with a reduce-only market
+    order in the opposite side.
 
     The side / size / positionIdx are re-derived from the LIVE exchange
     position — never trusted from the client — so a stale or forged request
     can't close the wrong size or side. reduceOnly guarantees this can only
-    ever reduce, never open or flip, a position.
+    ever reduce, never open or flip, a position. An optional `percent` in
+    (0, 100] closes that share of the live size, floored to the instrument's
+    lot step server-side; omitted or 100 keeps the exact full-close behaviour
+    (the exchange's own size string, no re-derivation).
     """
+    percent = 100.0
+    percent_raw = payload.get("percent")
+    if percent_raw is not None:
+        try:
+            percent = float(percent_raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="percent must be a number")
+        if not math.isfinite(percent) or not (0 < percent <= 100):
+            raise HTTPException(status_code=400, detail="percent must be greater than 0 and at most 100")
+
     pos = await _resolve_open_position(payload.get("symbol"), payload.get("positionIdx"))
     size = _safe_float(pos.get("size"))
     side = str(pos.get("side", ""))
     if size <= 0 or side.lower() not in ("buy", "sell"):
         raise HTTPException(status_code=400, detail="Position has no closable size")
 
+    if percent >= 100:
+        # Echo back the exchange's own size string (validated >0 above),
+        # stripped of stray whitespace — avoids any reformatting drift.
+        qty = str(pos.get("size")).strip()
+    else:
+        qty = await _partial_close_qty(pos, percent)
+
     order = {
         "symbol": pos.get("symbol"),
         "side": "Sell" if side.lower() == "buy" else "Buy",
         "orderType": "Market",
-        # Echo back the exchange's own size string (validated >0 above),
-        # stripped of stray whitespace — avoids any reformatting drift.
-        "qty": str(pos.get("size")).strip(),
+        "qty": qty,
         "reduceOnly": True,
         "positionIdx": pos.get("positionIdx", 0),
     }
-    return await dma_client.create_order(order)
+    audit_body = {**order, "percent": percent} if percent < 100 else order
+    return await _audited(request, user, "position.close", audit_body,
+                          lambda: dma_client.create_order(order))
 
 
 @app.post("/api/position/trading-stop")
-async def api_trading_stop(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
+async def api_trading_stop(request: Request, payload: dict = Body(...), user: dict = Depends(require_trade_token)):
     """Set or cancel TP/SL on an existing position (Full mode, market exit).
 
     positionIdx is re-derived from the LIVE position so the stop always attaches
@@ -955,6 +1229,9 @@ async def api_trading_stop(payload: dict = Body(...), user: dict = Depends(requi
         # Empty/None => not supplied (leave that leg untouched). "0" => cancel.
         if value in (None, ""):
             return None
+        if isinstance(value, str) and "_" in value:
+            # float("70_000") parses, but the raw string goes to the exchange.
+            raise HTTPException(status_code=400, detail=f"{name} must be a number")
         try:
             number = float(value)
         except (TypeError, ValueError):
@@ -995,11 +1272,12 @@ async def api_trading_stop(payload: dict = Body(...), user: dict = Depends(requi
     if trigger_by:  # already allowlist-validated above
         body["tpTriggerBy"] = trigger_by
         body["slTriggerBy"] = trigger_by
-    return await dma_client.set_trading_stop(body)
+    return await _audited(request, user, "position.trading-stop", body,
+                          lambda: dma_client.set_trading_stop(body))
 
 
 @app.post("/api/account/set-margin-mode")
-async def api_set_margin_mode(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
+async def api_set_margin_mode(request: Request, payload: dict = Body(...), user: dict = Depends(require_trade_token)):
     mode = payload.get("setMarginMode") or payload.get("mode")
     if not mode:
         raise HTTPException(status_code=400, detail="setMarginMode is required")
@@ -1012,11 +1290,13 @@ async def api_set_margin_mode(payload: dict = Body(...), user: dict = Depends(re
             status_code=400,
             detail="setMarginMode must be ISOLATED_MARGIN, REGULAR_MARGIN or PORTFOLIO_MARGIN",
         )
-    return await dma_client.set_margin_mode(mode)
+    return await _audited(request, user, "account.set-margin-mode",
+                          {"setMarginMode": mode},
+                          lambda: dma_client.set_margin_mode(mode))
 
 
 @app.post("/api/funds/transfer")
-async def api_transfer_funds(payload: dict = Body(...), user: dict = Depends(require_trade_token)):
+async def api_transfer_funds(request: Request, payload: dict = Body(...), user: dict = Depends(require_trade_token)):
     direction = payload.get("direction")
     amount = payload.get("amount")
     quote_asset = payload.get("quote_asset") or payload.get("quoteAsset")
@@ -1034,14 +1314,35 @@ async def api_transfer_funds(payload: dict = Body(...), user: dict = Depends(req
         raise HTTPException(status_code=400, detail="direction must be IN or OUT")
     if not _positive_finite(amount):
         raise HTTPException(status_code=400, detail="amount must be a finite number greater than 0")
-    return await dma_client.transfer_funds(
-        str(direction).upper(), amount, quote_asset, client_txn_id.strip()
+    direction = str(direction).upper()
+    txn_id = client_txn_id.strip()
+    return await _audited(
+        request, user, "funds.transfer",
+        {"direction": direction, "amount": amount, "quote_asset": quote_asset,
+         "client_txn_id": txn_id},
+        lambda: dma_client.transfer_funds(direction, amount, quote_asset, txn_id),
     )
 
 
 # --------------------------------------------------------------------------
 # DMA error handling
 # --------------------------------------------------------------------------
+def _upstream_error_message(detail) -> str:
+    """Concise, browser-safe message for an upstream DMA error. A dict detail is
+    the full upstream envelope — it can carry reflected params, request ids and
+    internal diagnostics, so only its human message field is surfaced (the full
+    detail is logged server-side by the callers). Shared by the HTTP handler and
+    the WebSocket error frames so the two can never diverge in what they leak."""
+    if isinstance(detail, dict):
+        return (
+            detail.get("retMsg")
+            or detail.get("message")
+            or detail.get("error")
+            or "The exchange rejected the request"
+        )
+    return str(detail)
+
+
 @app.exception_handler(dma_client.DMAError)
 async def dma_error_handler(request: Request, exc: dma_client.DMAError):
     # Never let an UPSTREAM auth error (coinswitch 401/403 — e.g. a bad API
@@ -1052,21 +1353,9 @@ async def dma_error_handler(request: Request, exc: dma_client.DMAError):
     status = exc.status
     if status in (401, 403):
         status = 502
-    # Do not forward the full upstream envelope to the browser — it can carry
-    # reflected params, request ids and internal diagnostics. Surface only a
-    # concise message; log the full detail server-side for debugging.
-    detail = exc.detail
-    if isinstance(detail, dict):
-        message = (
-            detail.get("retMsg")
-            or detail.get("message")
-            or detail.get("error")
-            or "The exchange rejected the request"
-        )
-        logger.warning("upstream DMA error %s: %s", exc.status, detail)
-    else:
-        message = str(detail)
-    return JSONResponse(status_code=status, content={"error": message})
+    if isinstance(exc.detail, dict):
+        logger.warning("upstream DMA error %s: %s", exc.status, exc.detail)
+    return JSONResponse(status_code=status, content={"error": _upstream_error_message(exc.detail)})
 
 
 @app.exception_handler(market_data.MarketDataError)
@@ -1078,7 +1367,15 @@ async def market_data_error_handler(request: Request, exc: market_data.MarketDat
 
 
 # --------------------------------------------------------------------------
-# WebSocket live feed
+# WebSocket live feed — ONE shared poller, fanned out to every connected socket.
+#
+# Previously each connection ran its own build_dashboard loop, so N open tabs
+# cost 3×N signed exchange reads per poll interval. All sockets receive the
+# same account snapshot anyway (the feed carries no per-user data — both roles
+# see identical positions/orders/balance), so one shared poll per interval
+# serves any number of tabs at a constant upstream cost. The poller starts
+# lazily with the first client and stops when the last one disconnects, so an
+# idle deploy polls nothing — exactly like before.
 # --------------------------------------------------------------------------
 def _ws_origin_ok(websocket: WebSocket) -> bool:
     """Reject cross-origin WebSocket handshakes (defense in depth)."""
@@ -1086,6 +1383,107 @@ def _ws_origin_ok(websocket: WebSocket) -> bool:
     if not origin:
         return True  # non-browser client; still needs a valid session cookie
     return urlparse(origin).netloc == websocket.headers.get("host", "")
+
+
+# Connected sockets -> their session payload ({'u','r','sid'}), used for the
+# per-cycle eviction check. Mutated only on the event loop (no locking needed).
+_ws_clients: dict[WebSocket, dict] = {}
+_ws_broadcast_task: asyncio.Task | None = None
+# Last serialized frame + its monotonic stamp, replayed to a newly-connected
+# socket so a fresh tab paints without waiting a full poll interval.
+_ws_last_frame: tuple[float, str] | None = None
+# A stalled send must not hold up the shared broadcast cycle indefinitely.
+_WS_SEND_TIMEOUT_S = 10.0
+
+
+# When the exchange rate-limits a build, sit out this many EXTRA poll periods
+# before the next one — hammering a throttled API prolongs the throttle, and
+# clients keep their last frame + staleness cue in the meantime.
+_WS_RATE_LIMIT_EXTRA_CYCLES = 2
+
+
+async def _ws_build_frame() -> tuple[str, float]:
+    """One dashboard snapshot serialized once for every socket, plus extra
+    cooldown seconds (0 normally; >0 after an upstream rate limit). Errors
+    become a sanitized {'type':'error'} frame (the client keeps its last rows
+    and flags the feed) — never internal exception text or the raw envelope."""
+    cooldown = 0.0
+    try:
+        data = await build_dashboard()
+    except dma_client.DMAError as exc:
+        if isinstance(exc.detail, dict):
+            logger.warning("upstream DMA error in ws feed: %s", exc.detail)
+        if dma_client.is_rate_limit(exc):
+            cooldown = settings.POLL_INTERVAL * _WS_RATE_LIMIT_EXTRA_CYCLES
+            logger.warning("ws feed: upstream rate limit — backing off %.0fs extra", cooldown)
+        data = {"type": "error", "error": _upstream_error_message(exc.detail)}
+    except Exception:  # defensive: keep the feed alive
+        logger.exception("dashboard build failed")
+        data = {"type": "error", "error": "dashboard refresh failed"}
+    # allow_nan=False turns the "invalid JSON the browser silently drops"
+    # failure mode into a loud, caught-by-the-broadcaster exception; it cannot
+    # fire in practice because build_dashboard strips non-finite floats.
+    return json.dumps(data, allow_nan=False), cooldown
+
+
+async def _ws_send_frame(websocket: WebSocket, user: dict, payload: str) -> None:
+    """Deliver one frame to one socket; evict superseded sessions with 1008 so
+    the tab redirects itself to /login. A dead/stalled socket is dropped rather
+    than allowed to delay the next shared broadcast cycle."""
+    if not auth.is_active_session(user.get("r"), user.get("sid")):
+        _ws_clients.pop(websocket, None)
+        try:
+            await websocket.close(code=1008)
+        except Exception:
+            pass
+        return
+    try:
+        await asyncio.wait_for(websocket.send_text(payload), _WS_SEND_TIMEOUT_S)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Normal for an abruptly-closed tab (send after close raises RuntimeError,
+        # not WebSocketDisconnect); the handler's receive() unregisters it too —
+        # pop here as well so a stalled-but-open socket can't stall every cycle.
+        _ws_clients.pop(websocket, None)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+async def _ws_broadcaster() -> None:
+    """Shared poll loop: one build_dashboard per POLL_INTERVAL, fanned out to all
+    connected sockets in parallel. Exits when the last client disconnects (the
+    next connection starts a fresh task)."""
+    global _ws_last_frame
+    while _ws_clients:
+        # Per-iteration guard: this task is now the ONE feed for every open tab,
+        # and nothing restarts it until a new connection arrives — so no cycle
+        # failure, however unexpected, may be allowed to kill the loop.
+        cooldown = 0.0
+        try:
+            payload, cooldown = await _ws_build_frame()
+            _ws_last_frame = (time.monotonic(), payload)
+            # Snapshot the registry: sends may evict entries while we iterate.
+            await asyncio.gather(
+                *(_ws_send_frame(ws, user, payload) for ws, user in list(_ws_clients.items())),
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("ws broadcast cycle failed; feed continues next cycle")
+        await asyncio.sleep(settings.POLL_INTERVAL + cooldown)
+
+
+def _ensure_ws_broadcaster() -> None:
+    """Start the shared poller if it isn't running. Registration happens before
+    this call and only at await boundaries, so the loop's emptiness check can
+    never miss a just-added client."""
+    global _ws_broadcast_task
+    if _ws_broadcast_task is None or _ws_broadcast_task.done():
+        _ws_broadcast_task = asyncio.create_task(_ws_broadcaster())
 
 
 @app.websocket("/ws")
@@ -1100,45 +1498,34 @@ async def ws_feed(websocket: WebSocket):
         return
 
     await websocket.accept()
+    _ws_clients[websocket] = user
+    _ensure_ws_broadcaster()
+    # Fast first paint: replay the latest broadcast frame if it is still fresh.
+    # (A brand-new broadcaster builds its first frame immediately, and the SPA
+    # also GETs /api/dashboard on boot, so a stale replay is never needed.)
+    if _ws_last_frame is not None and (
+        time.monotonic() - _ws_last_frame[0] < settings.POLL_INTERVAL * 2
+    ):
+        try:
+            await websocket.send_text(_ws_last_frame[1])
+        except Exception:
+            pass
     try:
         while True:
-            # If this session was superseded by a newer same-role login, close
-            # with 1008 so the (now evicted) tab redirects itself to /login.
-            if not auth.is_active_session(user.get("r"), user.get("sid")):
-                await websocket.close(code=1008)
-                return
-            try:
-                data = await build_dashboard()
-            except dma_client.DMAError as exc:
-                data = {"type": "error", "error": str(exc.detail)}
-            except Exception as exc:  # defensive: keep the socket alive
-                logger.exception("dashboard build failed")
-                data = {"type": "error", "error": str(exc)}
-            # Re-check RIGHT BEFORE sending: build_dashboard can take up to ~20s,
-            # and the session may have been evicted in that window — don't push a
-            # final account-data frame to an already-superseded socket.
-            if not auth.is_active_session(user.get("r"), user.get("sid")):
-                await websocket.close(code=1008)
-                return
-            await websocket.send_json(data)
-            await asyncio.sleep(settings.POLL_INTERVAL)
+            # The browser never sends application data; this parks the handler
+            # until the socket closes (client-side, or by the broadcaster on
+            # eviction), at which point receive raises WebSocketDisconnect.
+            await websocket.receive_text()
     except WebSocketDisconnect:
         return
-    except RuntimeError as exc:
-        # A client that vanishes WHILE a send is in flight surfaces as a
-        # RuntimeError ("Cannot call send once a close message has been sent"),
-        # not WebSocketDisconnect — a normal disconnect, not a server fault. A
-        # genuine RuntimeError from build_dashboard is already caught inside the
-        # loop, so this is the send-side close: return quietly (debug only) so it
-        # doesn't spam stderr as a red "error" on every abrupt tab close.
-        logger.debug("websocket closed during send: %s", exc)
-        return
     except Exception:
-        logger.exception("websocket loop error")
+        logger.exception("websocket receive loop error")
         try:
             await websocket.close()
         except Exception:
             pass
+    finally:
+        _ws_clients.pop(websocket, None)
 
 
 class NoCacheStaticFiles(StaticFiles):

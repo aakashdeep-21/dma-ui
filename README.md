@@ -13,33 +13,57 @@ All credentials live in environment variables.
 
 - 🔐 **Username/password login** with two roles:
   - **admin** — full trading (place market/limit orders, cancel, cancel-all,
-    set leverage, close positions)
+    set leverage, close positions fully or partially)
   - **viewer** — read-only (positions, open orders, live PnL, equity)
 - 📈 **Live dashboard** over WebSocket: total unrealised PnL, per-position PnL,
-  open orders, wallet equity — auto-updating every few seconds.
-- 🧮 **Order panel** (admin): market / limit orders, reduce-only, close button.
-- ⚙️ **Set leverage** per symbol (admin).
+  open orders, wallet equity — one shared server-side poll, fanned out to every
+  connected tab every few seconds.
+- 🧮 **Docked order ticket** (admin): market / limit orders, size by quantity or
+  by margin (%-of-balance presets, real account leverage), attached TP/SL,
+  reduce-only, live order-book ladder with click-to-fill, instrument spec strip.
+- ✂️ **Partial close**: close 25 / 50 / 75 / 100% of a position — the server
+  re-derives the live size and floors the slice to the instrument's lot step.
+- 🕯️ **Live candlestick charts** (public Bybit klines via a whitelisted,
+  unsigned proxy — see the region note below).
+- 🗄️ **History tab backed by MongoDB**: a background sync mirrors executions and
+  closed PnL into Mongo every minute (cursor-free, time-windowed); the UI reads
+  only the mirror, with range presets / custom dates / overall, an equity curve,
+  win-rate and fee analytics, and a "last synced" freshness cue.
+- 🔔 **Telegram alerts** (opt-in): order fills, TP/SL executions, liquidations —
+  plus an operational alert if the history sync wedges.
+- 👁️ **Privacy toggle** (masks account figures) and a **USDT/INR display lens**
+  (read-only views convert at a configured `INR_RATE`; every write surface stays
+  USDT — nothing sent to the exchange is ever converted).
+- ⚙️ **Account controls** (admin): leverage, margin mode, funds transfer (with
+  client-owned idempotency keys and positive success confirmation).
 - 🔒 Keys stay server-side; requests are Ed25519-signed in the backend.
 
 ## Tech
 
-Single **FastAPI** service (Python). Serves the static frontend, proxies +
-signs all DMA calls, and streams the live feed over `/ws`. One process, one
-Railway service — nothing else to run.
+Single **FastAPI** service (Python). Serves the static frontend (vanilla JS, no
+build step), proxies + signs all DMA calls, streams the live feed over `/ws`,
+and runs the background history sync + Telegram watcher in-process. One
+process, one Railway service — the only external dependency is MongoDB for the
+history mirror.
 
 ## Project layout
 
 ```
 app/
-  main.py        FastAPI routes + WebSocket live feed
-  config.py      env-var configuration
-  signer.py      Ed25519 request signing (ported from sign_server.py)
-  dma_client.py  async CoinSwitch DMA client
-  auth.py        login + signed-cookie sessions + roles
-  static/        login.html, index.html, app.js, styles.css
-requirements.txt
+  main.py          FastAPI routes, auth gates, WebSocket broadcast feed
+  config.py        env-var configuration
+  signer.py        Ed25519 request signing
+  dma_client.py    async CoinSwitch DMA client (+ windowed history fetching)
+  auth.py          login + signed-cookie sessions + per-role single session
+  db.py            MongoDB access layer (history mirror)
+  history_sync.py  background sync: exchange history -> MongoDB (every minute)
+  notifier.py      Telegram execution alerts + operational alerts (opt-in)
+  market_data.py   public kline proxy for the charts (unsigned, whitelisted)
+  static/          login.html, index.html, app.js, styles.css
+tests/             pytest suite (+ tests/test_snap.mjs money-math regression)
+requirements.txt / requirements-dev.txt
 Procfile / railway.json   start command for Railway
-.env.example   all required environment variables
+.env.example   all environment variables, documented
 ```
 
 ## Deploy on Railway
@@ -54,17 +78,37 @@ Procfile / railway.json   start command for Railway
    - `VIEWER_USERNAME`, `VIEWER_PASSWORD`
    - `SESSION_SECRET` (a long random string —
      `python -c "import secrets;print(secrets.token_hex(32))"`)
+   - `TRADE_TOKEN` (second secret gating every write; unset = writes disabled)
+   - `MONGO_URI` (+ `MONGO_USERNAME`/`MONGO_PASSWORD`, `MONGO_DB_NAME`, and one
+     of `MONGO_TLS_CA_FILE`/`MONGO_TLS_CA_PEM`) for the history mirror
    - optional: `DMA_BASE_URL`, `CATEGORY`, `SETTLE_COIN`, `ACCOUNT_TYPE`,
-     `POLL_INTERVAL`
+     `POLL_INTERVAL`, `INR_RATE`, `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`,
+     `SYNC_INTERVAL_SECONDS`, `SYNC_BACKFILL_DAYS`, `TRUSTED_PROXY_HOPS`,
+     `CHART_SYMBOLS` — every variable is documented in `.env.example`
 4. Railway gives the service a public URL. Open it → log in.
 
 > `$PORT` is provided by Railway automatically; the start command already
 > binds to it.
 
+> **Region note:** the Live Charts use Bybit's public kline API, which is
+> geo-blocked from US hosts. Deploy in a non-US region (Singapore confirmed
+> working); the signed DMA endpoints are unaffected either way.
+
 ### Health check
 
-`GET /healthz` returns whether all required env vars are configured — useful to
-verify the deployment before logging in.
+`GET /healthz` returns whether all required env vars are configured, plus
+`historySyncAgeSeconds` per history collection — seconds since each Mongo
+mirror last completed a sync (normally under ~2× `SYNC_INTERVAL_SECONDS`; a
+climbing value means the sync is wedged and the History tab is going stale).
+
+### Running the tests
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest -q                      # backend suite
+node --check app/static/app.js # frontend syntax
+node tests/test_snap.mjs       # money-math regression
+```
 
 ## Run locally
 
@@ -103,6 +147,21 @@ by **three independent gates**:
 
 Submit buttons are also disabled while a write is in flight to prevent
 accidental double-submission.
+
+**Audit trail:** every write (and every login attempt) emits one JSON line on
+the `dma-ui.audit` logger — action, user, role, client IP, the sanitized
+outbound body, and the outcome (exchange orderId / txn id, or the rejection).
+It answers "who did what, from where, and what did the exchange say" after any
+incident; secrets never appear in it. Lines go to stdout, so Railway retains
+them with the app logs.
+
+**Ambiguous order timeouts:** if the exchange does not answer an order
+submission (network timeout / gateway 5xx), the error explicitly warns that the
+order **may still have been placed** and to check Open Orders before retrying —
+a blind resubmit is the classic double-execution mistake. Optionally set
+`SEND_ORDER_LINK_ID=1` (after one live verification — see `.env.example`) to
+tag every order with a server-generated id that the error message and audit log
+reference.
 
 ## Security notes
 
@@ -146,13 +205,17 @@ both roles; writes are **admin-only** (the viewer gets `403`).
 
 **Reads** (dashboard + API Explorer): wallet balance, withdrawable amount,
 account info, server time, open positions, open orders, instruments info,
-tickers, order book, closed PnL, trades/execution history.
+tickers, order book, closed PnL, trades/execution history. Closed PnL and
+executions are served from the **MongoDB mirror** (kept fresh by the in-process
+sync); every other read hits the exchange live.
 
-**Writes** (admin panel): create order (market/limit, with optional attached
-take-profit / stop-loss), set TP/SL on an existing position
+**Writes** (admin panel): create order (market/limit, optional attached
+take-profit / stop-loss, optional time-in-force — GTC/IOC/FOK/Post-Only on
+limit orders), set TP/SL on an existing position
 (`/v5/position/trading-stop`, Full mode, positionIdx re-derived from the live
-position), cancel order, cancel-all, close position, set leverage, set margin
-mode, transfer funds.
+position), cancel order, amend (cancel + edit in the ticket), cancel-all,
+close position (fully, or a 25/50/75% slice — size re-derived live and floored
+to the lot step server-side), set leverage, set margin mode, transfer funds.
 
 **Projected PnL at TP/SL:** Bybit exposes no projected-PnL field, so it is
 computed client-side as `(exit − entry) × size` (linear; sign-flipped for
@@ -180,5 +243,8 @@ symbol) and renders the result as a **formatted table** (with a collapsible
 The DMA collection is REST-only (no exchange WebSocket). The backend therefore
 polls `/v5/position/list`, `/v5/order/realtime` and `/v5/account/wallet-balance`
 every `POLL_INTERVAL` seconds (default 5) and pushes the aggregated snapshot to
-all connected browsers over `/ws`. Unrealised PnL comes from the position
-feed's `unrealisedPnl` (mark-price based).
+all connected browsers over `/ws`. The poll is **shared**: one snapshot per
+interval is built and fanned out to every connected tab, so the upstream cost
+stays constant no matter how many dashboards are open (and drops to zero when
+none are). Unrealised PnL comes from the position feed's `unrealisedPnl`
+(mark-price based).
