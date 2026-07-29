@@ -296,6 +296,9 @@ function snapToStep(value, step) {
 // ONLY the displayed projected-PnL estimate — never an order/TP/SL we send.
 // If the account's fee tier changes, update this value.
 const TAKER_FEE_RATE = 0.00035; // 0.035%
+// Maker tier for the same account (see the taker note above). Used ONLY for
+// the entry-fee estimate in the ticket — never in anything sent to the venue.
+const MAKER_FEE_RATE = 0.00014; // 0.014%
 
 // Returns { net, gross, exitFee, roi } or null if inputs are incomplete.
 // roi is null when leverage is unknown (e.g. the order form).
@@ -788,7 +791,7 @@ function renderPositions(positions) {
         ["Updated", fmtTime(p.updatedTime)],
       ]);
 
-      return `<tr class="exp-row${expanded ? " expanded" : ""}" data-pkey="${esc(key)}" role="button" tabindex="0" aria-expanded="${expanded}">
+      return `<tr class="exp-row${expanded ? " expanded" : ""}${(p.side || "").toLowerCase() === "buy" ? " side-buy" : " side-sell"}" data-pkey="${esc(key)}" role="button" tabindex="0" aria-expanded="${expanded}">
         <td class="mono card-head"><span class="caret">${expanded ? "▾" : "▸"}</span>${esc(p.symbol)}</td>
         <td data-label="Side" class="side-cell ${(p.side || "").toLowerCase() === "buy" ? "pos" : "neg"}">${esc(p.side)}</td>
         <td data-label="Size" class="mono priv">${fmtNum(p.size, 4)}</td>
@@ -879,7 +882,7 @@ function renderOrders(orders) {
         ["Updated", fmtTime(o.updatedTime)],
       ]);
 
-      return `<tr class="exp-row${expanded ? " expanded" : ""}" data-okey="${esc(key)}" role="button" tabindex="0" aria-expanded="${expanded}">
+      return `<tr class="exp-row${expanded ? " expanded" : ""}${(o.side || "").toLowerCase() === "buy" ? " side-buy" : " side-sell"}" data-okey="${esc(key)}" role="button" tabindex="0" aria-expanded="${expanded}">
         <td class="mono card-head"><span class="caret">${expanded ? "▾" : "▸"}</span>${esc(o.symbol)}</td>
         <td data-label="Side" class="side-cell ${(o.side || "").toLowerCase() === "buy" ? "pos" : "neg"}">${esc(o.side)}</td>
         <td data-label="Type">${esc(o.orderType)}${badges}</td>
@@ -1729,6 +1732,15 @@ function wireAdminForms() {
         parts.push(`${fmtNum(notional)} ${esc(settleCoin())} notional${estimate ? " (at market)" : ""}`);
         // Margin figure only when the real leverage is known (never shown against a guess).
         if (!reduceOnly && lev > 0) parts.push(`margin ≈ <b>${fmtNum(notional / lev)}</b> ${esc(settleCoin())} <span class="muted">(${lev}×)</span>`);
+        // Entry-fee estimate: a market order pays taker; a limit can fill either
+        // side, so show the maker–taker band (Post-Only pins it to maker).
+        if (orderForm.orderType.value === "Market") {
+          parts.push(`fee ≈ ${fmtNum(notional * TAKER_FEE_RATE, 4)}`);
+        } else if (orderForm.timeInForce && orderForm.timeInForce.value === "PostOnly") {
+          parts.push(`fee ≈ ${fmtNum(notional * MAKER_FEE_RATE, 4)} <span class="muted">(maker)</span>`);
+        } else {
+          parts.push(`fee ≈ ${fmtNum(notional * MAKER_FEE_RATE, 4)}–${fmtNum(notional * TAKER_FEE_RATE, 4)}`);
+        }
         orderNotional.innerHTML = parts.join('<span class="sep">·</span>');
       } else if (marginMode && marginTyped > 0 && !(entryNum > 0)) {
         orderNotional.innerHTML = `<span class="warn">enter a limit price (or wait for the market price) to size by margin</span>`;
@@ -2480,14 +2492,19 @@ function wireTabs() {
   // Arrow/Home/End roving expected of a tablist. Viewer-hidden tabs are removed
   // from the DOM (loadMe), so the live NodeList is already the reachable set.
   tabs.addEventListener("keydown", (e) => {
-    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+    // Up/Down mirror Left/Right: the nav renders as a VERTICAL rail on desktop
+    // (aria-orientation=vertical) and horizontal on mobile — support both axes.
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(e.key)) return;
     const list = Array.from(tabs.querySelectorAll(".tab"));
     if (!list.length) return;
     const cur = list.indexOf(document.activeElement);
     let idx;
     if (e.key === "Home") idx = 0;
     else if (e.key === "End") idx = list.length - 1;
-    else idx = ((cur < 0 ? 0 : cur) + (e.key === "ArrowRight" ? 1 : -1) + list.length) % list.length;
+    else {
+      const fwd = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : -1;
+      idx = ((cur < 0 ? 0 : cur) + fwd + list.length) % list.length;
+    }
     e.preventDefault();
     show(list[idx].dataset.tab, true);
   });
@@ -3110,6 +3127,16 @@ function svgAreaChart(values, opts = {}) {
     `<circle cx="${x(values.length - 1).toFixed(1)}" cy="${y(end).toFixed(1)}" r="2.6" style="fill:${col}"/></svg>`;
 }
 
+// Compact human duration for the journal's holding-time stat.
+function fmtDuration(ms) {
+  if (!isFinite(ms) || ms <= 0) return "—";
+  const m = Math.round(ms / 60000);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}h ${m % 60}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
 function renderHistoryAnalytics(closedList, fees, makerCount, takerCount) {
   const el = document.getElementById("history-analytics");
   if (!el) return;
@@ -3119,6 +3146,14 @@ function renderHistoryAnalytics(closedList, fees, makerCount, takerCount) {
   if (!list.length) { el.hidden = true; el.innerHTML = ""; return; }
   let cum = 0;
   let curve = list.map((r) => (cum += Number(r.closedPnl) || 0));
+  // Max drawdown over the FULL cumulative series (before any downsampling):
+  // deepest fall from a running equity peak, baseline 0.
+  let peak = 0, maxDD = 0;
+  curve.forEach((v) => {
+    if (v > peak) peak = v;
+    const dd = peak - v;
+    if (dd > maxDD) maxDD = dd;
+  });
   // Downsample very long curves: a 10k-point SVG path janks layout for zero
   // visual gain in a ~320px-wide chart. Cumulative values are computed over
   // the FULL list first, so sampling changes resolution, never the shape/end.
@@ -3142,6 +3177,22 @@ function renderHistoryAnalytics(closedList, fees, makerCount, takerCount) {
   const flow = grossWin + grossLossAbs;
   const posPct = flow > 0 ? (grossWin / flow) * 100 : 0;
 
+  // --- Journal statistics (all derived from the already-fetched list) ---
+  const pnls = list.map((r) => Number(r.closedPnl) || 0);
+  const profitFactor = grossLossAbs > 0 ? grossWin / grossLossAbs : (grossWin > 0 ? Infinity : 0);
+  const expectancy = total / list.length;      // mean net PnL per closed trade
+  const avgWin = wins ? grossWin / wins : 0;
+  const avgLoss = losses ? grossLoss / losses : 0; // ≤ 0 by construction
+  const largestWin = Math.max(0, ...pnls);
+  const largestLoss = Math.min(0, ...pnls);
+  // Holding time: closed-pnl rows carry createdTime (open) + updatedTime (close).
+  let holdSum = 0, holdN = 0;
+  list.forEach((r) => {
+    const a = Number(r.createdTime), b = Number(r.updatedTime);
+    if (isFinite(a) && isFinite(b) && b > a) { holdSum += b - a; holdN++; }
+  });
+  const avgHoldMs = holdN ? holdSum / holdN : NaN;
+
   const coin = curUnit();
   const feeStr = fees != null && isFinite(fees) ? `${fmtMoney(fees)} ${coin}` : "—";
   const mt = (makerCount != null && takerCount != null) ? `${makerCount} / ${takerCount}` : "—";
@@ -3161,7 +3212,26 @@ function renderHistoryAnalytics(closedList, fees, makerCount, takerCount) {
       `<div class="posneg-bar" role="img" aria-label="${posPct.toFixed(0)}% of booked PnL is profit"><span class="p" style="width:${posPct.toFixed(1)}%"></span><span class="n" style="width:${(100 - posPct).toFixed(1)}%"></span></div>` +
       `<div class="figrow"><span class="k">Fees (maker/taker)</span><span class="v priv">${esc(mt)}</span></div>` +
       `<div class="figrow"><span class="k">Total fees</span><span class="v priv neg">${esc(feeStr)}</span></div>` +
+    `</div>` +
+    // Journal tiles: the derived performance statistics a trading journal is
+    // expected to carry. Every value is money-derived, so all are `priv`.
+    `<div class="journal-grid">` +
+      jTile("Profit factor", profitFactor === Infinity ? "∞" : profitFactor.toFixed(2),
+        profitFactor >= 1 ? "pos" : "neg") +
+      jTile("Expectancy / trade", `${fmtMoneySigned(expectancy)}`, pnlClass(expectancy)) +
+      jTile("Avg win", fmtMoneySigned(avgWin), "pos") +
+      jTile("Avg loss", fmtMoneySigned(avgLoss), "neg") +
+      jTile("Largest win", fmtMoneySigned(largestWin), "pos") +
+      jTile("Largest loss", fmtMoneySigned(largestLoss), "neg") +
+      jTile("Max drawdown", fmtMoneySigned(-maxDD), maxDD > 0 ? "neg" : "flat") +
+      jTile("Avg hold time", esc(fmtDuration(avgHoldMs)), "flat") +
     `</div>`;
+}
+
+// One journal statistic tile (label + masked value). Values arrive from fmt*
+// helpers (plain text) or pre-escaped strings — never raw exchange data.
+function jTile(label, value, cls) {
+  return `<div class="j-tile"><div class="k">${esc(label)}</div><div class="v priv ${cls || ""}">${value}</div></div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -3371,6 +3441,11 @@ function parseKline(data) {
   return out;
 }
 
+// Horizontal plot geometry shared by renderCandles AND the crosshair
+// hit-testing — one source so hover→candle mapping can never drift from
+// what is actually drawn.
+const CC_GEOM = { W: 600, L: 6, R: 6 };
+
 // Hand-drawn candlestick SVG + right-hand price scale. Inputs are coerced
 // NUMBERS only — no exchange string ever reaches innerHTML here, so this is
 // XSS-safe by construction (the price-scale labels go through fmtNum).
@@ -3397,7 +3472,8 @@ function renderCandles(svg, axisEl, timeEl, candles, dp) {
   // the element box): W/H = viewBox size; L/R/T/B = inner padding; volH = bottom
   // volume-strip height; gap = price↔volume separation. The price band is the
   // vertical range [T, priceBottom]; the volume bars sit below it.
-  const W = 600, H = 210, L = 6, R = 6, T = 10, B = 6, volH = 34, gap = 8;
+  const { W, L, R } = CC_GEOM;
+  const H = 210, T = 10, B = 6, volH = 34, gap = 8;
   const priceBottom = H - B - volH - gap;
   let min = Infinity, max = -Infinity, maxV = 0;
   candles.forEach((c) => {
@@ -3477,6 +3553,7 @@ function chartCardHTML(sm, suffix) {
     `<div class="cc-chart${suffix === "single" ? " lg" : ""}">` +
       `<svg class="cs" id="cs-${suffix}" viewBox="0 0 600 210" preserveAspectRatio="none" role="img" aria-label="${esc(sm.label)} candlesticks"></svg>` +
       `<div class="cc-axis" id="cax-${suffix}"></div>` +
+      `<div class="cc-cross" id="ccx-${suffix}" hidden></div>` +
     `</div>` +
     `<div class="cc-times" id="ctime-${suffix}"></div>` +
     `<div class="cc-foot"><span id="cfoot-${suffix}">—</span><span class="muted" id="civ-${suffix}"></span></div>`
@@ -3510,6 +3587,55 @@ function buildChartDom() {
   if (single && !single.children.length) {
     single.innerHTML = `<div class="cc-card">${chartCardHTML(chartSymById(chartState.single), "single")}</div>`;
   }
+  // Crosshair wiring — once per card (the shells are built once).
+  if (grid && !grid.dataset.crossWired) {
+    grid.dataset.crossWired = "1";
+    CHART_SYMBOLS.forEach((s) => wireChartCrosshair(s.id, () => s.id));
+  }
+  if (single && !single.dataset.crossWired) {
+    single.dataset.crossWired = "1";
+    wireChartCrosshair("single", () => chartState.loadedSingle || chartState.single);
+  }
+}
+
+// Crosshair: hovering a chart shows a vertical hairline snapped to the candle
+// under the cursor and swaps the card footer to that candle's time + OHLC.
+// Display-only: reads the already-fetched arrays, never fetches or re-renders.
+function wireChartCrosshair(suffix, symIdFn) {
+  const svg = document.getElementById(`cs-${suffix}`);
+  const cross = document.getElementById(`ccx-${suffix}`);
+  const foot = document.getElementById(`cfoot-${suffix}`);
+  if (!svg || !cross || !foot) return;
+  const chartBox = svg.parentElement; // .cc-chart (position: relative)
+  const onMove = (e) => {
+    const symId = symIdFn();
+    const sm = chartSymById(symId);
+    const arr = chartState.data[symId];
+    const rect = svg.getBoundingClientRect();
+    if (!arr || !arr.length || rect.width <= 0) { cross.hidden = true; return; }
+    const frac = (e.clientX - rect.left) / rect.width;
+    if (frac < 0 || frac > 1) { cross.hidden = true; return; }
+    const n = arr.length;
+    const step = (CC_GEOM.W - CC_GEOM.L - CC_GEOM.R) / n;
+    let idx = Math.floor((frac * CC_GEOM.W - CC_GEOM.L) / step);
+    idx = Math.max(0, Math.min(n - 1, idx));
+    const c = arr[idx];
+    // Snap the hairline to the hovered candle's centre, in on-screen pixels.
+    const xc = CC_GEOM.L + (idx + 0.5) * step;
+    const boxRect = chartBox.getBoundingClientRect();
+    cross.style.left = ((rect.left - boxRect.left) + (xc / CC_GEOM.W) * rect.width).toFixed(1) + "px";
+    cross.hidden = false;
+    foot.dataset.hover = "1"; // freeze the periodic H/L repaint while inspecting
+    foot.textContent =
+      `${fmtClock(c.t)}  O ${fmtNum(c.o, sm.dp)}  H ${fmtNum(c.h, sm.dp)}  L ${fmtNum(c.l, sm.dp)}  C ${fmtNum(c.c, sm.dp)}`;
+  };
+  const onLeave = () => {
+    cross.hidden = true;
+    delete foot.dataset.hover;
+    updateChartHeader(chartSymById(symIdFn()), suffix); // restore the H/L line
+  };
+  chartBox.addEventListener("mousemove", onMove);
+  chartBox.addEventListener("mouseleave", onLeave);
 }
 
 function updateChartHeader(sm, suffix) {
@@ -3536,7 +3662,11 @@ function updateChartHeader(sm, suffix) {
   let hi = -Infinity, lo = Infinity;
   arr.forEach((c) => { if (c.h > hi) hi = c.h; if (c.l < lo) lo = c.l; });
   const footEl = document.getElementById(`cfoot-${suffix}`);
-  if (footEl) footEl.textContent = `H ${fmtNum(hi, sm.dp)}  L ${fmtNum(lo, sm.dp)}`;
+  // While the crosshair is inspecting a candle, its OHLC readout owns the
+  // footer — don't let the periodic repaint stomp it mid-hover.
+  if (footEl && footEl.dataset.hover !== "1") {
+    footEl.textContent = `H ${fmtNum(hi, sm.dp)}  L ${fmtNum(lo, sm.dp)}`;
+  }
   const ivEl = document.getElementById(`civ-${suffix}`);
   // Label from the interval the on-screen data was fetched with (not the freshly
   // selected one) so the footer can never describe candles it doesn't show.
@@ -3685,6 +3815,20 @@ function wireCharts() {
     startChartPolling();
   });
 
+  // Fullscreen: the whole charts panel becomes a fixed overlay (Esc exits).
+  // Pure CSS-class toggle; polling/rendering are untouched and keep running.
+  const expandBtn = document.getElementById("chart-expand");
+  if (expandBtn) {
+    const setFull = (on) => {
+      panel.classList.toggle("chart-full", on);
+      expandBtn.setAttribute("aria-pressed", String(on));
+    };
+    expandBtn.addEventListener("click", () => setFull(!panel.classList.contains("chart-full")));
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && panel.classList.contains("chart-full")) setFull(false);
+    });
+  }
+
   // Pause polling when the browser tab is backgrounded; resume when visible.
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) stopChartPolling();
@@ -3692,6 +3836,118 @@ function wireCharts() {
   });
 
   startChartPolling();
+}
+
+// ---------------------------------------------------------------------------
+// Command palette (Ctrl/Cmd + K) — navigation & display actions ONLY. Every
+// action just .click()s an existing on-screen control, so no new code path
+// can ever reach a write endpoint; the standing rule that no keyboard
+// shortcut trades is preserved by construction.
+// ---------------------------------------------------------------------------
+function wireCommandPalette() {
+  const overlay = document.getElementById("cmdk-overlay");
+  const input = document.getElementById("cmdk-input");
+  const listEl = document.getElementById("cmdk-list");
+  if (!overlay || !input || !listEl) return;
+  let items = [];
+  let sel = 0;
+  let prevFocus = null;
+
+  // Built fresh at each open/keystroke from the CURRENT DOM, so viewer-removed
+  // controls (admin tabs, the ticket) never appear for a viewer session.
+  const buildActions = () => {
+    const acts = [];
+    document.querySelectorAll("#tabs .tab").forEach((b) => {
+      const label = (b.textContent || "").replace(/\s+/g, " ").trim();
+      acts.push({ label: `Go to ${label}`, hint: "nav", run: () => b.click() });
+    });
+    if (document.getElementById("order-form")) {
+      acts.push({
+        label: "Focus order ticket", hint: "/",
+        run: () => {
+          const pane = document.querySelector('[data-pane="dashboard"]');
+          const dashTab = document.querySelector('#tabs .tab[data-tab="dashboard"]');
+          if (pane && pane.hidden && dashTab) dashTab.click();
+          const f = document.getElementById("order-form");
+          try { f.symbol.focus(); f.symbol.select(); } catch (e) {}
+        },
+      });
+    }
+    acts.push({
+      label: "Toggle privacy mode", hint: "display",
+      run: () => { const b = document.getElementById("privacy-toggle"); if (b) b.click(); },
+    });
+    document.querySelectorAll("#ccy-toggle button").forEach((b) => {
+      acts.push({ label: `Display currency: ${b.dataset.ccy}`, hint: "display", run: () => b.click() });
+    });
+    const expand = document.getElementById("chart-expand");
+    if (expand) acts.push({ label: "Expand / collapse charts", hint: "esc exits", run: () => expand.click() });
+    [["markets-refresh", "Refresh markets"], ["history-refresh", "Refresh journal"],
+     ["account-refresh", "Refresh account"]].forEach(([id, label]) => {
+      const b = document.getElementById(id);
+      if (b) acts.push({ label, hint: "read-only", run: () => b.click() });
+    });
+    const logout = document.getElementById("logout-btn");
+    if (logout) acts.push({ label: "Log out", hint: "session", run: () => logout.click() });
+    return acts;
+  };
+
+  const paint = () => {
+    const q = input.value.trim().toLowerCase();
+    items = buildActions().filter((a) => !q || a.label.toLowerCase().includes(q));
+    sel = Math.min(sel, Math.max(0, items.length - 1));
+    listEl.innerHTML = items.length
+      ? items.map((a, i) =>
+          `<div class="cmdk-item${i === sel ? " sel" : ""}" role="option" aria-selected="${i === sel}" data-i="${i}">` +
+          `<span>${esc(a.label)}</span><span class="hint">${esc(a.hint)}</span></div>`
+        ).join("")
+      : `<div class="cmdk-empty">No matching command</div>`;
+  };
+
+  const close = () => {
+    overlay.hidden = true;
+    input.value = "";
+    restoreFocus(prevFocus);
+  };
+  const open = () => {
+    // Never stack over a live trade dialog — those own the keyboard.
+    const confirmOv = document.getElementById("confirm-overlay");
+    const tpslOv = document.getElementById("tpsl-overlay");
+    if ((confirmOv && !confirmOv.hidden) || (tpslOv && !tpslOv.hidden)) return;
+    prevFocus = document.activeElement;
+    sel = 0;
+    overlay.hidden = false;
+    paint();
+    input.focus();
+  };
+  const runSelected = () => {
+    const action = items[sel];
+    close();
+    if (action) action.run();
+  };
+
+  document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && String(e.key).toLowerCase() === "k") {
+      e.preventDefault();
+      if (overlay.hidden) open(); else close();
+    }
+  });
+  const hintBtn = document.getElementById("cmdk-hint");
+  if (hintBtn) hintBtn.addEventListener("click", open);
+  input.addEventListener("input", () => { sel = 0; paint(); });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); close(); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); sel = Math.min(sel + 1, items.length - 1); paint(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); sel = Math.max(sel - 1, 0); paint(); }
+    else if (e.key === "Enter") { e.preventDefault(); runSelected(); }
+  });
+  listEl.addEventListener("click", (e) => {
+    const it = e.target.closest(".cmdk-item[data-i]");
+    if (!it) return;
+    sel = Number(it.dataset.i);
+    runSelected();
+  });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
 }
 
 // ---------------------------------------------------------------------------
@@ -3734,6 +3990,7 @@ document.addEventListener("keydown", (e) => {
   wireTabs();
   wireMarketsHistory();
   wireCharts(); // live candlestick charts (read-only; polls while dashboard visible)
+  wireCommandPalette(); // Ctrl/Cmd+K — navigation & display actions only
   wirePrivacyToggle(); // restore saved privacy state BEFORE the first render (no flash)
   wireCurrencyToggle(); // restore saved currency BEFORE the first render
   renderLoading(); // skeleton rows until the first snapshot lands

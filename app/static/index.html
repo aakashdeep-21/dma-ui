@@ -9,419 +9,436 @@
 </head>
 <body>
   <a href="#main" class="skip-link">Skip to content</a>
-  <div class="sticky-top">
-    <header class="topbar">
-      <div class="brand">
+
+  <div class="shell">
+    <!-- ================= LEFT NAV RAIL ================= -->
+    <aside class="side" aria-label="Primary">
+      <div class="side-brand" title="DMA Terminal">
         <span class="brand-dot"></span>
-        <strong>DMA Terminal</strong>
-        <span id="scope-chip" class="scope-chip" title="Settlement coin for the displayed account"></span>
+        <span class="side-brand-name">DMA</span>
       </div>
-      <div class="topbar-stats">
-        <div class="stat stat-primary">
-          <span class="stat-label">Unrealised PnL</span>
-          <span class="stat-value priv" id="stat-pnl">—</span>
-          <span class="stat-sub priv" id="stat-pnl-pct"></span>
-        </div>
-        <div class="stat stat-primary">
-          <span class="stat-label" title="Maintenance margin ÷ margin balance. Higher = closer to liquidation.">Margin Ratio</span>
-          <span class="stat-value priv" id="stat-margin-ratio">—</span>
-          <span class="meter" id="margin-meter" role="img" aria-label="Margin ratio"><span style="width:0%"></span></span>
-        </div>
-        <div class="stat">
-          <span class="stat-label">Equity</span>
-          <span class="stat-value priv" id="stat-equity">—</span>
-          <span class="stat-sub priv" id="stat-available"></span>
-        </div>
-        <div class="stat">
-          <span class="stat-label">Margin Used</span>
-          <span class="stat-value priv" id="stat-margin-used">—</span>
-        </div>
-        <div class="stat stat-chip">
-          <span class="stat-label">Positions</span>
-          <span class="stat-value priv" id="stat-positions">—</span>
-        </div>
-        <div class="stat stat-chip">
-          <span class="stat-label">Open Orders</span>
-          <span class="stat-value priv" id="stat-orders">—</span>
-        </div>
-      </div>
-      <div class="topbar-right">
-        <div class="ccy-toggle segment" id="ccy-toggle" role="group" aria-label="Display currency">
-          <button type="button" data-ccy="USDT" class="seg-neutral active" aria-pressed="true">USDT</button>
-          <button type="button" data-ccy="INR" class="seg-neutral" aria-pressed="false">INR</button>
-        </div>
-        <!-- Privacy toggle: masks account figures (balances, sizes, PnL) behind
-             **** for shoulder-surfing/screen-share. Display-only; public market
-             data stays visible and trading math is unaffected. -->
-        <button id="privacy-toggle" class="icon-btn" type="button" aria-pressed="false"
-                title="Hide account figures" aria-label="Hide account figures">
-          <svg class="icon-on" viewBox="0 0 24 24" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>
-          <svg class="icon-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+      <!-- The nav keeps its #tabs / .tab / data-tab contract: all switching,
+           roving tabindex and ARIA logic in app.js is unchanged — only the
+           presentation moved from a top bar to a vertical rail. -->
+      <nav class="tabs" id="tabs" role="tablist" aria-label="Views" aria-orientation="vertical">
+        <button class="tab active" data-tab="dashboard" role="tab" id="tab-dashboard" aria-controls="panel-dashboard" aria-selected="true" tabindex="0">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
+          <span>Trade</span>
         </button>
-        <span id="conn-status" class="conn conn-off" role="status" aria-live="polite">connecting…</span>
-        <span class="user-badge"><span id="user-name">—</span> <span id="user-role" class="role-pill"></span></span>
-        <button id="logout-btn" class="btn-ghost">Logout</button>
+        <button class="tab" data-tab="markets" role="tab" id="tab-markets" aria-controls="panel-markets" aria-selected="false" tabindex="-1">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
+          <span>Markets</span>
+        </button>
+        <button class="tab" data-tab="history" role="tab" id="tab-history" aria-controls="panel-history" aria-selected="false" tabindex="-1">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          <span>Journal</span>
+        </button>
+        <button class="tab admin-only" data-tab="account" role="tab" id="tab-account" aria-controls="panel-account" aria-selected="false" tabindex="-1">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
+          <span>Account</span>
+        </button>
+        <button class="tab" data-tab="tools" role="tab" id="tab-tools" aria-controls="panel-tools" aria-selected="false" tabindex="-1">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          <span>API</span>
+        </button>
+      </nav>
+      <div class="side-spacer"></div>
+      <button class="side-kbd" id="cmdk-hint" type="button" title="Command palette (Ctrl/Cmd + K)" aria-label="Open command palette">
+        <kbd>⌘K</kbd>
+      </button>
+    </aside>
+
+    <!-- ================= CONTENT COLUMN ================= -->
+    <div class="content">
+      <!-- .sticky-top is a JS contract: syncHeaderHeight() measures it to
+           position the sticky order rail. -->
+      <div class="sticky-top">
+        <header class="topbar">
+          <span id="scope-chip" class="scope-chip" title="Settlement coin for the displayed account"></span>
+          <div class="topbar-stats">
+            <div class="stat stat-primary">
+              <span class="stat-label">Unrealised PnL</span>
+              <span class="stat-value priv" id="stat-pnl">—</span>
+              <span class="stat-sub priv" id="stat-pnl-pct"></span>
+            </div>
+            <div class="stat-div" aria-hidden="true"></div>
+            <div class="stat stat-primary">
+              <span class="stat-label" title="Maintenance margin ÷ margin balance. Higher = closer to liquidation.">Margin Ratio</span>
+              <span class="stat-value priv" id="stat-margin-ratio">—</span>
+              <span class="meter" id="margin-meter" role="img" aria-label="Margin ratio"><span style="width:0%"></span></span>
+            </div>
+            <div class="stat-div" aria-hidden="true"></div>
+            <div class="stat">
+              <span class="stat-label">Equity</span>
+              <span class="stat-value priv" id="stat-equity">—</span>
+              <span class="stat-sub priv" id="stat-available"></span>
+            </div>
+            <div class="stat">
+              <span class="stat-label">Margin Used</span>
+              <span class="stat-value priv" id="stat-margin-used">—</span>
+            </div>
+            <div class="stat stat-chip">
+              <span class="stat-label">Pos</span>
+              <span class="stat-value priv" id="stat-positions">—</span>
+            </div>
+            <div class="stat stat-chip">
+              <span class="stat-label">Orders</span>
+              <span class="stat-value priv" id="stat-orders">—</span>
+            </div>
+          </div>
+          <div class="topbar-right">
+            <div class="ccy-toggle segment" id="ccy-toggle" role="group" aria-label="Display currency">
+              <button type="button" data-ccy="USDT" class="seg-neutral active" aria-pressed="true">USDT</button>
+              <button type="button" data-ccy="INR" class="seg-neutral" aria-pressed="false">INR</button>
+            </div>
+            <!-- Privacy toggle: masks account figures behind **** (display-only). -->
+            <button id="privacy-toggle" class="icon-btn" type="button" aria-pressed="false"
+                    title="Hide account figures" aria-label="Hide account figures">
+              <svg class="icon-on" viewBox="0 0 24 24" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>
+              <svg class="icon-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+            </button>
+            <span id="conn-status" class="conn conn-off" role="status" aria-live="polite">connecting…</span>
+            <span class="user-badge"><span id="user-name">—</span> <span id="user-role" class="role-pill"></span></span>
+            <button id="logout-btn" class="btn-ghost">Logout</button>
+          </div>
+        </header>
       </div>
-    </header>
 
-    <nav class="tabs" id="tabs" role="tablist" aria-label="Views">
-      <button class="tab active" data-tab="dashboard" role="tab" id="tab-dashboard" aria-controls="panel-dashboard" aria-selected="true" tabindex="0">Dashboard</button>
-      <button class="tab" data-tab="markets" role="tab" id="tab-markets" aria-controls="panel-markets" aria-selected="false" tabindex="-1">Markets</button>
-      <button class="tab" data-tab="history" role="tab" id="tab-history" aria-controls="panel-history" aria-selected="false" tabindex="-1">History</button>
-      <button class="tab admin-only" data-tab="account" role="tab" id="tab-account" aria-controls="panel-account" aria-selected="false" tabindex="-1">Account</button>
-      <button class="tab" data-tab="tools" role="tab" id="tab-tools" aria-controls="panel-tools" aria-selected="false" tabindex="-1">API</button>
-    </nav>
-  </div>
+      <main id="main" aria-label="Trading terminal" tabindex="-1">
+        <!-- ============ DASHBOARD / TRADE ============ -->
+        <div class="pane" data-pane="dashboard" id="panel-dashboard" role="tabpanel" aria-labelledby="tab-dashboard">
+          <div class="workspace">
+            <div class="workspace-main">
+              <section class="panel">
+                <div class="panel-head">
+                  <h2>Open Positions</h2>
+                  <span class="muted" id="positions-updated" role="status" aria-live="polite"></span>
+                </div>
+                <div class="table-wrap">
+                  <table id="positions-table" class="sortable">
+                    <thead>
+                      <tr>
+                        <th data-sortkey="symbol" data-type="str">Symbol</th>
+                        <th data-sortkey="side" data-type="str">Side</th>
+                        <th data-sortkey="size" data-type="num">Size</th>
+                        <th data-sortkey="avgPrice" data-type="num" title="Average entry price · break-even (incl. fees) below">Entry</th>
+                        <th data-sortkey="markPrice" data-type="num" title="Current mark price">Mark</th>
+                        <th data-sortkey="liqPrice" data-type="num" title="Liquidation price · proximity gauge + % distance from mark below">Liq.</th>
+                        <th data-sortkey="leverage" data-type="num">Lev</th>
+                        <th data-sortkey="positionValue" data-type="num" title="Position notional value">Value</th>
+                        <th data-sortkey="unrealisedPnl" data-type="num" title="Unrealised PnL · ROE % (PnL ÷ initial margin) below">Unrealised PnL</th>
+                        <th data-sortkey="takeProfit" data-type="num" title="Take Profit · projected net PnL below">TP</th>
+                        <th data-sortkey="stopLoss" data-type="num" title="Stop Loss · projected net PnL below">SL</th>
+                        <th class="admin-only">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody id="positions-body">
+                      <tr><td colspan="12"><span class="skel"></span></td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
 
-  <main id="main" aria-label="Trading terminal" tabindex="-1">
-    <!-- ============ DASHBOARD ============ -->
-    <div class="pane" data-pane="dashboard" id="panel-dashboard" role="tabpanel" aria-labelledby="tab-dashboard">
-      <div class="workspace">
-        <div class="workspace-main">
-          <section class="panel">
-            <div class="panel-head">
-              <h2>Open Positions</h2>
-              <span class="muted" id="positions-updated" role="status" aria-live="polite"></span>
-            </div>
-            <div class="table-wrap">
-              <table id="positions-table" class="sortable">
-                <thead>
-                  <tr>
-                    <th data-sortkey="symbol" data-type="str">Symbol</th>
-                    <th data-sortkey="side" data-type="str">Side</th>
-                    <th data-sortkey="size" data-type="num">Size</th>
-                    <th data-sortkey="avgPrice" data-type="num" title="Average entry price · break-even (incl. fees) below">Entry</th>
-                    <th data-sortkey="markPrice" data-type="num" title="Current mark price">Mark</th>
-                    <th data-sortkey="liqPrice" data-type="num" title="Liquidation price · proximity gauge + % distance from mark below">Liq.</th>
-                    <th data-sortkey="leverage" data-type="num">Lev</th>
-                    <th data-sortkey="positionValue" data-type="num" title="Position notional value">Value</th>
-                    <th data-sortkey="unrealisedPnl" data-type="num" title="Unrealised PnL · ROE % (PnL ÷ initial margin) below">Unrealised PnL</th>
-                    <th data-sortkey="takeProfit" data-type="num" title="Take Profit · projected net PnL below">TP</th>
-                    <th data-sortkey="stopLoss" data-type="num" title="Stop Loss · projected net PnL below">SL</th>
-                    <th class="admin-only">Actions</th>
-                  </tr>
-                </thead>
-                <tbody id="positions-body">
-                  <tr><td colspan="12"><span class="skel"></span></td></tr>
-                </tbody>
-              </table>
-            </div>
-          </section>
+              <section class="panel">
+                <div class="panel-head">
+                  <h2>Open Orders</h2>
+                  <button id="cancel-all-btn" class="btn-danger admin-only">Cancel all</button>
+                </div>
+                <div class="table-wrap">
+                  <table id="orders-table" class="sortable">
+                    <thead>
+                      <tr>
+                        <th data-sortkey="symbol" data-type="str">Symbol</th>
+                        <th data-sortkey="side" data-type="str">Side</th>
+                        <th data-sortkey="orderType" data-type="str">Type</th>
+                        <th data-sortkey="qty" data-type="num">Qty</th>
+                        <th data-sortkey="price" data-type="num">Price</th>
+                        <th data-sortkey="triggerPrice" data-type="num">Trigger</th>
+                        <th data-sortkey="orderStatus" data-type="str">Status</th>
+                        <th class="admin-only">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody id="orders-body">
+                      <tr><td colspan="8"><span class="skel"></span></td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
 
-          <section class="panel">
-            <div class="panel-head">
-              <h2>Open Orders</h2>
-              <button id="cancel-all-btn" class="btn-danger admin-only">Cancel all</button>
+              <!-- Live candlestick charts (read-only public market data). -->
+              <section class="panel" id="charts-panel">
+                <div class="panel-head">
+                  <h2>Live Charts</h2>
+                  <div class="chart-controls">
+                    <div class="segment chart-seg" id="chart-view" role="group" aria-label="Chart view">
+                      <button type="button" class="seg-neutral active" data-view="grid" aria-pressed="true">BTC · ETH · SOL</button>
+                      <button type="button" class="seg-neutral" data-view="single" aria-pressed="false">Single</button>
+                    </div>
+                    <div class="segment chart-seg" id="chart-sym" role="group" aria-label="Chart symbol" hidden></div>
+                    <!-- Interval buttons rendered by wireCharts() from CHART_INTERVALS. -->
+                    <div class="segment chart-seg" id="chart-iv" role="group" aria-label="Candle interval"></div>
+                    <button type="button" id="chart-expand" class="icon-btn" title="Expand charts (Esc to exit)" aria-label="Expand charts" aria-pressed="false">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+                    </button>
+                  </div>
+                </div>
+                <div id="charts-grid" class="charts-grid"></div>
+                <div id="charts-single" class="charts-single" hidden></div>
+              </section>
             </div>
-            <div class="table-wrap">
-              <table id="orders-table" class="sortable">
-                <thead>
-                  <tr>
-                    <th data-sortkey="symbol" data-type="str">Symbol</th>
-                    <th data-sortkey="side" data-type="str">Side</th>
-                    <th data-sortkey="orderType" data-type="str">Type</th>
-                    <th data-sortkey="qty" data-type="num">Qty</th>
-                    <th data-sortkey="price" data-type="num">Price</th>
-                    <th data-sortkey="triggerPrice" data-type="num">Trigger</th>
-                    <th data-sortkey="orderStatus" data-type="str">Status</th>
-                    <th class="admin-only">Actions</th>
-                  </tr>
-                </thead>
-                <tbody id="orders-body">
-                  <tr><td colspan="8"><span class="skel"></span></td></tr>
-                </tbody>
-              </table>
-            </div>
-          </section>
 
-          <!-- Live candlestick charts (read-only public market data). Available
-               to both roles; click a chart to load that symbol into the ticket. -->
-          <section class="panel" id="charts-panel">
-            <div class="panel-head">
-              <h2>Live Charts</h2>
-              <div class="chart-controls">
-                <div class="segment chart-seg" id="chart-view" role="group" aria-label="Chart view">
-                  <button type="button" class="seg-neutral active" data-view="grid" aria-pressed="true">BTC · ETH · SOL</button>
-                  <button type="button" class="seg-neutral" data-view="single" aria-pressed="false">Single</button>
+            <!-- Docked order rail (admin only). -->
+            <aside class="workspace-rail admin-only" aria-label="Order entry">
+              <section class="panel token-panel">
+                <div class="panel-head">
+                  <h2>Trade Token</h2>
+                  <span id="token-status" class="token-status locked" role="status" aria-live="polite">LOCKED</span>
                 </div>
-                <div class="segment chart-seg" id="chart-sym" role="group" aria-label="Chart symbol" hidden></div>
-                <!-- Interval buttons are rendered by wireCharts() from CHART_INTERVALS (single source). -->
-                <div class="segment chart-seg" id="chart-iv" role="group" aria-label="Candle interval"></div>
-              </div>
-            </div>
-            <div id="charts-grid" class="charts-grid"></div>
-            <div id="charts-single" class="charts-single" hidden></div>
-          </section>
-        </div>
+                <div class="form-grid">
+                  <label>Required for every write operation
+                    <input id="trade-token" type="password" placeholder="Paste trade token to unlock trading" autocomplete="off" aria-describedby="token-status" />
+                  </label>
+                  <p class="muted token-help">Trading actions are disabled until a valid token is entered. The token is held only in this browser tab and sent with each write request.</p>
+                </div>
+              </section>
 
-        <!-- Docked order rail (admin only). Co-locates the decision (positions/PnL)
-             with the action (order entry) so trading no longer means tab-hopping. -->
-        <aside class="workspace-rail admin-only" aria-label="Order entry">
-          <section class="panel token-panel">
-            <div class="panel-head">
-              <h2>Trade Token</h2>
-              <span id="token-status" class="token-status locked" role="status" aria-live="polite">LOCKED</span>
-            </div>
-            <div class="form-grid">
-              <label>Required for every write operation
-                <input id="trade-token" type="password" placeholder="Paste trade token to unlock trading" autocomplete="off" aria-describedby="token-status" />
-              </label>
-              <p class="muted token-help">Trading actions are disabled until a valid token is entered. The token is held only in this browser tab and sent with each write request.</p>
-            </div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-head"><h2>Place Order</h2><span class="muted" style="font-size:11px">prices &amp; amounts in USDT</span></div>
-            <form id="order-form" class="form-grid">
-              <label>Symbol
-                <input name="symbol" placeholder="SOLUSDT" required autocomplete="off"
-                       title="Press / anywhere to jump here" />
-              </label>
-              <div class="spec-strip" id="order-spec" hidden></div>
-              <label>Side
-                <div class="segment" id="seg-side" role="group" aria-label="Order side">
-                  <button type="button" data-val="Buy" class="seg-buy" aria-pressed="true">Buy</button>
-                  <button type="button" data-val="Sell" class="seg-sell" aria-pressed="false">Sell</button>
-                </div>
-                <select name="side" class="sr-only" tabindex="-1">
-                  <option value="Buy">Buy</option>
-                  <option value="Sell">Sell</option>
-                </select>
-              </label>
-              <label>Order type
-                <div class="segment" id="seg-type" role="group" aria-label="Order type">
-                  <button type="button" data-val="Market" class="seg-neutral" aria-pressed="true">Market</button>
-                  <button type="button" data-val="Limit" class="seg-neutral" aria-pressed="false">Limit</button>
-                </div>
-                <select name="orderType" id="order-type" class="sr-only" tabindex="-1">
-                  <option value="Market">Market</option>
-                  <option value="Limit">Limit</option>
-                </select>
-              </label>
-              <!-- Position sizing. Enter the size either as a base-coin Quantity
-                   or as the USDT Margin you want to commit. Margin is a CLIENT-SIDE
-                   convenience only: it is converted to a quantity
-                   (qty = margin × leverage ÷ price) and the order sent to the
-                   exchange is ALWAYS the base-coin qty — the margin figure itself is
-                   never part of the order payload. Leverage/margin-mode stay account
-                   state, changed separately under Account. -->
-              <label>Size by
-                <div class="segment" id="seg-sizemode" role="group" aria-label="Size order by quantity or margin">
-                  <button type="button" data-val="qty" class="seg-neutral" aria-pressed="true">Quantity</button>
-                  <button type="button" data-val="margin" class="seg-neutral" aria-pressed="false">Margin</button>
-                </div>
-                <select name="sizeMode" id="size-mode" class="sr-only" tabindex="-1">
-                  <option value="qty">Quantity</option>
-                  <option value="margin">Margin</option>
-                </select>
-              </label>
-              <label class="sizeby-qty">Quantity
-                <input name="qty" placeholder="1" inputmode="decimal" autocomplete="off" />
-              </label>
-              <label class="sizeby-margin">Margin <span class="muted">(USDT to commit)</span>
-                <input name="margin" placeholder="100" inputmode="decimal" autocomplete="off" />
-              </label>
-              <!-- %-of-balance sizing helper. Leverage is fetched from the exchange
-                   for the typed symbol (your REAL account leverage), shown read-only,
-                   and feeds BOTH the %-buttons and the Margin→Quantity conversion. It
-                   is never sent with the order (change it under Account → Set Leverage). -->
-              <div class="sizing">
-                <div class="sizing-row">
-                  <span class="sizing-avail priv" id="sizing-avail">avail —</span>
-                  <span class="sizing-lev-display priv" id="sizing-lev-display"
-                        title="Your account leverage for this symbol, fetched from the exchange">lev —</span>
-                </div>
-                <div class="sizing-btns" id="sizing-btns" role="group" aria-label="Size as percent of available balance">
-                  <button type="button" data-pct="25">25%</button>
-                  <button type="button" data-pct="50">50%</button>
-                  <button type="button" data-pct="75">75%</button>
-                  <button type="button" data-pct="100">Max</button>
-                </div>
-              </div>
-              <div class="notional-hint" id="order-notional" role="status" aria-live="polite"></div>
-              <label class="limit-only">Price
-                <input name="price" placeholder="limit price" inputmode="decimal" autocomplete="off" />
-              </label>
-              <!-- Advanced order options behind a disclosure so the default
-                   ticket stays short (Submit reachable without scrolling).
-                   PRESENTATION ONLY: the inputs remain ordinary members of
-                   #order-form, so every existing handler, validation and
-                   payload is unchanged — and the typed-confirm modal always
-                   lists TP/SL/TIF values whether this is open or collapsed. -->
-              <details class="ticket-adv">
-                <summary>TP / SL &amp; advanced <span class="muted">optional</span></summary>
-                <div class="adv-body">
-                  <label class="limit-only">Time in force
-                    <select name="timeInForce">
-                      <option value="GTC">GTC — good till cancelled</option>
-                      <option value="PostOnly">Post-Only — maker only, never takes</option>
-                      <option value="IOC">IOC — immediate or cancel</option>
-                      <option value="FOK">FOK — fill or kill</option>
+              <section class="panel ticket-panel">
+                <div class="panel-head"><h2>Place Order</h2><span class="muted ticket-unit">prices &amp; amounts in USDT</span></div>
+                <form id="order-form" class="form-grid">
+                  <label>Symbol
+                    <input name="symbol" placeholder="SOLUSDT" required autocomplete="off"
+                           title="Press / anywhere to jump here" />
+                  </label>
+                  <div class="spec-strip" id="order-spec" hidden></div>
+                  <label class="ticket-side">Side
+                    <div class="segment seg-lg" id="seg-side" role="group" aria-label="Order side">
+                      <button type="button" data-val="Buy" class="seg-buy" aria-pressed="true">Buy / Long</button>
+                      <button type="button" data-val="Sell" class="seg-sell" aria-pressed="false">Sell / Short</button>
+                    </div>
+                    <select name="side" class="sr-only" tabindex="-1">
+                      <option value="Buy">Buy</option>
+                      <option value="Sell">Sell</option>
                     </select>
                   </label>
-                  <label>Take Profit <span class="muted">(optional)</span>
-                    <input name="takeProfit" placeholder="TP trigger price" inputmode="decimal" autocomplete="off" />
+                  <label>Order type
+                    <div class="segment" id="seg-type" role="group" aria-label="Order type">
+                      <button type="button" data-val="Market" class="seg-neutral" aria-pressed="true">Market</button>
+                      <button type="button" data-val="Limit" class="seg-neutral" aria-pressed="false">Limit</button>
+                    </div>
+                    <select name="orderType" id="order-type" class="sr-only" tabindex="-1">
+                      <option value="Market">Market</option>
+                      <option value="Limit">Limit</option>
+                    </select>
                   </label>
-                  <label>Stop Loss <span class="muted">(optional)</span>
-                    <input name="stopLoss" placeholder="SL trigger price" inputmode="decimal" autocomplete="off" />
+                  <!-- Sizing: base-coin Quantity or USDT Margin (client-side helper;
+                       the payload is ALWAYS the base-coin qty). -->
+                  <label>Size by
+                    <div class="segment" id="seg-sizemode" role="group" aria-label="Size order by quantity or margin">
+                      <button type="button" data-val="qty" class="seg-neutral" aria-pressed="true">Quantity</button>
+                      <button type="button" data-val="margin" class="seg-neutral" aria-pressed="false">Margin</button>
+                    </div>
+                    <select name="sizeMode" id="size-mode" class="sr-only" tabindex="-1">
+                      <option value="qty">Quantity</option>
+                      <option value="margin">Margin</option>
+                    </select>
                   </label>
-                  <label class="checkbox">
-                    <input type="checkbox" name="reduceOnly" /> Reduce only
+                  <label class="sizeby-qty">Quantity
+                    <input name="qty" placeholder="1" inputmode="decimal" autocomplete="off" />
                   </label>
+                  <label class="sizeby-margin">Margin <span class="muted">(USDT to commit)</span>
+                    <input name="margin" placeholder="100" inputmode="decimal" autocomplete="off" />
+                  </label>
+                  <div class="sizing">
+                    <div class="sizing-row">
+                      <span class="sizing-avail priv" id="sizing-avail">avail —</span>
+                      <span class="sizing-lev-display priv" id="sizing-lev-display"
+                            title="Your account leverage for this symbol, fetched from the exchange">lev —</span>
+                    </div>
+                    <div class="sizing-btns" id="sizing-btns" role="group" aria-label="Size as percent of available balance">
+                      <button type="button" data-pct="25">25%</button>
+                      <button type="button" data-pct="50">50%</button>
+                      <button type="button" data-pct="75">75%</button>
+                      <button type="button" data-pct="100">Max</button>
+                    </div>
+                  </div>
+                  <div class="notional-hint" id="order-notional" role="status" aria-live="polite"></div>
+                  <label class="limit-only">Price
+                    <input name="price" placeholder="limit price" inputmode="decimal" autocomplete="off" />
+                  </label>
+                  <!-- Advanced options behind a disclosure; the inputs stay ordinary
+                       members of #order-form (all handlers/payloads unchanged). -->
+                  <details class="ticket-adv">
+                    <summary>TP / SL &amp; advanced <span class="muted">optional</span></summary>
+                    <div class="adv-body">
+                      <label class="limit-only">Time in force
+                        <select name="timeInForce">
+                          <option value="GTC">GTC — good till cancelled</option>
+                          <option value="PostOnly">Post-Only — maker only, never takes</option>
+                          <option value="IOC">IOC — immediate or cancel</option>
+                          <option value="FOK">FOK — fill or kill</option>
+                        </select>
+                      </label>
+                      <label>Take Profit <span class="muted">(optional)</span>
+                        <input name="takeProfit" placeholder="TP trigger price" inputmode="decimal" autocomplete="off" />
+                      </label>
+                      <label>Stop Loss <span class="muted">(optional)</span>
+                        <input name="stopLoss" placeholder="SL trigger price" inputmode="decimal" autocomplete="off" />
+                      </label>
+                      <label class="checkbox">
+                        <input type="checkbox" name="reduceOnly" /> Reduce only
+                      </label>
+                    </div>
+                  </details>
+                  <div id="order-pnl-preview" class="pnl-preview"></div>
+                  <button type="submit" class="btn-primary btn-submit">Submit order</button>
+                </form>
+                <div id="order-result" class="result-msg" role="status" aria-live="polite"></div>
+              </section>
+
+              <section class="panel book-panel">
+                <div class="panel-head">
+                  <h2>Order Book</h2>
+                  <span class="panel-head-meta">
+                    <span class="muted" id="book-symbol">—</span>
+                    <span class="muted book-unit" id="book-unit">USDT</span>
+                  </span>
                 </div>
-              </details>
-              <div id="order-pnl-preview" class="pnl-preview"></div>
-              <button type="submit" class="btn-primary">Submit order</button>
-            </form>
-            <div id="order-result" class="result-msg" role="status" aria-live="polite"></div>
-          </section>
+                <div id="book-widget" class="book-widget"><p class="muted book-empty">Pick a symbol to load depth.</p></div>
+              </section>
+            </aside>
+          </div>
+        </div>
 
-          <!-- Live top-of-book + depth for the active symbol (set by typing a
-               symbol above or clicking a position/order row). -->
-          <section class="panel book-panel">
+        <!-- ============ MARKETS ============ -->
+        <div class="pane" data-pane="markets" id="panel-markets" role="tabpanel" aria-labelledby="tab-markets" hidden>
+          <section class="panel">
             <div class="panel-head">
-              <h2>Order Book</h2>
-              <span class="panel-head-meta">
-                <span class="muted" id="book-symbol">—</span>
-                <span class="muted book-unit" id="book-unit">USDT</span>
-              </span>
+              <h2>Markets</h2>
+              <div class="panel-head-actions">
+                <input id="markets-filter" placeholder="Filter symbol…" aria-label="Filter markets by symbol" />
+                <button id="markets-refresh" class="btn-ghost sm">Refresh</button>
+              </div>
             </div>
-            <div id="book-widget" class="book-widget"><p class="muted book-empty">Pick a symbol to load depth.</p></div>
+            <div id="markets-body" class="explorer-result"><p class="loading-msg muted">Loading markets…</p></div>
           </section>
-        </aside>
-      </div>
-    </div>
+        </div>
 
-    <!-- ============ MARKETS ============ -->
-    <div class="pane" data-pane="markets" id="panel-markets" role="tabpanel" aria-labelledby="tab-markets" hidden>
-      <section class="panel">
-        <div class="panel-head">
-          <h2>Markets</h2>
-          <div class="panel-head-actions">
-            <input id="markets-filter" placeholder="Filter symbol…" aria-label="Filter markets by symbol" />
-            <button id="markets-refresh" class="btn-ghost sm">Refresh</button>
+        <!-- ============ HISTORY / JOURNAL ============ -->
+        <div class="pane" data-pane="history" id="panel-history" role="tabpanel" aria-labelledby="tab-history" hidden>
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Trading Journal — Closed PnL</h2>
+              <div class="panel-head-actions">
+                <select id="history-range" aria-label="History time range">
+                  <option value="1">Last day</option>
+                  <option value="7">Last week</option>
+                  <option value="30" selected>Last month</option>
+                  <option value="all">Overall</option>
+                  <option value="custom">Custom…</option>
+                </select>
+                <input type="date" id="history-from" aria-label="From date" hidden />
+                <input type="date" id="history-to" aria-label="To date" hidden />
+                <input id="history-filter" placeholder="Filter symbol…" aria-label="Filter history by symbol" />
+                <button id="history-refresh" class="btn-ghost sm">Refresh</button>
+              </div>
+            </div>
+            <div id="history-summary" class="explorer-summary" hidden></div>
+            <div id="history-analytics" class="analytics" hidden></div>
+            <div id="history-closed" class="explorer-result"><p class="muted" style="padding:14px">Open this tab to load history…</p></div>
+          </section>
+          <section class="panel">
+            <div class="panel-head"><h2>Recent Trades</h2></div>
+            <div id="history-exec" class="explorer-result"><p class="muted" style="padding:14px">—</p></div>
+          </section>
+        </div>
+
+        <!-- ============ ACCOUNT (admin) ============ -->
+        <div class="pane admin-only" data-pane="account" id="panel-account" role="tabpanel" aria-labelledby="tab-account" hidden>
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Account &amp; Risk</h2>
+              <button id="account-refresh" class="btn-ghost sm">Refresh</button>
+            </div>
+            <div id="account-overview" class="explorer-result"><p class="muted" style="padding:14px">Open this tab to load account details…</p></div>
+          </section>
+
+          <div class="trade-grid">
+            <section class="panel">
+              <div class="panel-head"><h2>Set Leverage</h2></div>
+              <form id="leverage-form" class="form-grid">
+                <label>Symbol
+                  <input name="symbol" placeholder="SOLUSDT" required autocomplete="off" />
+                </label>
+                <label>Buy leverage
+                  <input name="buyLeverage" placeholder="10" required inputmode="decimal" autocomplete="off" />
+                </label>
+                <label>Sell leverage
+                  <input name="sellLeverage" placeholder="10" required inputmode="decimal" autocomplete="off" />
+                </label>
+                <button type="submit" class="btn-primary">Apply leverage</button>
+              </form>
+              <div id="leverage-result" class="result-msg" role="status" aria-live="polite"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-head"><h2>Set Margin Mode</h2></div>
+              <form id="margin-form" class="form-grid">
+                <label>Margin mode
+                  <select name="setMarginMode">
+                    <option value="REGULAR_MARGIN">REGULAR_MARGIN</option>
+                    <option value="ISOLATED_MARGIN">ISOLATED_MARGIN</option>
+                    <option value="PORTFOLIO_MARGIN">PORTFOLIO_MARGIN</option>
+                  </select>
+                </label>
+                <button type="submit" class="btn-primary">Apply margin mode</button>
+              </form>
+              <div id="margin-result" class="result-msg" role="status" aria-live="polite"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-head"><h2>Transfer Funds</h2></div>
+              <form id="transfer-form" class="form-grid">
+                <label>Direction
+                  <select name="direction">
+                    <option value="OUT">OUT (to spot/wallet)</option>
+                    <option value="IN">IN (to futures)</option>
+                  </select>
+                </label>
+                <label>Amount
+                  <input name="amount" type="number" step="any" inputmode="decimal" placeholder="40000" required />
+                </label>
+                <label>Quote asset
+                  <select name="quote_asset">
+                    <option value="INR">INR</option>
+                    <option value="USDT">USDT</option>
+                  </select>
+                </label>
+                <button type="submit" class="btn-danger">Transfer funds</button>
+              </form>
+              <div id="transfer-result" class="result-msg" role="status" aria-live="polite"></div>
+            </section>
           </div>
         </div>
-        <div id="markets-body" class="explorer-result"><p class="loading-msg muted">Loading markets…</p></div>
-      </section>
-    </div>
 
-    <!-- ============ HISTORY ============ -->
-    <div class="pane" data-pane="history" id="panel-history" role="tabpanel" aria-labelledby="tab-history" hidden>
-      <section class="panel">
-        <div class="panel-head">
-          <h2>Closed PnL</h2>
-          <div class="panel-head-actions">
-            <select id="history-range" aria-label="History time range">
-              <option value="1">Last day</option>
-              <option value="7">Last week</option>
-              <option value="30" selected>Last month</option>
-              <option value="all">Overall</option>
-              <option value="custom">Custom…</option>
-            </select>
-            <input type="date" id="history-from" aria-label="From date" hidden />
-            <input type="date" id="history-to" aria-label="To date" hidden />
-            <input id="history-filter" placeholder="Filter symbol…" aria-label="Filter history by symbol" />
-            <button id="history-refresh" class="btn-ghost sm">Refresh</button>
-          </div>
+        <!-- ============ API (read-only Explorer) ============ -->
+        <div class="pane" data-pane="tools" id="panel-tools" role="tabpanel" aria-labelledby="tab-tools" hidden>
+          <section class="panel explorer-panel">
+            <div class="panel-head">
+              <h2>API Explorer</h2>
+              <span class="muted">read-only queries · developer tooling</span>
+            </div>
+            <div class="explorer-controls">
+              <input id="explorer-symbol" placeholder="Symbol (e.g. SOLUSDT) — used where applicable" aria-label="Explorer symbol" />
+              <div id="explorer-buttons" class="explorer-buttons"></div>
+            </div>
+            <div id="explorer-result" class="explorer-result"><p class="muted" style="padding:14px">Pick a query above…</p></div>
+          </section>
         </div>
-        <div id="history-summary" class="explorer-summary" hidden></div>
-        <div id="history-analytics" class="analytics" hidden></div>
-        <div id="history-closed" class="explorer-result"><p class="muted" style="padding:14px">Open this tab to load history…</p></div>
-      </section>
-      <section class="panel">
-        <div class="panel-head"><h2>Recent Trades</h2></div>
-        <div id="history-exec" class="explorer-result"><p class="muted" style="padding:14px">—</p></div>
-      </section>
+      </main>
     </div>
-
-    <!-- ============ ACCOUNT (admin) ============ -->
-    <div class="pane admin-only" data-pane="account" id="panel-account" role="tabpanel" aria-labelledby="tab-account" hidden>
-      <section class="panel">
-        <div class="panel-head">
-          <h2>Account &amp; Risk</h2>
-          <button id="account-refresh" class="btn-ghost sm">Refresh</button>
-        </div>
-        <div id="account-overview" class="explorer-result"><p class="muted" style="padding:14px">Open this tab to load account details…</p></div>
-      </section>
-
-      <div class="trade-grid">
-        <section class="panel">
-          <div class="panel-head"><h2>Set Leverage</h2></div>
-          <form id="leverage-form" class="form-grid">
-            <label>Symbol
-              <input name="symbol" placeholder="SOLUSDT" required autocomplete="off" />
-            </label>
-            <label>Buy leverage
-              <input name="buyLeverage" placeholder="10" required inputmode="decimal" autocomplete="off" />
-            </label>
-            <label>Sell leverage
-              <input name="sellLeverage" placeholder="10" required inputmode="decimal" autocomplete="off" />
-            </label>
-            <button type="submit" class="btn-primary">Apply leverage</button>
-          </form>
-          <div id="leverage-result" class="result-msg" role="status" aria-live="polite"></div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head"><h2>Set Margin Mode</h2></div>
-          <form id="margin-form" class="form-grid">
-            <label>Margin mode
-              <select name="setMarginMode">
-                <option value="REGULAR_MARGIN">REGULAR_MARGIN</option>
-                <option value="ISOLATED_MARGIN">ISOLATED_MARGIN</option>
-                <option value="PORTFOLIO_MARGIN">PORTFOLIO_MARGIN</option>
-              </select>
-            </label>
-            <button type="submit" class="btn-primary">Apply margin mode</button>
-          </form>
-          <div id="margin-result" class="result-msg" role="status" aria-live="polite"></div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head"><h2>Transfer Funds</h2></div>
-          <form id="transfer-form" class="form-grid">
-            <label>Direction
-              <select name="direction">
-                <option value="OUT">OUT (to spot/wallet)</option>
-                <option value="IN">IN (to futures)</option>
-              </select>
-            </label>
-            <label>Amount
-              <input name="amount" type="number" step="any" inputmode="decimal" placeholder="40000" required />
-            </label>
-            <label>Quote asset
-              <select name="quote_asset">
-                <option value="INR">INR</option>
-                <option value="USDT">USDT</option>
-              </select>
-            </label>
-            <button type="submit" class="btn-danger">Transfer funds</button>
-          </form>
-          <div id="transfer-result" class="result-msg" role="status" aria-live="polite"></div>
-        </section>
-      </div>
-    </div>
-
-    <!-- ============ API (read-only Explorer) ============ -->
-    <div class="pane" data-pane="tools" id="panel-tools" role="tabpanel" aria-labelledby="tab-tools" hidden>
-      <section class="panel explorer-panel">
-        <div class="panel-head">
-          <h2>API Explorer</h2>
-          <span class="muted">read-only queries · developer tooling</span>
-        </div>
-        <div class="explorer-controls">
-          <input id="explorer-symbol" placeholder="Symbol (e.g. SOLUSDT) — used where applicable" aria-label="Explorer symbol" />
-          <div id="explorer-buttons" class="explorer-buttons"></div>
-        </div>
-        <div id="explorer-result" class="explorer-result"><p class="muted" style="padding:14px">Pick a query above…</p></div>
-      </section>
-    </div>
-  </main>
+  </div>
 
   <div class="toasts-wrap">
-    <!-- Errors/warnings interrupt (assertive); info/success are polite. No
-         aria-atomic: announce only the newly-added toast, not the whole stack. -->
     <div id="toasts-alert" class="toasts" role="alert" aria-live="assertive"></div>
     <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
   </div>
@@ -431,8 +448,6 @@
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
       <h3 id="confirm-title">Confirm action</h3>
       <div id="confirm-message" class="confirm-message"></div>
-      <!-- Optional quick-portion buttons (e.g. partial close); populated by
-           typedConfirm() only when the caller passes percent choices. -->
       <div id="confirm-choices" class="confirm-choices" hidden></div>
       <p class="muted">Type <strong>confirm</strong> below to proceed:</p>
       <input id="confirm-input" type="text" autocomplete="off" placeholder="confirm" />
@@ -469,6 +484,15 @@
         <button id="tpsl-cancel" class="btn-ghost" type="button">Cancel</button>
         <button id="tpsl-apply" class="btn-primary" type="button">Apply TP/SL</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Command palette (navigation/display actions ONLY — never a write) -->
+  <div id="cmdk-overlay" class="modal-overlay cmdk-overlay" hidden>
+    <div class="cmdk" role="dialog" aria-modal="true" aria-label="Command palette">
+      <input id="cmdk-input" type="text" placeholder="Type a command… (Esc to close)"
+             autocomplete="off" role="combobox" aria-expanded="true" aria-controls="cmdk-list" />
+      <div id="cmdk-list" class="cmdk-list" role="listbox" aria-label="Commands"></div>
     </div>
   </div>
 
