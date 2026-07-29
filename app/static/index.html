@@ -54,6 +54,33 @@
            position the sticky order rail. -->
       <div class="sticky-top">
         <header class="topbar">
+          <!-- Workspace switcher: layouts are display-state only; switching
+               never touches trading state or issues a write. -->
+          <div class="ws-wrap">
+            <button id="ws-btn" class="ws-btn" type="button" aria-haspopup="dialog" aria-expanded="false"
+                    title="Workspaces — press W">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="7" rx="1.5"/><rect x="3" y="14" width="8" height="7" rx="1.5"/><rect x="15" y="14" width="6" height="7" rx="1.5"/></svg>
+              <span id="ws-current">Default</span>
+              <span class="ws-caret" aria-hidden="true">▾</span>
+            </button>
+            <div id="ws-panel" class="ws-panel" role="dialog" aria-label="Workspaces" hidden>
+              <input id="ws-search" type="text" placeholder="Search workspaces…" autocomplete="off"
+                     role="combobox" aria-expanded="true" aria-controls="ws-list" />
+              <div id="ws-list" class="ws-list" role="listbox" aria-label="Workspaces"></div>
+              <div class="ws-foot">
+                <button id="ws-new" class="btn-ghost sm" type="button">＋ New</button>
+                <button id="ws-dup" class="btn-ghost sm" type="button">Duplicate</button>
+                <button id="ws-export" class="btn-ghost sm" type="button">Export</button>
+                <button id="ws-import" class="btn-ghost sm" type="button">Import</button>
+                <input id="ws-import-file" type="file" accept="application/json,.json" hidden />
+              </div>
+              <div class="ws-foot">
+                <button id="ws-snap-save" class="btn-ghost sm" type="button" title="Keep a restore point before experimenting">Save snapshot</button>
+                <button id="ws-snap-restore" class="btn-ghost sm" type="button">Restore</button>
+                <button id="ws-reset" class="btn-ghost sm" type="button">Reset layout</button>
+              </div>
+            </div>
+          </div>
           <span id="scope-chip" class="scope-chip" title="Settlement coin for the displayed account"></span>
           <div class="topbar-stats">
             <div class="stat stat-primary">
@@ -207,6 +234,17 @@
                 <div id="charts-grid" class="charts-grid"></div>
                 <div id="charts-single" class="charts-single" hidden></div>
               </section>
+
+              <!-- Shown only when EVERY main panel is collapsed in the active
+                   workspace — the layout is empty, not broken. -->
+              <div id="ws-empty" class="ws-empty" hidden>
+                <div class="ws-empty-glyph" aria-hidden="true">◫</div>
+                <p>All panels are collapsed in this workspace.</p>
+                <div class="ws-empty-actions">
+                  <button id="ws-empty-reset" class="btn-ghost sm" type="button">Restore defaults</button>
+                  <button id="ws-empty-open" class="btn-ghost sm" type="button">Workspaces</button>
+                </div>
+              </div>
             </div>
 
             <!-- Docked order rail (admin only). -->
@@ -521,6 +559,7 @@
         <kbd>B</kbd><span>Ticket → Buy / Long side</span>
         <kbd>S</kbd><span>Ticket → Sell / Short side</span>
         <kbd>⌘K</kbd><span>Command palette</span>
+        <kbd>W</kbd><span>Workspace switcher (digits 1–9 select inside)</span>
         <kbd>↑ ↓</kbd><span>Navigate rows, tabs &amp; panels</span>
         <kbd>Enter</kbd><span>Expand row · activate</span>
         <kbd>Esc</kbd><span>Close dialogs · exit fullscreen</span>

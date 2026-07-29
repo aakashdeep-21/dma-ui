@@ -3183,6 +3183,7 @@ function setActiveSymbol(sym) {
     const lbl = document.getElementById("book-symbol");
     if (lbl) lbl.textContent = symbol;
     loadBook();
+    wsAutoSave(); // the book symbol is part of the active workspace
   }
   startBookPolling();
 }
@@ -4074,39 +4075,463 @@ function wireCharts() {
   startChartPolling();
 }
 
-// ---------------------------------------------------------------------------
-// Workspace system — collapse any panel; drag (or Arrow-key) the dashboard's
-// main panels into your own order; both persist locally. PRESENTATION ONLY:
-// panels keep their ids and inner DOM, so every renderer and poller is
-// untouched; collapsing charts/book additionally pauses their polling.
-// ---------------------------------------------------------------------------
-const _WS_KEY = "dma.workspace.v1";
-function _wsState() {
-  try { return JSON.parse(localStorage.getItem(_WS_KEY) || "{}") || {}; } catch (e) { return {}; }
-}
-function _wsSave(st) {
-  try { localStorage.setItem(_WS_KEY, JSON.stringify(st)); } catch (e) {}
+// ===========================================================================
+// WORKSPACES — a workspace is a complete named trading environment (panel
+// order + collapsed state, table density, chart view/interval/symbol, active
+// tab, order-book symbol). Any number of them; switching restores everything
+// instantly. Storage: localStorage `dma.workspace.v2` (versioned; migrates
+// v1 + the old density key; corrupt/future blobs are PRESERVED under a
+// `.corrupt` key, never silently discarded). Everything here is DISPLAY
+// STATE ONLY: applying a workspace re-clicks existing controls and toggles
+// classes — it can never touch trading state or issue a write.
+//
+// Layout: a PURE, DOM-free document-ops core first (top-level functions so
+// tests/test_snap.mjs can extract and unit-test them), then the DOM manager.
+// ===========================================================================
+
+const WS_STORE_KEY = "dma.workspace.v2";
+const WS_LEGACY_KEY = "dma.workspace.v1";
+const WS_SCHEMA_VERSION = 2;
+const WS_MAX = 20;
+// Allowlists for sanitizing stored/imported state (one-line consts so the
+// test harness can extract them alongside the functions).
+const WS_PANEL_IDS = ["risk", "positions", "orders", "charts", "token", "ticket", "book"];
+const WS_TABS = ["dashboard", "markets", "history", "account", "tools"];
+const WS_CHART_VIEWS = ["grid", "single"];
+const WS_INTERVALS = ["1", "5", "15", "60"]; // keep in sync with CHART_INTERVALS codes
+const WS_SYMBOL_RE = /^[A-Z0-9]{1,20}$/;
+
+function wsId() {
+  return "ws_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 }
 
-function wireWorkspace() {
+// Coerce ANY value into a valid workspace state (unknown fields dropped,
+// invalid values replaced by defaults). This is the single trust boundary for
+// storage and imports: everything rendered later is either from these
+// allowlists or additionally escaped at render time.
+function wsSanitizeState(raw) {
+  const src = raw && typeof raw === "object" ? raw : {};
+  const chart = src.chart && typeof src.chart === "object" ? src.chart : {};
+  const collapsed = {};
+  if (src.collapsed && typeof src.collapsed === "object") {
+    WS_PANEL_IDS.forEach((id) => { if (src.collapsed[id]) collapsed[id] = true; });
+  }
+  const order = Array.isArray(src.order)
+    ? src.order.filter((id, i) => WS_PANEL_IDS.includes(id) && src.order.indexOf(id) === i)
+    : [];
+  const single = String(chart.single || "").toUpperCase();
+  const book = String(src.bookSymbol || "").toUpperCase();
+  return {
+    order: order.length ? order : ["risk", "positions", "orders", "charts"],
+    collapsed,
+    density: src.density === "compact" ? "compact" : "comfortable",
+    chart: {
+      view: WS_CHART_VIEWS.includes(chart.view) ? chart.view : "grid",
+      interval: WS_INTERVALS.includes(String(chart.interval)) ? String(chart.interval) : "15",
+      single: WS_SYMBOL_RE.test(single) ? single : "BTCUSDT",
+    },
+    tab: WS_TABS.includes(src.tab) ? src.tab : "dashboard",
+    bookSymbol: WS_SYMBOL_RE.test(book) ? book : "",
+  };
+}
+
+function wsMakeWorkspace(name, state, description) {
+  const now = Date.now();
+  return {
+    id: wsId(),
+    name: String(name || "Workspace").slice(0, 40),
+    description: typeof description === "string" ? description.slice(0, 140) : "",
+    createdAt: now,
+    updatedAt: now,
+    state: wsSanitizeState(state),
+    snapshot: null,
+  };
+}
+
+function wsSanitizeWorkspace(w) {
+  if (!w || typeof w !== "object" || typeof w.id !== "string" || !w.id) return null;
+  const now = Date.now();
+  return {
+    id: w.id.slice(0, 40),
+    name: String(w.name || "Workspace").slice(0, 40),
+    description: typeof w.description === "string" ? w.description.slice(0, 140) : "",
+    createdAt: Number(w.createdAt) || now,
+    updatedAt: Number(w.updatedAt) || now,
+    state: wsSanitizeState(w.state),
+    snapshot: w.snapshot && typeof w.snapshot === "object"
+      ? { savedAt: Number(w.snapshot.savedAt) || now, state: wsSanitizeState(w.snapshot.state) }
+      : null,
+  };
+}
+
+function wsNewDoc() {
+  const w = wsMakeWorkspace("Default");
+  return { version: WS_SCHEMA_VERSION, activeId: w.id, workspaces: [w] };
+}
+
+// v1 ({order, collapsed}) + the old standalone density key become the state
+// of the initial "Default" workspace.
+function wsMigrateFromV1(v1, legacyDensity) {
+  const doc = wsNewDoc();
+  doc.workspaces[0].state = wsSanitizeState({
+    order: v1 && v1.order,
+    collapsed: v1 && v1.collapsed,
+    density: legacyDensity,
+  });
+  return doc;
+}
+
+// Parse whatever is in storage into a guaranteed-valid document.
+// corrupt:true means the caller must PRESERVE the original blob (quarantine
+// key) — user layouts are never silently discarded. An unknown/future schema
+// version is treated the same way rather than half-read.
+function wsParseDoc(rawV2, rawV1, legacyDensity) {
+  if (rawV2 == null || rawV2 === "") {
+    if (rawV1) {
+      try {
+        return { doc: wsMigrateFromV1(JSON.parse(rawV1), legacyDensity), migrated: true, corrupt: false };
+      } catch (e) {
+        return { doc: wsNewDoc(), migrated: false, corrupt: true };
+      }
+    }
+    return { doc: wsNewDoc(), migrated: false, corrupt: false };
+  }
+  let parsed;
+  try { parsed = JSON.parse(rawV2); } catch (e) {
+    return { doc: wsNewDoc(), migrated: false, corrupt: true };
+  }
+  if (!parsed || typeof parsed !== "object" ||
+      parsed.version !== WS_SCHEMA_VERSION || !Array.isArray(parsed.workspaces)) {
+    return { doc: wsNewDoc(), migrated: false, corrupt: true };
+  }
+  const workspaces = parsed.workspaces.map(wsSanitizeWorkspace).filter(Boolean).slice(0, WS_MAX);
+  if (!workspaces.length) return { doc: wsNewDoc(), migrated: false, corrupt: true };
+  const activeId = workspaces.some((w) => w.id === parsed.activeId) ? parsed.activeId : workspaces[0].id;
+  return { doc: { version: WS_SCHEMA_VERSION, activeId, workspaces }, migrated: false, corrupt: false };
+}
+
+// Accepts our export envelope ({kind:"workspace", workspace:{…}}) or a bare
+// workspace object; returns a FRESH workspace (new id/timestamps) or null.
+function wsValidateImport(obj) {
+  let w = null;
+  if (obj && typeof obj === "object") {
+    if (obj.kind === "workspace" && obj.workspace && typeof obj.workspace === "object") w = obj.workspace;
+    else if (obj.state && typeof obj.state === "object") w = obj;
+  }
+  if (!w) return null;
+  return wsMakeWorkspace(String(w.name || "Imported"), w.state, w.description);
+}
+
+function wsCreate(doc, name, state) {
+  if (doc.workspaces.length >= WS_MAX) return null;
+  const w = wsMakeWorkspace(name, state);
+  doc.workspaces.push(w);
+  doc.activeId = w.id;
+  return w;
+}
+
+function wsDuplicate(doc, id) {
+  const base = doc.workspaces.find((w) => w.id === id);
+  if (!base) return null;
+  const copy = wsCreate(doc, base.name.slice(0, 35) + " copy", base.state);
+  if (copy && base.snapshot) {
+    copy.snapshot = { savedAt: base.snapshot.savedAt, state: wsSanitizeState(base.snapshot.state) };
+  }
+  return copy;
+}
+
+function wsRename(doc, id, name) {
+  const w = doc.workspaces.find((x) => x.id === id);
+  const clean = String(name || "").trim();
+  if (!w || !clean) return false;
+  w.name = clean.slice(0, 40);
+  w.updatedAt = Date.now();
+  return true;
+}
+
+function wsDelete(doc, id) {
+  if (doc.workspaces.length <= 1) return false; // the last workspace is undeletable
+  const before = doc.workspaces.length;
+  doc.workspaces = doc.workspaces.filter((w) => w.id !== id);
+  if (doc.workspaces.length === before) return false;
+  if (doc.activeId === id) doc.activeId = doc.workspaces[0].id;
+  return true;
+}
+
+// ------------------------------ DOM manager -------------------------------
+
+let _wsDoc = null;
+let _wsSaveTimer = null;
+let _wsStorageWarned = false;
+let _wsEditId = null;    // row currently in inline-rename mode
+let _wsDeleteId = null;  // row currently showing the delete confirm
+const _wsPanelCtl = {};  // panel id -> { setCollapsed(on) }
+
+function wsActive() {
+  if (!_wsDoc) return null;
+  return _wsDoc.workspaces.find((w) => w.id === _wsDoc.activeId) || _wsDoc.workspaces[0];
+}
+
+function wsPersist() {
+  if (!_wsDoc) return;
+  try {
+    localStorage.setItem(WS_STORE_KEY, JSON.stringify(_wsDoc));
+  } catch (e) {
+    // Quota/private-mode: warn ONCE — layouts keep working for the session.
+    if (!_wsStorageWarned) {
+      _wsStorageWarned = true;
+      toast("Could not persist workspace layouts (storage unavailable)", "warn");
+    }
+  }
+}
+
+// Read the CURRENT display state from the live DOM. Starts from the saved
+// state so information about panels absent from this DOM (e.g. the rail for
+// a viewer session) is preserved rather than dropped.
+function wsCaptureState() {
+  const active = wsActive();
+  const st = wsSanitizeState(active ? active.state : null);
   const main = document.querySelector(".workspace-main");
-  const st = _wsState();
+  if (main) {
+    st.order = Array.from(main.querySelectorAll(":scope > [data-wpanel]")).map((s) => s.dataset.wpanel);
+  }
+  document.querySelectorAll("[data-wpanel]").forEach((sec) => {
+    st.collapsed[sec.dataset.wpanel] = sec.classList.contains("collapsed");
+  });
+  st.density = document.body.classList.contains("density-compact") ? "compact" : "comfortable";
+  st.chart = { view: chartState.view, interval: chartState.interval, single: chartState.single };
+  const activeTab = document.querySelector("#tabs .tab.active");
+  if (activeTab && activeTab.dataset.tab) st.tab = activeTab.dataset.tab;
+  st.bookSymbol = state.activeSymbol || "";
+  return wsSanitizeState(st);
+}
 
-  // Restore the saved order of the main panels (unknown ids are ignored, so a
-  // stale saved layout can never lose a panel).
-  if (main && Array.isArray(st.order)) {
+// Apply a state to the live UI. Chart view/interval/symbol and the tab are
+// applied by CLICKING the existing controls (skipped when already active), so
+// no second code path exists for them; everything else is class/DOM order.
+function wsApplyState(rawState, opts = {}) {
+  const st = wsSanitizeState(rawState);
+  const main = document.querySelector(".workspace-main");
+  if (main) {
     st.order.forEach((id) => {
       const sec = main.querySelector(`:scope > [data-wpanel="${CSS.escape(id)}"]`);
       if (sec) main.appendChild(sec);
     });
+    const empty = document.getElementById("ws-empty");
+    if (empty) main.appendChild(empty); // the empty-state banner stays last
   }
-  const persistOrder = () => {
-    if (!main) return;
-    const next = _wsState();
-    next.order = Array.from(main.querySelectorAll(":scope > [data-wpanel]")).map((s) => s.dataset.wpanel);
-    _wsSave(next);
+  Object.keys(_wsPanelCtl).forEach((id) => _wsPanelCtl[id].setCollapsed(!!st.collapsed[id]));
+  document.body.classList.toggle("density-compact", st.density === "compact");
+  const clickIfInactive = (sel) => {
+    const b = document.querySelector(sel);
+    if (b && !b.classList.contains("active")) b.click();
   };
+  clickIfInactive(`#chart-view button[data-view="${st.chart.view}"]`);
+  if (st.chart.view === "single") {
+    clickIfInactive(`#chart-sym button[data-sym="${CSS.escape(st.chart.single)}"]`);
+  }
+  clickIfInactive(`#chart-iv button[data-iv="${st.chart.interval}"]`);
+  const tabBtn = document.querySelector(`#tabs .tab[data-tab="${st.tab}"]`);
+  if (tabBtn && !tabBtn.classList.contains("active")) tabBtn.click();
+  if (st.bookSymbol && st.bookSymbol !== state.activeSymbol) setActiveSymbol(st.bookSymbol);
+  wsUpdateEmptyState();
+  if (!opts.noAnim) {
+    const pane = document.querySelector("main .pane:not([hidden])");
+    if (pane) {
+      pane.classList.remove("ws-anim");
+      void pane.offsetWidth; // restart the entrance animation
+      pane.classList.add("ws-anim");
+    }
+  }
+}
 
+// Debounced auto-save: EVERY layout-affecting interaction funnels through
+// here (collapse, reorder, density, chart controls, tab, book symbol) — there
+// is no Save button anywhere.
+function wsAutoSave() {
+  if (!_wsDoc) return;
+  clearTimeout(_wsSaveTimer);
+  _wsSaveTimer = setTimeout(() => {
+    const active = wsActive();
+    if (!active) return;
+    active.state = wsCaptureState();
+    active.updatedAt = Date.now();
+    wsPersist();
+    wsPaintCurrent();
+    const panel = document.getElementById("ws-panel");
+    if (panel && !panel.hidden) wsRenderList();
+  }, 400);
+}
+
+function wsFlushSave() {
+  if (!_wsDoc) return;
+  clearTimeout(_wsSaveTimer);
+  const active = wsActive();
+  if (!active) return;
+  active.state = wsCaptureState();
+  active.updatedAt = Date.now();
+  wsPersist();
+}
+
+function wsSwitch(id) {
+  if (!_wsDoc || id === _wsDoc.activeId) { wsCloseSwitcher(); return; }
+  const target = _wsDoc.workspaces.find((w) => w.id === id);
+  if (!target) return;
+  wsFlushSave(); // never lose the outgoing workspace's latest changes
+  _wsDoc.activeId = id;
+  wsApplyState(target.state);
+  wsPersist();
+  wsPaintCurrent();
+  wsCloseSwitcher();
+  toast(`Workspace: ${target.name}`, "info", 1800);
+}
+
+function wsUpdateEmptyState() {
+  const main = document.querySelector(".workspace-main");
+  const empty = document.getElementById("ws-empty");
+  if (!main || !empty) return;
+  const panels = Array.from(main.querySelectorAll(":scope > [data-wpanel]"));
+  empty.hidden = !panels.length || panels.some((p) => !p.classList.contains("collapsed"));
+}
+
+function wsPaintCurrent() {
+  const label = document.getElementById("ws-current");
+  const active = wsActive();
+  if (label && active) label.textContent = active.name;
+}
+
+function wsRelTime(ts) {
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+function wsRenderList() {
+  const listEl = document.getElementById("ws-list");
+  const search = document.getElementById("ws-search");
+  if (!listEl || !_wsDoc) return;
+  const q = (search ? search.value : "").trim().toLowerCase();
+  const rows = _wsDoc.workspaces.filter((w) => !q || w.name.toLowerCase().includes(q));
+  const many = _wsDoc.workspaces.length > 1;
+  listEl.innerHTML = rows.length ? rows.map((w, i) => {
+    const activeCls = w.id === _wsDoc.activeId ? " active" : "";
+    const panelCount = WS_PANEL_IDS.filter((id) => !w.state.collapsed[id]).length;
+    const collapsedCount = Object.keys(w.state.collapsed).filter((k) => w.state.collapsed[k]).length;
+    const meta = `${panelCount} panels · ${collapsedCount} collapsed · ${wsRelTime(w.updatedAt)}`;
+    if (w.id === _wsEditId) {
+      return `<div class="ws-row editing" data-wsid="${esc(w.id)}">` +
+        `<input class="ws-rename" type="text" value="${esc(w.name)}" maxlength="40" aria-label="Workspace name" />` +
+        `</div>`;
+    }
+    if (w.id === _wsDeleteId) {
+      return `<div class="ws-row deleting" data-wsid="${esc(w.id)}">` +
+        `<span class="ws-name">Delete “${esc(w.name)}”?</span>` +
+        `<span class="ws-acts">` +
+        `<button type="button" class="ws-act neg" data-act="confirm-del" title="Delete">✓</button>` +
+        `<button type="button" class="ws-act" data-act="cancel-del" title="Keep">✕</button>` +
+        `</span></div>`;
+    }
+    return `<div class="ws-row${activeCls}" role="option" aria-selected="${w.id === _wsDoc.activeId}" data-wsid="${esc(w.id)}" data-i="${i}">` +
+      `<span class="ws-dot" aria-hidden="true"></span>` +
+      `<span class="ws-main"><span class="ws-name">${esc(w.name)}</span>` +
+      `<span class="ws-meta">${esc(meta)}</span></span>` +
+      (i < 9 ? `<kbd class="ws-key">${i + 1}</kbd>` : "") +
+      `<span class="ws-acts">` +
+      `<button type="button" class="ws-act" data-act="rename" title="Rename" aria-label="Rename ${esc(w.name)}">✎</button>` +
+      (many ? `<button type="button" class="ws-act" data-act="delete" title="Delete" aria-label="Delete ${esc(w.name)}">🗑</button>` : "") +
+      `</span></div>`;
+  }).join("") : `<div class="ws-none muted">No matching workspace.</div>`;
+  const editInput = listEl.querySelector(".ws-rename");
+  if (editInput) { editInput.focus(); editInput.select(); }
+}
+
+function wsOpenSwitcher(startRename) {
+  const panel = document.getElementById("ws-panel");
+  const btn = document.getElementById("ws-btn");
+  const search = document.getElementById("ws-search");
+  if (!panel || !_wsDoc) return;
+  _wsEditId = startRename ? _wsDoc.activeId : null;
+  _wsDeleteId = null;
+  if (search) search.value = "";
+  panel.hidden = false;
+  if (btn) btn.setAttribute("aria-expanded", "true");
+  wsRenderList();
+  if (!startRename && search) search.focus();
+}
+
+function wsCloseSwitcher() {
+  const panel = document.getElementById("ws-panel");
+  const btn = document.getElementById("ws-btn");
+  if (panel) panel.hidden = true;
+  if (btn) btn.setAttribute("aria-expanded", "false");
+  _wsEditId = null;
+  _wsDeleteId = null;
+}
+
+function wsExportActive() {
+  const active = wsActive();
+  if (!active) return;
+  wsFlushSave();
+  const payload = {
+    app: "dma-terminal", kind: "workspace", version: WS_SCHEMA_VERSION,
+    exportedAt: new Date().toISOString(),
+    workspace: { name: active.name, description: active.description, state: active.state },
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `dma-workspace-${active.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "layout"}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function wsImportFromFile(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    let ws = null;
+    try { ws = wsValidateImport(JSON.parse(String(reader.result))); } catch (e) { /* invalid JSON */ }
+    if (!ws) { toast("Import failed: not a valid workspace file", "neg"); return; }
+    if (_wsDoc.workspaces.length >= WS_MAX) { toast(`Workspace limit reached (${WS_MAX})`, "warn"); return; }
+    wsFlushSave();
+    _wsDoc.workspaces.push(ws);
+    _wsDoc.activeId = ws.id;
+    wsApplyState(ws.state);
+    wsPersist();
+    wsPaintCurrent();
+    wsRenderList();
+    toast(`Imported workspace: ${ws.name}`, "pos");
+  };
+  reader.onerror = () => toast("Import failed: could not read the file", "neg");
+  reader.readAsText(file);
+}
+
+function wireWorkspaces() {
+  // ---- Load (with migration + corruption quarantine) ----
+  let rawV2 = null, rawV1 = null, legacyDensity = null;
+  try {
+    rawV2 = localStorage.getItem(WS_STORE_KEY);
+    rawV1 = localStorage.getItem(WS_LEGACY_KEY);
+    legacyDensity = localStorage.getItem("dma.density");
+  } catch (e) { /* storage unavailable: run on defaults */ }
+  const { doc, migrated, corrupt } = wsParseDoc(rawV2, rawV1, legacyDensity);
+  _wsDoc = doc;
+  if (corrupt && rawV2 != null) {
+    try { localStorage.setItem(WS_STORE_KEY + ".corrupt", rawV2); } catch (e) {}
+    toast("Workspace data was unreadable — reset to defaults (old data kept under …corrupt)", "warn", 8000);
+  }
+  if (migrated) {
+    try { localStorage.removeItem(WS_LEGACY_KEY); } catch (e) {}
+  }
+  wsPersist();
+
+  // ---- Per-panel controls (collapse + drag), registered into _wsPanelCtl ----
+  const main = document.querySelector(".workspace-main");
   document.querySelectorAll("[data-wpanel]").forEach((sec) => {
     const head = sec.querySelector(".panel-head");
     const id = sec.dataset.wpanel;
@@ -4122,21 +4547,19 @@ function wireWorkspace() {
     head.appendChild(tools);
 
     const collapseBtn = tools.querySelector(".wpanel-collapse");
-    const applyCollapsed = (on) => {
+    const setCollapsed = (on) => {
+      if (sec.classList.contains("collapsed") === on) return; // cheap no-op
       sec.classList.toggle("collapsed", on);
       collapseBtn.setAttribute("aria-expanded", String(!on));
       collapseBtn.textContent = on ? "▸" : "▾";
       // Collapsed panels stop paying for data they don't show.
       if (id === "charts") { if (on) stopChartPolling(); else startChartPolling(); }
     };
-    if (st.collapsed && st.collapsed[id]) applyCollapsed(true);
+    _wsPanelCtl[id] = { setCollapsed };
     collapseBtn.addEventListener("click", () => {
-      const on = !sec.classList.contains("collapsed");
-      applyCollapsed(on);
-      const next = _wsState();
-      next.collapsed = next.collapsed || {};
-      next.collapsed[id] = on;
-      _wsSave(next);
+      setCollapsed(!sec.classList.contains("collapsed"));
+      wsUpdateEmptyState();
+      wsAutoSave();
     });
 
     const dragBtn = tools.querySelector(".wpanel-drag");
@@ -4146,8 +4569,7 @@ function wireWorkspace() {
         e.dataTransfer.effectAllowed = "move";
         sec.classList.add("dragging");
       });
-      dragBtn.addEventListener("dragend", () => { sec.classList.remove("dragging"); persistOrder(); });
-      // Keyboard parity for reordering (a11y): Arrow keys swap with a sibling.
+      dragBtn.addEventListener("dragend", () => { sec.classList.remove("dragging"); wsAutoSave(); });
       dragBtn.addEventListener("keydown", (e) => {
         if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
         e.preventDefault();
@@ -4155,12 +4577,11 @@ function wireWorkspace() {
         if (!sib || !sib.dataset || !sib.dataset.wpanel) return;
         if (e.key === "ArrowUp") main.insertBefore(sec, sib);
         else main.insertBefore(sib, sec);
-        persistOrder();
+        wsAutoSave();
         dragBtn.focus();
       });
     }
   });
-
   if (main) {
     main.addEventListener("dragover", (e) => {
       const dragging = main.querySelector(":scope > .dragging");
@@ -4169,25 +4590,167 @@ function wireWorkspace() {
       const over = e.target.closest("[data-wpanel]");
       if (!over || over === dragging || over.parentElement !== main) return;
       const rect = over.getBoundingClientRect();
-      const before = e.clientY < rect.top + rect.height / 2;
-      main.insertBefore(dragging, before ? over : over.nextSibling);
+      main.insertBefore(dragging, e.clientY < rect.top + rect.height / 2 ? over : over.nextSibling);
     });
     main.addEventListener("drop", (e) => e.preventDefault());
   }
+
+  // ---- Auto-save hooks for the non-panel parts of a workspace ----
+  ["chart-view", "chart-iv", "chart-sym"].forEach((cid) => {
+    const el = document.getElementById(cid);
+    if (el) el.addEventListener("click", (e) => { if (e.target.closest("button")) wsAutoSave(); });
+  });
+  const tabs = document.getElementById("tabs");
+  if (tabs) {
+    tabs.addEventListener("click", () => wsAutoSave());
+    tabs.addEventListener("keydown", () => wsAutoSave()); // arrow-key tab switches
+  }
+
+  // ---- Switcher UI ----
+  const btn = document.getElementById("ws-btn");
+  const panel = document.getElementById("ws-panel");
+  const search = document.getElementById("ws-search");
+  const listEl = document.getElementById("ws-list");
+  if (btn && panel) {
+    btn.addEventListener("click", () => { panel.hidden ? wsOpenSwitcher() : wsCloseSwitcher(); });
+    document.addEventListener("click", (e) => {
+      if (!panel.hidden && !panel.contains(e.target) && !btn.contains(e.target)) wsCloseSwitcher();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !panel.hidden) wsCloseSwitcher();
+    });
+  }
+  if (search) {
+    search.addEventListener("input", () => { _wsDeleteId = null; wsRenderList(); });
+    search.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        const first = listEl && listEl.querySelector(".ws-row[data-wsid]:not(.editing):not(.deleting)");
+        if (first) wsSwitch(first.dataset.wsid);
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        const first = listEl && listEl.querySelector(".ws-row[tabindex], .ws-row");
+        if (first && first.focus) { first.setAttribute("tabindex", "0"); first.focus(); }
+      }
+    });
+  }
+  if (listEl) {
+    listEl.addEventListener("click", (e) => {
+      const act = e.target.closest(".ws-act");
+      const row = e.target.closest(".ws-row[data-wsid]");
+      if (!row) return;
+      const id = row.dataset.wsid;
+      if (act) {
+        const kind = act.dataset.act;
+        if (kind === "rename") { _wsEditId = id; _wsDeleteId = null; wsRenderList(); }
+        else if (kind === "delete") { _wsDeleteId = id; _wsEditId = null; wsRenderList(); }
+        else if (kind === "confirm-del") {
+          const wasActive = _wsDoc.activeId === id;
+          if (wsDelete(_wsDoc, id)) {
+            _wsDeleteId = null;
+            if (wasActive) wsApplyState(wsActive().state);
+            wsPersist(); wsPaintCurrent(); wsRenderList();
+            toast("Workspace deleted", "info", 2000);
+          }
+        } else if (kind === "cancel-del") { _wsDeleteId = null; wsRenderList(); }
+        return;
+      }
+      if (row.classList.contains("editing") || row.classList.contains("deleting")) return;
+      wsSwitch(id);
+    });
+    // Inline rename: Enter/blur commits, Esc cancels.
+    listEl.addEventListener("keydown", (e) => {
+      const input = e.target.closest(".ws-rename");
+      if (input) {
+        if (e.key === "Enter") { e.preventDefault(); input.blur(); }
+        else if (e.key === "Escape") { e.preventDefault(); _wsEditId = null; wsRenderList(); }
+        return;
+      }
+      // Keyboard on rows: Enter switches, digits quick-switch, arrows move.
+      const row = e.target.closest(".ws-row[data-wsid]");
+      if (!row) return;
+      if (e.key === "Enter") { e.preventDefault(); wsSwitch(row.dataset.wsid); }
+      else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const sib = e.key === "ArrowDown" ? row.nextElementSibling : row.previousElementSibling;
+        if (sib && sib.classList.contains("ws-row")) { sib.setAttribute("tabindex", "0"); sib.focus(); }
+      }
+    });
+    listEl.addEventListener("focusout", (e) => {
+      const input = e.target.closest && e.target.closest(".ws-rename");
+      if (!input || _wsEditId == null) return;
+      if (wsRename(_wsDoc, _wsEditId, input.value)) wsPersist();
+      _wsEditId = null;
+      wsPaintCurrent();
+      wsRenderList();
+    });
+    // Digits 1–9 select the Nth listed workspace while the switcher is open
+    // (and focus is NOT in the search field, where digits must stay typeable).
+    document.addEventListener("keydown", (e) => {
+      if (!panel || panel.hidden) return;
+      if (e.target === search || _wsEditId) return;
+      if (!/^[1-9]$/.test(e.key)) return;
+      const rows = listEl.querySelectorAll(".ws-row[data-wsid]:not(.editing):not(.deleting)");
+      const row = rows[Number(e.key) - 1];
+      if (row) { e.preventDefault(); wsSwitch(row.dataset.wsid); }
+    });
+  }
+
+  // ---- Footer actions ----
+  const on = (bid, fn) => { const b = document.getElementById(bid); if (b) b.addEventListener("click", fn); };
+  on("ws-new", () => {
+    wsFlushSave();
+    const w = wsCreate(_wsDoc, `Workspace ${_wsDoc.workspaces.length + 1}`, wsCaptureState());
+    if (!w) { toast(`Workspace limit reached (${WS_MAX})`, "warn"); return; }
+    wsPersist(); wsPaintCurrent();
+    _wsEditId = w.id; // Linear-style: a new workspace is born in rename mode
+    wsRenderList();
+  });
+  on("ws-dup", () => {
+    wsFlushSave();
+    const w = wsDuplicate(_wsDoc, _wsDoc.activeId);
+    if (!w) { toast(`Workspace limit reached (${WS_MAX})`, "warn"); return; }
+    wsPersist(); wsPaintCurrent(); wsRenderList();
+    toast(`Duplicated as: ${w.name}`, "pos", 2200);
+  });
+  on("ws-export", wsExportActive);
+  on("ws-import", () => { const f = document.getElementById("ws-import-file"); if (f) f.click(); });
+  const fileInput = document.getElementById("ws-import-file");
+  if (fileInput) fileInput.addEventListener("change", () => {
+    wsImportFromFile(fileInput.files && fileInput.files[0]);
+    fileInput.value = "";
+  });
+  on("ws-snap-save", () => {
+    const active = wsActive();
+    if (!active) return;
+    active.snapshot = { savedAt: Date.now(), state: wsCaptureState() };
+    wsPersist();
+    toast("Snapshot saved for this workspace", "pos", 2200);
+  });
+  on("ws-snap-restore", () => {
+    const active = wsActive();
+    if (!active || !active.snapshot) { toast("No snapshot saved for this workspace yet", "warn"); return; }
+    wsApplyState(active.snapshot.state);
+    wsAutoSave();
+    toast(`Snapshot restored (${wsRelTime(active.snapshot.savedAt)})`, "pos", 2200);
+  });
+  on("ws-reset", () => {
+    wsApplyState(null); // defaults
+    wsAutoSave();
+    toast("Workspace reset to the default layout", "info", 2200);
+  });
+  on("ws-empty-reset", () => { wsApplyState(null); wsAutoSave(); });
+  on("ws-empty-open", () => wsOpenSwitcher());
+
+  // ---- Apply the active workspace ----
+  wsPaintCurrent();
+  wsApplyState(wsActive().state, { noAnim: true });
 }
 
-// ---------------------------------------------------------------------------
-// Table density — compact mode for information-dense sessions; persisted.
-// ---------------------------------------------------------------------------
-function applyDensity() {
-  let compact = false;
-  try { compact = localStorage.getItem("dma.density") === "compact"; } catch (e) {}
-  document.body.classList.toggle("density-compact", compact);
-}
+// Table density is part of the active WORKSPACE's state (info-density is a
+// per-environment preference); this thin toggle exists for the palette.
 function toggleDensity() {
-  const compact = !document.body.classList.contains("density-compact");
-  document.body.classList.toggle("density-compact", compact);
-  try { localStorage.setItem("dma.density", compact ? "compact" : "comfortable"); } catch (e) {}
+  document.body.classList.toggle("density-compact");
+  wsAutoSave();
 }
 
 // ---------------------------------------------------------------------------
@@ -4266,13 +4829,22 @@ function wireCommandPalette() {
       run: () => { const b = document.getElementById("notif-btn"); if (b) b.click(); },
     });
     acts.push({ label: "Keyboard shortcuts", hint: "?", run: openKeysHelp });
-    acts.push({
-      label: "Reset workspace layout", hint: "reload",
-      run: () => {
-        try { localStorage.removeItem(_WS_KEY); } catch (e) {}
-        toast("Workspace layout reset — reload to apply", "info");
-      },
-    });
+    // Workspace actions — all layout/display state; none can reach a write.
+    if (_wsDoc) {
+      _wsDoc.workspaces.forEach((w) => {
+        if (w.id !== _wsDoc.activeId) {
+          acts.push({ label: `Workspace: ${w.name}`, hint: "switch", run: () => wsSwitch(w.id) });
+        }
+      });
+    }
+    acts.push({ label: "New workspace", hint: "layout", run: () => { const b = document.getElementById("ws-new"); wsOpenSwitcher(); if (b) b.click(); } });
+    acts.push({ label: "Duplicate workspace", hint: "layout", run: () => { const b = document.getElementById("ws-dup"); if (b) b.click(); } });
+    acts.push({ label: "Rename workspace", hint: "layout", run: () => wsOpenSwitcher(true) });
+    acts.push({ label: "Export workspace", hint: "json", run: wsExportActive });
+    acts.push({ label: "Import workspace…", hint: "json", run: () => { const f = document.getElementById("ws-import-file"); if (f) f.click(); } });
+    acts.push({ label: "Save layout snapshot", hint: "layout", run: () => { const b = document.getElementById("ws-snap-save"); if (b) b.click(); } });
+    acts.push({ label: "Restore layout snapshot", hint: "layout", run: () => { const b = document.getElementById("ws-snap-restore"); if (b) b.click(); } });
+    acts.push({ label: "Reset workspace layout", hint: "layout", run: () => { const b = document.getElementById("ws-reset"); if (b) b.click(); } });
     const logout = document.getElementById("logout-btn");
     if (logout) acts.push({ label: "Log out", hint: "session", run: () => logout.click() });
     return acts;
@@ -4349,6 +4921,10 @@ document.addEventListener("keydown", (e) => {
   if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
   if (e.key === "?") { e.preventDefault(); openKeysHelp(); return; }
   const key = e.key.toLowerCase();
+  // "W" opens the workspace switcher (search + arrows + digits inside). The
+  // spec's Ctrl+1..9 / Ctrl+Shift+N/D/R were deliberately NOT bound: browsers
+  // own them (tab switching, incognito, bookmark-all, hard-reload).
+  if (key === "w") { e.preventDefault(); wsOpenSwitcher(); return; }
   if (e.key !== "/" && key !== "b" && key !== "s") return;
   const form = document.getElementById("order-form");
   if (!form) return;
@@ -4400,11 +4976,10 @@ document.addEventListener("keydown", (e) => {
   wireTabs();
   wireMarketsHistory();
   wireCharts(); // live candlestick charts (read-only; polls while dashboard visible)
-  wireWorkspace(); // panel collapse/reorder, persisted locally (display-only)
+  wireWorkspaces(); // multi-workspace system: load/migrate, apply active layout
   wireCommandPalette(); // Ctrl/Cmd+K — navigation & display actions only
   wireNotifCenter(); // session notification log (every toast, recoverable)
   wireKeysHelp(); // "?" shortcut reference
-  applyDensity(); // restore saved table density
   wirePrivacyToggle(); // restore saved privacy state BEFORE the first render (no flash)
   wireCurrencyToggle(); // restore saved currency BEFORE the first render
   renderLoading(); // skeleton rows until the first snapshot lands

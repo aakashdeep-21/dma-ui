@@ -924,6 +924,91 @@ table.kv td { text-align: left; }
 .error-msg { color: var(--neg); font-size: 12.5px; min-height: 18px; margin-top: 10px; }
 .brand { display: flex; align-items: center; gap: 10px; }
 
+/* ---------- 17a. Workspace switcher ---------- */
+.ws-wrap { position: relative; display: inline-flex; }
+.ws-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.015));
+  border: 1px solid var(--border-soft); border-radius: var(--radius-sm);
+  color: var(--text); padding: 6px 11px; cursor: pointer;
+  font-size: 12.5px; font-weight: 700; max-width: 200px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+  transition: border-color 0.15s, background 0.15s;
+}
+.ws-btn:hover { border-color: rgba(143,151,255,0.5); background: var(--accent-tint); }
+.ws-btn svg { width: 15px; height: 15px; flex: 0 0 auto; fill: none; stroke: var(--accent-2);
+  stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+#ws-current { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-caret { color: var(--muted); font-size: 10px; }
+
+.ws-panel {
+  position: absolute; top: calc(100% + 10px); left: 0; z-index: 900;
+  width: 340px; max-height: 440px; display: flex; flex-direction: column;
+  background: linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0) 120px), var(--surface-2);
+  border: 1px solid var(--border); border-radius: 14px; overflow: hidden;
+  box-shadow: var(--shadow-pop), 0 0 50px -24px var(--accent-glow);
+  animation: modalIn 0.18s var(--ease-out);
+}
+#ws-search {
+  background: transparent; border: none; border-bottom: 1px solid var(--border-soft);
+  color: var(--text); padding: 12px 14px; font-size: 13px; outline: none; width: 100%;
+}
+.ws-list { overflow-y: auto; padding: 6px; flex: 1; min-height: 60px; }
+.ws-row {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 10px; border-radius: 9px; cursor: pointer;
+  transition: background 0.1s;
+}
+.ws-row:hover, .ws-row:focus-visible { background: var(--accent-tint); }
+.ws-row.active { background: rgba(143,151,255,0.09); box-shadow: inset 0 0 0 1px rgba(143,151,255,0.22); }
+.ws-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--border); }
+.ws-row.active .ws-dot { background: var(--accent-2); box-shadow: 0 0 8px var(--accent-glow); }
+.ws-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ws-name { font-size: 13px; font-weight: 600; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-meta { font-size: 10px; color: var(--muted); font-family: var(--mono); }
+.ws-key { font-family: var(--mono); font-size: 9.5px; color: var(--muted);
+  padding: 1px 5px; border-radius: 4px; background: rgba(255,255,255,0.04);
+  box-shadow: inset 0 0 0 1px var(--border-soft); }
+.ws-acts { display: flex; gap: 3px; opacity: 0; transition: opacity 0.12s; }
+.ws-row:hover .ws-acts, .ws-row:focus-within .ws-acts,
+.ws-row.deleting .ws-acts { opacity: 1; }
+.ws-act {
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  font-size: 12px; padding: 3px 5px; border-radius: 5px;
+}
+.ws-act:hover { color: var(--text); background: rgba(255,255,255,0.06); }
+.ws-act.neg:hover { color: var(--neg); background: var(--neg-tint); }
+.ws-row.editing { padding: 5px 6px; cursor: default; background: transparent; }
+.ws-row.deleting { background: var(--neg-tint); box-shadow: inset 0 0 0 1px rgba(255,77,103,0.3); }
+.ws-row.deleting .ws-name { color: var(--neg); font-size: 12px; }
+.ws-rename {
+  flex: 1; background: rgba(0,0,0,0.4); border: 1px solid var(--accent-2);
+  color: var(--text); padding: 6px 9px; border-radius: 7px; font-size: 13px;
+  outline: none; box-shadow: 0 0 0 3px rgba(143,151,255,0.16);
+}
+.ws-none { padding: 16px; text-align: center; font-size: 12px; }
+.ws-foot {
+  display: flex; gap: 6px; padding: 8px; flex-wrap: wrap;
+  border-top: 1px solid var(--border-soft);
+}
+.ws-foot .btn-ghost.sm { flex: 1; min-width: 0; white-space: nowrap; }
+
+/* Empty workspace (every main panel collapsed) */
+.ws-empty {
+  padding: 44px 16px; text-align: center;
+  border: 1px dashed var(--border); border-radius: var(--radius);
+  color: var(--muted); font-size: 13px;
+  background: rgba(255,255,255,0.012);
+}
+.ws-empty-glyph { font-size: 28px; color: var(--accent-2); opacity: 0.45;
+  text-shadow: 0 0 24px var(--accent-glow); margin-bottom: 10px; }
+.ws-empty-actions { display: flex; gap: 8px; justify-content: center; margin-top: 14px; }
+
+/* Workspace-switch transition (also reused on pane entry) */
+.ws-anim { animation: paneIn 0.22s var(--ease-out); }
+
 /* ---------- 17b. Workspace system (collapse / reorder) ---------- */
 .wpanel-tools { display: flex; gap: 4px; margin-left: 8px; flex: 0 0 auto; }
 .wpanel-btn {
@@ -1100,7 +1185,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 @media (prefers-reduced-motion: reduce) {
   td.flash-up, td.flash-down, .toast, .skel, .meter > span, .btn-primary,
   .stale-data #positions-body, .stale-data #orders-body, .stale-data .topbar-stats,
-  .modal, .cmdk, .loading-msg, .pane, .tab, .cc-card {
+  .modal, .cmdk, .loading-msg, .pane, .tab, .cc-card, .ws-anim, .ws-panel {
     animation: none !important; transition: none !important;
   }
   .conn-on::before { animation: none !important; }
