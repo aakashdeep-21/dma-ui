@@ -2330,16 +2330,6 @@ function buildTable(rows, columns) {
   return `<div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
-// Inline 24h low→high range bar with a marker at the last price. Returns safe
-// HTML built only from coerced numbers.
-function rangeGaugeHTML(low, high, last) {
-  const lo = Number(low), hi = Number(high), lp = Number(last);
-  // Marker position is a ratio within [low, high] — currency-invariant. Only the
-  // displayed last-price text converts (cvtCell).
-  if (!(hi > lo) || !isFinite(lp)) return cvtCell(last);
-  const posPct = Math.min(100, Math.max(0, ((lp - lo) / (hi - lo)) * 100));
-  return `${cvtCell(last)}<span class="range-gauge" role="img" aria-label="24h range position ${posPct.toFixed(0)}%"><span class="mark" style="left:${posPct.toFixed(1)}%"></span></span>`;
-}
 // Key/value table for a single object.
 function buildKV(obj, fields) {
   const entries = fields
@@ -2683,51 +2673,1002 @@ function wireTabs() {
   });
 }
 
-let _marketsData = null;
-let _marketsTimer = null;
-async function fetchMarkets() {
-  const body = document.getElementById("markets-body");
-  try {
-    _marketsData = await api("/api/tickers");
-    renderMarkets();
-  } catch (e) {
-    if (body) body.innerHTML = errorMsg(e.message);
+// ===========================================================================
+// WATCHLIST & MARKET MONITOR  (the "Watch" tab)
+// ---------------------------------------------------------------------------
+// A first-class market-monitoring surface built ON TOP of the existing
+// /api/tickers snapshot poll — NO new backend endpoint and NO new polling
+// loop: the same 15s Markets poll now also feeds the watchlist, builds a
+// symbol→ticker index, appends a per-symbol tick history for sparklines, and
+// evaluates price alerts. Sparklines are session-accumulated from observed
+// ticks on purpose: the kline proxy is symbol-whitelisted + region-fragile, so
+// it cannot serve arbitrary watchlist symbols — deriving trend from the ticks
+// we already fetch is the correct reuse. Rows update IN PLACE (only changed
+// cells repaint) so hundreds of symbols stay smooth and flash-free.
+//
+// Layout: a PURE, DOM-free core (top-level fns, unit-tested in test_snap.mjs)
+// then the DOM manager. Everything here is display/navigation state — nothing
+// can place, modify or cancel an order.
+// ===========================================================================
+
+const WL_STORE_KEY = "dma.watchlists.v1";
+const WL_SCHEMA_VERSION = 1;
+const WL_MAX_LISTS = 40;
+const WL_MAX_SYMBOLS = 500;   // per list; also the render/perf ceiling
+const WL_MAX_ALERTS = 100;
+const WL_SPARK_POINTS = 40;   // tick-history depth per symbol
+const WL_SYMBOL_RE = /^[A-Z0-9]{1,20}$/;
+const WL_FILTERS = ["all", "fav", "gainers", "losers", "movers"];
+const WL_SORTS = ["custom", "symbol", "price", "pct", "vol", "funding", "oi"];
+const WL_ALERT_KINDS = ["above", "below", "pct_up", "pct_down", "funding_abs"];
+const WL_MOVER_PCT = 0.05;    // |24h| ≥ 5% = "mover"
+
+function wlId(prefix) {
+  return (prefix || "wl") + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+function wlSanitizeSymbol(s) {
+  const up = String(s == null ? "" : s).trim().toUpperCase();
+  return WL_SYMBOL_RE.test(up) ? up : null;
+}
+function wlSanitizeSymbols(arr) {
+  const out = [], seen = new Set();
+  if (Array.isArray(arr)) {
+    for (const s of arr) {
+      const v = wlSanitizeSymbol(s);
+      if (v && !seen.has(v)) { seen.add(v); out.push(v); if (out.length >= WL_MAX_SYMBOLS) break; }
+    }
+  }
+  return out;
+}
+function wlSanitizeList(l) {
+  if (!l || typeof l !== "object" || typeof l.id !== "string" || !l.id) return null;
+  const now = Date.now();
+  const symbols = wlSanitizeSymbols(l.symbols);
+  const favs = wlSanitizeSymbols(l.favs).filter((s) => symbols.includes(s));
+  return {
+    id: l.id.slice(0, 40),
+    name: String(l.name || "Watchlist").slice(0, 40),
+    symbols, favs,
+    createdAt: Number(l.createdAt) || now,
+    updatedAt: Number(l.updatedAt) || now,
+  };
+}
+function wlSanitizeAlert(a) {
+  if (!a || typeof a !== "object") return null;
+  const symbol = wlSanitizeSymbol(a.symbol);
+  const value = Number(a.value);
+  if (!symbol || !WL_ALERT_KINDS.includes(a.kind) || !isFinite(value)) return null;
+  return {
+    id: typeof a.id === "string" && a.id ? a.id.slice(0, 40) : wlId("al"),
+    symbol, kind: a.kind, value,
+    createdAt: Number(a.createdAt) || Date.now(),
+    triggered: !!a.triggered,
+  };
+}
+function wlNewDoc() {
+  const fav = wlSanitizeList({ id: wlId("wl"), name: "Favorites", symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT"] });
+  return { version: WL_SCHEMA_VERSION, activeId: fav.id, lists: [fav], alerts: [] };
+}
+// Parse storage into a guaranteed-valid doc. corrupt:true means the caller
+// must quarantine the original blob (user data is never silently discarded);
+// an unknown/future schema version is treated the same way.
+function wlParseDoc(raw) {
+  if (raw == null || raw === "") return { doc: wlNewDoc(), corrupt: false };
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (e) { return { doc: wlNewDoc(), corrupt: true }; }
+  if (!parsed || typeof parsed !== "object" ||
+      parsed.version !== WL_SCHEMA_VERSION || !Array.isArray(parsed.lists)) {
+    return { doc: wlNewDoc(), corrupt: true };
+  }
+  const lists = parsed.lists.map(wlSanitizeList).filter(Boolean).slice(0, WL_MAX_LISTS);
+  if (!lists.length) return { doc: wlNewDoc(), corrupt: true };
+  const alerts = (Array.isArray(parsed.alerts) ? parsed.alerts : [])
+    .map(wlSanitizeAlert).filter(Boolean).slice(0, WL_MAX_ALERTS);
+  const activeId = lists.some((l) => l.id === parsed.activeId) ? parsed.activeId : lists[0].id;
+  return { doc: { version: WL_SCHEMA_VERSION, activeId, lists, alerts }, corrupt: false };
+}
+// Accepts the export envelope ({kind:"watchlist", list:{…}}) or a bare list.
+function wlValidateImport(obj) {
+  let l = null;
+  if (obj && typeof obj === "object") {
+    if (obj.kind === "watchlist" && obj.list && typeof obj.list === "object") l = obj.list;
+    else if (Array.isArray(obj.symbols)) l = obj;
+  }
+  if (!l) return null;
+  return wlSanitizeList({ id: wlId("wl"), name: String(l.name || "Imported"), symbols: l.symbols, favs: l.favs });
+}
+function wlFindList(doc, id) { return doc.lists.find((l) => l.id === id) || null; }
+function wlCreate(doc, name) {
+  if (doc.lists.length >= WL_MAX_LISTS) return null;
+  const l = wlSanitizeList({ id: wlId("wl"), name: name || `Watchlist ${doc.lists.length + 1}`, symbols: [] });
+  doc.lists.push(l);
+  doc.activeId = l.id;
+  return l;
+}
+function wlRename(doc, id, name) {
+  const l = wlFindList(doc, id);
+  const clean = String(name || "").trim();
+  if (!l || !clean) return false;
+  l.name = clean.slice(0, 40); l.updatedAt = Date.now();
+  return true;
+}
+function wlDuplicate(doc, id) {
+  const base = wlFindList(doc, id);
+  if (!base || doc.lists.length >= WL_MAX_LISTS) return null;
+  const copy = wlSanitizeList({
+    id: wlId("wl"), name: base.name.slice(0, 35) + " copy",
+    symbols: base.symbols.slice(), favs: base.favs.slice(),
+  });
+  doc.lists.push(copy);
+  doc.activeId = copy.id;
+  return copy;
+}
+function wlDelete(doc, id) {
+  if (doc.lists.length <= 1) return false; // last list is undeletable
+  const before = doc.lists.length;
+  doc.lists = doc.lists.filter((l) => l.id !== id);
+  if (doc.lists.length === before) return false;
+  if (doc.activeId === id) doc.activeId = doc.lists[0].id;
+  return true;
+}
+function wlAddSymbol(doc, listId, sym) {
+  const l = wlFindList(doc, listId);
+  const v = wlSanitizeSymbol(sym);
+  if (!l || !v || l.symbols.includes(v) || l.symbols.length >= WL_MAX_SYMBOLS) return false;
+  l.symbols.push(v); l.updatedAt = Date.now();
+  return true;
+}
+function wlRemoveSymbol(doc, listId, sym) {
+  const l = wlFindList(doc, listId);
+  const v = wlSanitizeSymbol(sym);
+  if (!l || !v || !l.symbols.includes(v)) return false;
+  l.symbols = l.symbols.filter((s) => s !== v);
+  l.favs = l.favs.filter((s) => s !== v);
+  l.updatedAt = Date.now();
+  return true;
+}
+function wlReorder(doc, listId, sym, beforeSym) {
+  const l = wlFindList(doc, listId);
+  const v = wlSanitizeSymbol(sym);
+  if (!l || !v || !l.symbols.includes(v)) return false;
+  l.symbols = l.symbols.filter((s) => s !== v);
+  const idx = beforeSym ? l.symbols.indexOf(wlSanitizeSymbol(beforeSym) || "") : -1;
+  if (idx >= 0) l.symbols.splice(idx, 0, v); else l.symbols.push(v);
+  l.updatedAt = Date.now();
+  return true;
+}
+function wlMoveSymbol(doc, fromId, toId, sym) {
+  if (fromId === toId) return false;
+  const to = wlFindList(doc, toId);
+  const v = wlSanitizeSymbol(sym);
+  if (!to || !v) return false;
+  if (!to.symbols.includes(v) && to.symbols.length < WL_MAX_SYMBOLS) { to.symbols.push(v); to.updatedAt = Date.now(); }
+  wlRemoveSymbol(doc, fromId, sym);
+  return true;
+}
+function wlToggleFav(doc, listId, sym) {
+  const l = wlFindList(doc, listId);
+  const v = wlSanitizeSymbol(sym);
+  if (!l || !v || !l.symbols.includes(v)) return false;
+  l.favs = l.favs.includes(v) ? l.favs.filter((s) => s !== v) : l.favs.concat([v]);
+  l.updatedAt = Date.now();
+  return true;
+}
+// Should this alert fire NOW, given the current ticker (and the previous last
+// price for edge detection)? Pure — the same call the tests exercise. prev is
+// used only to fire ONCE on the crossing tick for above/below.
+function wlEvalAlert(alert, ticker, prevPrice) {
+  if (!alert || !ticker) return false;
+  const last = Number(ticker.lastPrice);
+  const pct = Number(ticker.price24hPcnt) * 100;
+  const funding = Math.abs(Number(ticker.fundingRate) * 100);
+  const prev = Number(prevPrice);
+  switch (alert.kind) {
+    case "above": return isFinite(last) && last >= alert.value && (!isFinite(prev) || prev < alert.value);
+    case "below": return isFinite(last) && last <= alert.value && (!isFinite(prev) || prev > alert.value);
+    case "pct_up": return isFinite(pct) && pct >= alert.value;
+    case "pct_down": return isFinite(pct) && pct <= alert.value;
+    case "funding_abs": return isFinite(funding) && funding >= alert.value;
+    default: return false;
   }
 }
-function renderMarkets() {
-  const body = document.getElementById("markets-body");
-  if (!body) return;
-  const filter = (document.getElementById("markets-filter").value || "").trim().toUpperCase();
-  let list = listOf(_marketsData);
-  if (filter) list = list.filter((t) => String(t.symbol || "").toUpperCase().includes(filter));
-  if (!list.length) { body.innerHTML = emptyMsg("No matching symbols"); return; }
-  list = list.slice().sort((a, b) => (Number(b.turnover24h) || 0) - (Number(a.turnover24h) || 0));
-  body.innerHTML = buildTable(list.slice(0, 200), [
-    { label: "Symbol", get: (t) => t.symbol },
-    { label: "Last", raw: (t) => rangeGaugeHTML(t.lowPrice24h, t.highPrice24h, t.lastPrice) },
-    { label: "Mark", get: (t) => t.markPrice, money: true },
-    { label: "24h %", get: (t) => pct(t.price24hPcnt), cls: (t) => pnlClass(t.price24hPcnt) },
-    { label: "24h High", get: (t) => t.highPrice24h, money: true },
-    { label: "24h Low", get: (t) => t.lowPrice24h, money: true },
-    { label: "Funding", raw: (t) => fmtFundingHTML(t.fundingRate) },
-    { label: "Open Int", get: (t) => t.openInterest },
-    { label: "Turnover 24h", get: (t) => t.turnover24h, money: true, digits: 0 },
-  ]) + (list.length > 200 ? `<p class="muted" style="padding:8px 16px">Showing top 200 by turnover. Filter to narrow.</p>` : "");
+// Compute the ordered VISIBLE symbols for a list + view. Pure: `index` maps
+// symbol → {price24hPcnt, lastPrice, turnover24h, fundingRate, openInterest}.
+function wlComputeView(symbols, favs, index, opts) {
+  const o = opts || {};
+  const favSet = new Set(favs || []);
+  const q = String(o.query || "").trim().toUpperCase();
+  let out = (symbols || []).slice();
+  if (q) out = out.filter((s) => s.includes(q));
+  const met = (s) => index[s] || {};
+  if (o.filter === "fav") out = out.filter((s) => favSet.has(s));
+  else if (o.filter === "gainers") out = out.filter((s) => Number(met(s).price24hPcnt) > 0);
+  else if (o.filter === "losers") out = out.filter((s) => Number(met(s).price24hPcnt) < 0);
+  else if (o.filter === "movers") out = out.filter((s) => Math.abs(Number(met(s).price24hPcnt) || 0) >= WL_MOVER_PCT);
+  const sort = WL_SORTS.includes(o.sort) ? o.sort : "custom";
+  const dir = o.dir === "asc" ? 1 : -1;
+  if (sort === "custom") {
+    // Favorites float to the top, each group keeping its manual order.
+    const fav = out.filter((s) => favSet.has(s));
+    const rest = out.filter((s) => !favSet.has(s));
+    out = fav.concat(rest);
+  } else if (sort === "symbol") {
+    out.sort((a, b) => a.localeCompare(b) * dir);
+  } else {
+    const keyOf = {
+      price: (s) => Number(met(s).lastPrice) || 0,
+      pct: (s) => Number(met(s).price24hPcnt) || 0,
+      vol: (s) => Number(met(s).turnover24h) || 0,
+      funding: (s) => Number(met(s).fundingRate) || 0,
+      oi: (s) => Number(met(s).openInterest) || 0,
+    }[sort];
+    out.sort((a, b) => (keyOf(a) - keyOf(b)) * dir);
+  }
+  return out;
 }
+
+// ------------------------------ DOM manager -------------------------------
+
+let _marketsData = null;         // kept name: raw /api/tickers envelope (ticker universe)
+let _marketsTimer = null;        // kept name: the shared 15s poll interval id
+let _wlDoc = null;
+let _tickerIndex = {};           // symbol → ticker object (rebuilt each poll)
+let _tickHistory = {};           // symbol → [last prices] (sparkline source)
+let _wlView = { filter: "all", sort: "custom", dir: "desc", query: "" };
+const _wlRowEls = {};            // symbol → row element (keyed, in-place patched)
+let _wlPrevPrice = {};           // symbol → last price (direction flash + alert edges)
+let _wlRenderedKey = "";         // signature of the last full render
+let _wlSaveTimer = null;
+let _wlStorageWarned = false;
+
+function wlActiveList() {
+  if (!_wlDoc) return null;
+  return wlFindList(_wlDoc, _wlDoc.activeId) || _wlDoc.lists[0];
+}
+function wlPersist() {
+  if (!_wlDoc) return;
+  try { localStorage.setItem(WL_STORE_KEY, JSON.stringify(_wlDoc)); }
+  catch (e) {
+    if (!_wlStorageWarned) { _wlStorageWarned = true; toast("Could not persist watchlists (storage unavailable)", "warn"); }
+  }
+}
+function wlLoad() {
+  let raw = null;
+  try { raw = localStorage.getItem(WL_STORE_KEY); } catch (e) {}
+  const { doc, corrupt } = wlParseDoc(raw);
+  _wlDoc = doc;
+  if (corrupt && raw != null) {
+    try { localStorage.setItem(WL_STORE_KEY + ".corrupt", raw); } catch (e) {}
+    toast("Watchlist data was unreadable — reset to defaults (old data kept under …corrupt)", "warn", 8000);
+  }
+  wlPersist();
+}
+
+// Price decimals heuristic (tickers carry no tickSize): larger prices show
+// fewer decimals, sub-dollar symbols show more.
+function wlPriceDp(v) {
+  const n = Math.abs(Number(v));
+  if (!isFinite(n) || n === 0) return 2;
+  if (n >= 1000) return 1;
+  if (n >= 1) return 2;
+  if (n >= 0.01) return 5;
+  return 8;
+}
+
+function wlSparkline(sym) {
+  const h = _tickHistory[sym];
+  if (!h || h.length < 2) return "";
+  const w = 60, ht = 20, pad = 2;
+  let min = Infinity, max = -Infinity;
+  for (const v of h) { if (v < min) min = v; if (v > max) max = v; }
+  const span = (max - min) || 1;
+  const dx = (w - pad * 2) / (h.length - 1);
+  const pts = h.map((v, i) => `${(pad + i * dx).toFixed(1)},${(ht - pad - ((v - min) / span) * (ht - pad * 2)).toFixed(1)}`).join(" ");
+  const up = h[h.length - 1] >= h[0];
+  const col = up ? "var(--pos)" : "var(--neg)";
+  return `<svg class="wl-spark" viewBox="0 0 ${w} ${ht}" preserveAspectRatio="none" aria-hidden="true">` +
+    `<polyline points="${pts}" style="fill:none;stroke:${col};stroke-width:1.4;vector-effect:non-scaling-stroke"/></svg>`;
+}
+
+// Build a row skeleton once; dynamic cells are patched by wlPatchRow.
+function wlBuildRow(sym) {
+  const row = document.createElement("div");
+  row.className = "wl-row";
+  row.setAttribute("role", "listitem");
+  row.dataset.sym = sym;
+  row.tabIndex = 0;
+  row.draggable = true;
+  row.innerHTML =
+    // Market data is PUBLIC — deliberately NOT `.priv`: privacy mode masks
+    // account figures (balances/sizes/PnL), never public prices (consistent
+    // with the charts, order book and old Markets tab).
+    `<button class="wl-fav" type="button" tabindex="-1" aria-label="Toggle favorite ${esc(sym)}" title="Favorite">★</button>` +
+    `<span class="wl-sym mono">${esc(sym)}</span>` +
+    `<span class="wl-spark-cell"></span>` +
+    `<span class="wl-last mono"></span>` +
+    `<span class="wl-pct mono"></span>` +
+    `<span class="wl-mark mono wl-opt"></span>` +
+    `<span class="wl-index mono wl-opt"></span>` +
+    `<span class="wl-funding mono wl-opt"></span>` +
+    `<span class="wl-spread mono wl-opt"></span>` +
+    `<span class="wl-vol mono wl-opt"></span>` +
+    `<span class="wl-oi mono wl-opt"></span>` +
+    `<button class="wl-more" type="button" tabindex="-1" aria-label="Actions for ${esc(sym)}" title="Actions (right-click or Menu key)">⋯</button>`;
+  return row;
+}
+
+// Patch ONLY the changing cells of one row from the current ticker index.
+function wlPatchRow(row, sym) {
+  const t = _tickerIndex[sym];
+  const q = (sel) => row.querySelector(sel);
+  const active = wlActiveList();
+  const isFav = active && active.favs.includes(sym);
+  row.classList.toggle("is-fav", !!isFav);
+  const favBtn = q(".wl-fav");
+  if (favBtn) favBtn.classList.toggle("on", !!isFav);
+  if (!t) {
+    q(".wl-last").textContent = "—";
+    q(".wl-pct").textContent = "";
+    q(".wl-spark-cell").innerHTML = "";
+    return;
+  }
+  const dp = wlPriceDp(t.lastPrice);
+  const last = Number(t.lastPrice);
+  const prev = _wlPrevPrice[sym];
+  // Direction flash on a MEANINGFUL change only (subtle bg fade, not a blink).
+  if (isFinite(last) && isFinite(prev) && last !== prev) {
+    const cls = last > prev ? "tick-up" : "tick-down";
+    row.classList.remove("tick-up", "tick-down");
+    void row.offsetWidth;
+    row.classList.add(cls);
+  }
+  q(".wl-last").textContent = fmtMoney(t.lastPrice, dp);
+  const pctEl = q(".wl-pct");
+  pctEl.textContent = pct(t.price24hPcnt);
+  pctEl.className = "wl-pct mono " + pnlClass(t.price24hPcnt);
+  q(".wl-mark").textContent = fmtMoney(t.markPrice, dp);
+  q(".wl-index").textContent = t.indexPrice != null ? fmtMoney(t.indexPrice, dp) : "—";
+  const fEl = q(".wl-funding");
+  fEl.innerHTML = fmtFundingHTML(t.fundingRate);
+  const bid = Number(t.bid1Price), ask = Number(t.ask1Price);
+  q(".wl-spread").textContent = (isFinite(bid) && isFinite(ask) && ask >= bid)
+    ? fmtMoney(ask - bid, wlPriceDp(ask - bid || ask)) : "—";
+  q(".wl-vol").textContent = t.turnover24h != null ? fmtMoney(t.turnover24h, 0) : "—";
+  q(".wl-oi").textContent = t.openInterest != null ? fmtNum(t.openInterest, 0) : "—";
+  q(".wl-spark-cell").innerHTML = wlSparkline(sym);
+}
+
+function wlViewKey(visible) {
+  return _wlDoc.activeId + "|" + _wlView.filter + "|" + _wlView.sort + "|" + _wlView.dir +
+    "|" + _wlView.query + "|" + visible.join(",");
+}
+
+// Decide full re-layout vs cheap value patch. Called every poll and on any
+// view/list change.
+function wlSync() {
+  if (!_wlDoc) return;
+  const list = wlActiveList();
+  const visible = list ? wlComputeView(list.symbols, list.favs, _tickerIndex, _wlView) : [];
+  const key = wlViewKey(visible);
+  if (key !== _wlRenderedKey) { _wlRenderFull(visible); _wlRenderedKey = key; }
+  else { visible.forEach((s) => { const r = _wlRowEls[s]; if (r) wlPatchRow(r, s); }); }
+  // Record prices AFTER patching so the next poll's direction flash is correct.
+  visible.forEach((s) => { const t = _tickerIndex[s]; if (t && isFinite(Number(t.lastPrice))) _wlPrevPrice[s] = Number(t.lastPrice); });
+  wlRenderSyncedLabel();
+}
+
+function _wlRenderFull(visible) {
+  const rowsEl = document.getElementById("wl-rows");
+  const emptyEl = document.getElementById("wl-empty");
+  if (!rowsEl || !emptyEl) return;
+  const list = wlActiveList();
+  if (!list) return;
+  if (!visible.length) {
+    rowsEl.innerHTML = "";
+    emptyEl.hidden = false;
+    let title, hint, action;
+    if (!list.symbols.length) { title = "This watchlist is empty"; hint = "Search a symbol above to add it, or import a list."; action = "add"; }
+    else if (_wlView.query) { title = "No symbols match your search"; hint = `Nothing in “${esc(list.name)}” matches that filter.`; action = "clear"; }
+    else if (_wlView.filter === "fav") { title = "No favorites yet"; hint = "Star a symbol to pin it here."; action = "allfilter"; }
+    else { title = "Nothing matches this filter"; hint = "Try a different quick filter."; action = "allfilter"; }
+    emptyEl.innerHTML =
+      `<div class="wl-empty-glyph" aria-hidden="true">◵</div>` +
+      `<p class="wl-empty-title">${esc(title)}</p>` +
+      `<p class="wl-empty-hint">${esc(hint)}</p>` +
+      `<div class="wl-empty-actions">` +
+        (action === "add" ? `<button class="btn-primary sm" data-wlempty="add">Add a symbol</button>` : "") +
+        (action === "clear" ? `<button class="btn-ghost sm" data-wlempty="clear">Clear search</button>` : "") +
+        (action === "allfilter" ? `<button class="btn-ghost sm" data-wlempty="allfilter">Show all</button>` : "") +
+      `</div>`;
+    return;
+  }
+  emptyEl.hidden = true;
+  const frag = document.createDocumentFragment();
+  visible.forEach((sym) => {
+    let row = _wlRowEls[sym];
+    if (!row) { row = wlBuildRow(sym); _wlRowEls[sym] = row; }
+    frag.appendChild(row);
+  });
+  rowsEl.replaceChildren(frag);
+  visible.forEach((s) => wlPatchRow(_wlRowEls[s], s));
+  // Prune cached rows no longer in this list (bounded, but tidy).
+  const live = new Set(list.symbols);
+  Object.keys(_wlRowEls).forEach((s) => { if (!live.has(s)) delete _wlRowEls[s]; });
+}
+
+function wlRenderSyncedLabel() {
+  const el = document.getElementById("wl-synced");
+  if (!el) return;
+  const list = wlActiveList();
+  const n = list ? list.symbols.length : 0;
+  el.textContent = _marketsData ? `${n} sym${n === 1 ? "bol" : "bols"} · live` : "connecting…";
+}
+
+// The list tab strip.
+function wlRenderLists() {
+  const el = document.getElementById("wl-lists");
+  if (!el || !_wlDoc) return;
+  el.innerHTML = _wlDoc.lists.map((l) => {
+    const on = l.id === _wlDoc.activeId;
+    return `<button type="button" class="wl-chip${on ? " active" : ""}" role="tab" aria-selected="${on}" ` +
+      `data-wlid="${esc(l.id)}" title="${esc(l.name)} · ${l.symbols.length} symbols">` +
+      `<span class="wl-chip-name">${esc(l.name)}</span><span class="wl-chip-n">${l.symbols.length}</span></button>`;
+  }).join("") +
+    `<button type="button" class="wl-chip wl-chip-new" id="wl-new" title="New watchlist" aria-label="New watchlist">＋</button>`;
+}
+
+function wlSwitchList(id) {
+  if (!_wlDoc || !wlFindList(_wlDoc, id)) return;
+  _wlDoc.activeId = id;
+  _wlPrevPrice = {};                 // fresh direction baseline for the new list
+  Object.keys(_wlRowEls).forEach((k) => delete _wlRowEls[k]);
+  wlPersist();
+  wlRenderLists();
+  _wlRenderedKey = "";               // force a full re-layout
+  wlSync();
+  wsAutoSave();                      // the active list is part of the workspace
+}
+
+function wlAutoSaveView() {
+  clearTimeout(_wlSaveTimer);
+  _wlSaveTimer = setTimeout(() => { wsAutoSave(); }, 300);
+}
+
+// ---- data poll (reuses the existing 15s Markets cadence) ----
+async function fetchMarkets() {
+  try {
+    _marketsData = await api("/api/tickers");
+  } catch (e) {
+    const rowsEl = document.getElementById("wl-rows");
+    if (rowsEl && !Object.keys(_wlRowEls).length) rowsEl.innerHTML = errorMsg(e.message);
+    return;
+  }
+  // Rebuild the symbol→ticker index + append tick history (bounded).
+  const idx = {};
+  listOf(_marketsData).forEach((t) => {
+    const s = wlSanitizeSymbol(t.symbol);
+    if (!s) return;
+    idx[s] = t;
+    const lp = Number(t.lastPrice);
+    if (isFinite(lp)) {
+      (_tickHistory[s] = _tickHistory[s] || []).push(lp);
+      if (_tickHistory[s].length > WL_SPARK_POINTS) _tickHistory[s].shift();
+    }
+  });
+  _tickerIndex = idx;
+  wlEvaluateAlerts();
+  wlSync();
+}
+
+// renderMarkets kept as an alias for the currency-lens re-render hook.
+function renderMarkets() { _wlRenderedKey = ""; wlSync(); }
+
 function onMarketsActive() {
+  if (_wlDoc) { wlRenderLists(); wlSync(); }
   if (!_marketsData) fetchMarkets();
   clearInterval(_marketsTimer);
-  // Capture the id locally so the self-clearing callback cancels ITS OWN interval,
-  // not whatever _marketsTimer happens to point at after a re-entry.
   const id = setInterval(() => {
     const pane = document.querySelector('[data-pane="markets"]');
     if (!pane || pane.hidden) { clearInterval(id); return; }
-    // Skip (don't cancel) the tick while the BROWSER tab is backgrounded — the
-    // full-tickers poll is pure waste with nothing on screen; it resumes on the
-    // next tick once the tab is visible again.
     if (!document.hidden) fetchMarkets();
   }, 15000);
   _marketsTimer = id;
+}
+
+// ---- alerts (client-side; notify only, never a trade) ----
+function wlEvaluateAlerts() {
+  if (!_wlDoc || !_wlDoc.alerts.length) return;
+  let changed = false;
+  _wlDoc.alerts.forEach((a) => {
+    if (a.triggered) return;
+    const t = _tickerIndex[a.symbol];
+    if (t && wlEvalAlert(a, t, _wlPrevPrice[a.symbol])) {
+      a.triggered = true;
+      changed = true;
+      toast(`Alert · ${a.symbol} ${wlAlertLabel(a)}`, "warn", 8000);
+    }
+  });
+  if (changed) wlPersist();
+}
+function wlAlertLabel(a) {
+  switch (a.kind) {
+    case "above": return `rose above ${a.value}`;
+    case "below": return `fell below ${a.value}`;
+    case "pct_up": return `24h change ≥ ${a.value}%`;
+    case "pct_down": return `24h change ≤ ${a.value}%`;
+    case "funding_abs": return `|funding| ≥ ${a.value}%`;
+    default: return "triggered";
+  }
+}
+
+// Quick-trade integration: open a watchlist symbol in the trading surfaces.
+// trade=true (admin) loads the full ticket (which fans out to chart/book/
+// preview via its input handler); otherwise just points the order book at it.
+function wlOpenSymbol(sym, opts) {
+  const v = wlSanitizeSymbol(sym);
+  if (!v) return;
+  const trade = !opts || opts.trade !== false;
+  const dashTab = document.querySelector('#tabs .tab[data-tab="dashboard"]');
+  if (dashTab) dashTab.click();
+  if (trade && document.getElementById("order-form")) loadSymbolIntoTicket(v);
+  else setActiveSymbol(v);
+}
+
+// ---- symbol search (add-to-list) ----
+let _wlSearchSel = -1;
+function wlSearchMatches(q) {
+  const query = String(q || "").trim().toUpperCase();
+  if (!query) return [];
+  const list = wlActiveList();
+  const inList = new Set(list ? list.symbols : []);
+  const all = Object.keys(_tickerIndex);
+  // Rank: startsWith first, then substring; already-in-list still shown (marked).
+  const starts = [], contains = [];
+  for (const s of all) {
+    if (s === query) starts.unshift(s);
+    else if (s.startsWith(query)) starts.push(s);
+    else if (s.includes(query)) contains.push(s);
+  }
+  return starts.concat(contains).slice(0, 12).map((s) => ({ sym: s, inList: inList.has(s) }));
+}
+function wlRenderSearch() {
+  const input = document.getElementById("wl-search");
+  const box = document.getElementById("wl-search-results");
+  if (!input || !box) return;
+  const q = input.value;
+  if (!q.trim()) { box.hidden = true; input.setAttribute("aria-expanded", "false"); return; }
+  const matches = wlSearchMatches(q);
+  if (_wlSearchSel >= matches.length) _wlSearchSel = matches.length - 1;
+  box.innerHTML = matches.length
+    ? matches.map((m, i) => {
+        const t = _tickerIndex[m.sym] || {};
+        return `<div class="wl-sr-item${i === _wlSearchSel ? " sel" : ""}" role="option" aria-selected="${i === _wlSearchSel}" data-sym="${esc(m.sym)}">` +
+          `<span class="wl-sr-sym mono">${esc(m.sym)}</span>` +
+          `<span class="wl-sr-px mono ${pnlClass(t.price24hPcnt)}">${t.lastPrice != null ? esc(fmtNum(t.lastPrice, wlPriceDp(t.lastPrice))) : ""} <em>${t.price24hPcnt != null ? esc(pct(t.price24hPcnt)) : ""}</em></span>` +
+          (m.inList ? `<span class="wl-sr-in">✓ in list</span>` : `<span class="wl-sr-add">＋ add</span>`) +
+          `</div>`;
+      }).join("")
+    : `<div class="wl-sr-empty muted">No market matches “${esc(q.trim().toUpperCase())}”.</div>`;
+  box.hidden = false;
+  input.setAttribute("aria-expanded", "true");
+}
+function wlAddFromSearch(sym) {
+  const v = wlSanitizeSymbol(sym);
+  if (!v) return;
+  const list = wlActiveList();
+  if (!list) return;
+  if (list.symbols.includes(v)) { toast(`${v} is already in “${list.name}”`, "info", 2000); return; }
+  if (wlAddSymbol(_wlDoc, list.id, v)) {
+    wlPersist(); wlRenderLists(); _wlRenderedKey = ""; wlSync();
+    toast(`Added ${v} to “${list.name}”`, "pos", 2000);
+  } else {
+    toast(`Could not add ${v} (list full?)`, "warn");
+  }
+}
+
+// ---- context menu ----
+function wlCloseCtx() {
+  const menu = document.getElementById("wl-ctx");
+  if (menu) { menu.hidden = true; menu.innerHTML = ""; }
+}
+function wlOpenCtx(sym, x, y) {
+  const menu = document.getElementById("wl-ctx");
+  const list = wlActiveList();
+  if (!menu || !list) return;
+  const isAdmin = state.role === "admin" && !!document.getElementById("order-form");
+  const isFav = list.favs.includes(sym);
+  const others = _wlDoc.lists.filter((l) => l.id !== list.id);
+  const item = (act, label, extra) => `<button class="wl-ctx-item" role="menuitem" tabindex="-1" data-act="${act}"${extra || ""}>${label}</button>`;
+  menu.innerHTML =
+    `<div class="wl-ctx-head mono">${esc(sym)}</div>` +
+    (isAdmin ? item("trade", "Trade this symbol") : "") +
+    item("chart", "Open chart &amp; book") +
+    item("fav", isFav ? "★ Remove favorite" : "☆ Add favorite") +
+    item("alert", "Set price alert…") +
+    item("copy", "Copy symbol") +
+    item("history", "Open journal") +
+    (others.length ? `<div class="wl-ctx-sep"></div><div class="wl-ctx-label">Move to</div>` +
+      others.slice(0, 6).map((l) => item("move", `→ ${esc(l.name)}`, ` data-listid="${esc(l.id)}"`)).join("") : "") +
+    `<div class="wl-ctx-sep"></div>` +
+    item("remove", "Remove from list");
+  menu.dataset.sym = sym;
+  menu.hidden = false;
+  // Clamp to viewport.
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = Math.min(x, vw - rect.width - 8) + "px";
+  menu.style.top = Math.min(y, vh - rect.height - 8) + "px";
+  const first = menu.querySelector(".wl-ctx-item");
+  if (first) first.focus();
+}
+function wlCtxAction(act, sym, el) {
+  const list = wlActiveList();
+  if (!list) return;
+  switch (act) {
+    case "trade": wlOpenSymbol(sym, { trade: true }); break;
+    case "chart": wlOpenSymbol(sym, { trade: false }); break;
+    case "fav":
+      if (wlToggleFav(_wlDoc, list.id, sym)) { wlPersist(); _wlRenderedKey = ""; wlSync(); }
+      break;
+    case "alert": wlOpenAlert(sym); break;
+    case "copy":
+      try { navigator.clipboard.writeText(sym); toast(`Copied ${sym}`, "info", 1500); }
+      catch (e) { toast("Clipboard unavailable", "warn"); }
+      break;
+    case "history": {
+      const t = document.querySelector('#tabs .tab[data-tab="history"]');
+      if (t) t.click();
+      break;
+    }
+    case "move": {
+      const toId = el && el.dataset.listid;
+      if (toId && wlMoveSymbol(_wlDoc, list.id, toId, sym)) {
+        wlPersist(); wlRenderLists(); _wlRenderedKey = ""; wlSync();
+        const dest = wlFindList(_wlDoc, toId);
+        toast(`Moved ${sym} → “${dest ? dest.name : ""}”`, "pos", 2000);
+      }
+      break;
+    }
+    case "remove":
+      if (wlRemoveSymbol(_wlDoc, list.id, sym)) { wlPersist(); wlRenderLists(); _wlRenderedKey = ""; wlSync(); }
+      break;
+  }
+  wlCloseCtx();
+}
+
+// ---- price-alert modal ----
+let _wlAlertSym = null;
+function wlRenderAlertExisting() {
+  const box = document.getElementById("alert-existing");
+  if (!box || !_wlDoc) return;
+  const mine = _wlDoc.alerts.filter((a) => a.symbol === _wlAlertSym);
+  box.innerHTML = mine.length
+    ? `<div class="ae-title">Active alerts</div>` + mine.map((a) =>
+        `<div class="ae-row${a.triggered ? " done" : ""}"><span>${esc(wlAlertLabel(a))}${a.triggered ? " · fired" : ""}</span>` +
+        `<button type="button" class="ws-act" data-alid="${esc(a.id)}" aria-label="Remove alert">✕</button></div>`
+      ).join("")
+    : `<div class="ae-empty muted">No alerts on ${esc(_wlAlertSym || "")} yet.</div>`;
+}
+function wlOpenAlert(sym) {
+  const v = wlSanitizeSymbol(sym);
+  if (!v) return;
+  _wlAlertSym = v;
+  const overlay = document.getElementById("alert-overlay");
+  const ctx = document.getElementById("alert-context");
+  const out = document.getElementById("alert-result");
+  const valInput = document.getElementById("alert-value");
+  if (!overlay) return;
+  const t = _tickerIndex[v];
+  if (ctx) ctx.textContent = t && t.lastPrice != null
+    ? `${v} · last ${fmtNum(t.lastPrice, wlPriceDp(t.lastPrice))} · alerts notify only, never trade`
+    : `${v} · alerts notify only, never trade`;
+  if (out) { out.textContent = ""; out.className = "result-msg"; }
+  if (valInput) valInput.value = "";
+  wlRenderAlertExisting();
+  overlay.hidden = false;
+  if (valInput) valInput.focus();
+}
+
+// ---- list-chip inline rename ----
+function wlStartRenameChip(chip) {
+  if (!chip || !_wlDoc) return;
+  const id = chip.dataset.wlid;
+  const l = wlFindList(_wlDoc, id);
+  if (!l) return;
+  chip.innerHTML = `<input class="wl-chip-edit" type="text" value="${esc(l.name)}" maxlength="40" aria-label="Rename watchlist" />`;
+  const input = chip.querySelector("input");
+  input.focus(); input.select();
+  const commit = () => {
+    if (wlRename(_wlDoc, id, input.value)) wlPersist();
+    wlRenderLists();
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); commit(); }
+    else if (e.key === "Escape") { e.preventDefault(); wlRenderLists(); }
+  });
+  input.addEventListener("blur", commit);
+}
+
+function wlExportActive() {
+  const list = wlActiveList();
+  if (!list) return;
+  const payload = {
+    app: "dma-terminal", kind: "watchlist", version: WL_SCHEMA_VERSION,
+    exportedAt: new Date().toISOString(),
+    list: { name: list.name, symbols: list.symbols, favs: list.favs },
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `dma-watchlist-${list.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "list"}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function wireWatchlist() {
+  wlLoad();
+  wlRenderLists();
+
+  // ---- list chips: switch / new / rename (double-click) / drop-target ----
+  const listsEl = document.getElementById("wl-lists");
+  if (listsEl) {
+    listsEl.addEventListener("click", (e) => {
+      if (e.target.closest(".wl-chip-edit")) return;
+      const newBtn = e.target.closest("#wl-new");
+      if (newBtn) {
+        const l = wlCreate(_wlDoc, `Watchlist ${_wlDoc.lists.length + 1}`);
+        if (!l) { toast(`Watchlist limit reached (${WL_MAX_LISTS})`, "warn"); return; }
+        wlPersist(); wlRenderLists();
+        _wlPrevPrice = {}; Object.keys(_wlRowEls).forEach((k) => delete _wlRowEls[k]);
+        _wlRenderedKey = ""; wlSync(); wsAutoSave();
+        const chip = listsEl.querySelector(`.wl-chip[data-wlid="${CSS.escape(l.id)}"]`);
+        if (chip) wlStartRenameChip(chip);
+        return;
+      }
+      const chip = e.target.closest(".wl-chip[data-wlid]");
+      if (chip) wlSwitchList(chip.dataset.wlid);
+    });
+    listsEl.addEventListener("dblclick", (e) => {
+      const chip = e.target.closest(".wl-chip[data-wlid]");
+      if (chip) wlStartRenameChip(chip);
+    });
+    // Symbols can be dropped onto a chip to MOVE them to that list.
+    listsEl.addEventListener("dragover", (e) => {
+      if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("application/x-wl-sym")) {
+        e.preventDefault();
+        const chip = e.target.closest(".wl-chip[data-wlid]");
+        listsEl.querySelectorAll(".wl-chip.drop").forEach((c) => c.classList.remove("drop"));
+        if (chip) chip.classList.add("drop");
+      }
+    });
+    listsEl.addEventListener("dragleave", (e) => {
+      const chip = e.target.closest(".wl-chip");
+      if (chip) chip.classList.remove("drop");
+    });
+    listsEl.addEventListener("drop", (e) => {
+      const chip = e.target.closest(".wl-chip[data-wlid]");
+      listsEl.querySelectorAll(".wl-chip.drop").forEach((c) => c.classList.remove("drop"));
+      if (!chip) return;
+      const sym = e.dataTransfer.getData("application/x-wl-sym");
+      const active = wlActiveList();
+      if (sym && active && chip.dataset.wlid !== active.id && wlMoveSymbol(_wlDoc, active.id, chip.dataset.wlid, sym)) {
+        e.preventDefault();
+        wlPersist(); wlRenderLists(); _wlRenderedKey = ""; wlSync();
+        toast(`Moved ${sym}`, "pos", 1500);
+      }
+    });
+  }
+
+  // ---- search ----
+  const search = document.getElementById("wl-search");
+  const results = document.getElementById("wl-search-results");
+  if (search) {
+    search.addEventListener("input", () => { _wlSearchSel = 0; wlRenderSearch(); });
+    search.addEventListener("keydown", (e) => {
+      const matches = wlSearchMatches(search.value);
+      if (e.key === "ArrowDown") { e.preventDefault(); _wlSearchSel = Math.min(_wlSearchSel + 1, matches.length - 1); wlRenderSearch(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); _wlSearchSel = Math.max(_wlSearchSel - 1, 0); wlRenderSearch(); }
+      else if (e.key === "Enter") {
+        e.preventDefault();
+        const pick = matches[_wlSearchSel] || matches[0];
+        if (pick) { wlAddFromSearch(pick.sym); search.value = ""; wlRenderSearch(); }
+      } else if (e.key === "Escape") { search.value = ""; wlRenderSearch(); search.blur(); }
+    });
+    search.addEventListener("blur", () => setTimeout(() => { if (results) results.hidden = true; }, 150));
+  }
+  if (results) {
+    results.addEventListener("mousedown", (e) => {
+      const item = e.target.closest(".wl-sr-item[data-sym]");
+      if (item) { e.preventDefault(); wlAddFromSearch(item.dataset.sym); if (search) { search.value = ""; wlRenderSearch(); search.focus(); } }
+    });
+  }
+
+  // ---- filters + sort ----
+  const filters = document.getElementById("wl-filters");
+  if (filters) filters.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-filter]");
+    if (!b) return;
+    _wlView.filter = WL_FILTERS.includes(b.dataset.filter) ? b.dataset.filter : "all";
+    filters.querySelectorAll("button").forEach((x) => {
+      const on = x === b; x.classList.toggle("active", on); x.setAttribute("aria-pressed", String(on));
+    });
+    _wlRenderedKey = ""; wlSync(); wlAutoSaveView();
+  });
+  const sortSel = document.getElementById("wl-sort");
+  if (sortSel) sortSel.addEventListener("change", () => {
+    _wlView.sort = WL_SORTS.includes(sortSel.value) ? sortSel.value : "custom";
+    _wlRenderedKey = ""; wlSync(); wlAutoSaveView();
+  });
+  const dirBtn = document.getElementById("wl-sort-dir");
+  if (dirBtn) dirBtn.addEventListener("click", () => {
+    _wlView.dir = _wlView.dir === "asc" ? "desc" : "asc";
+    dirBtn.textContent = _wlView.dir === "asc" ? "▴" : "▾";
+    dirBtn.setAttribute("aria-label", `Sort ${_wlView.dir === "asc" ? "ascending" : "descending"}`);
+    _wlRenderedKey = ""; wlSync(); wlAutoSaveView();
+  });
+
+  // ---- rows: click / fav / more / keyboard / drag ----
+  const rowsEl = document.getElementById("wl-rows");
+  if (rowsEl) {
+    rowsEl.addEventListener("click", (e) => {
+      const row = e.target.closest(".wl-row[data-sym]");
+      if (!row) return;
+      const sym = row.dataset.sym;
+      if (e.target.closest(".wl-fav")) {
+        const list = wlActiveList();
+        if (list && wlToggleFav(_wlDoc, list.id, sym)) { wlPersist(); _wlRenderedKey = ""; wlSync(); }
+        return;
+      }
+      if (e.target.closest(".wl-more")) {
+        const r = e.target.getBoundingClientRect();
+        wlOpenCtx(sym, r.left, r.bottom + 4);
+        return;
+      }
+      wlOpenSymbol(sym, { trade: true });
+    });
+    rowsEl.addEventListener("contextmenu", (e) => {
+      const row = e.target.closest(".wl-row[data-sym]");
+      if (!row) return;
+      e.preventDefault();
+      wlOpenCtx(row.dataset.sym, e.clientX, e.clientY);
+    });
+    rowsEl.addEventListener("keydown", (e) => {
+      const row = e.target.closest(".wl-row[data-sym]");
+      if (!row || e.target !== row) return;
+      const sym = row.dataset.sym;
+      const list = wlActiveList();
+      if (e.key === "Enter") { e.preventDefault(); wlOpenSymbol(sym, { trade: true }); }
+      else if (e.key === " " || e.key === "Spacebar") {
+        e.preventDefault();
+        if (list && wlToggleFav(_wlDoc, list.id, sym)) { wlPersist(); _wlRenderedKey = ""; wlSync(); focusWlRow(sym); }
+      } else if (e.key === "Delete" || e.key === "Backspace") {
+        e.preventDefault();
+        const next = row.nextElementSibling || row.previousElementSibling;
+        if (list && wlRemoveSymbol(_wlDoc, list.id, sym)) {
+          wlPersist(); wlRenderLists(); _wlRenderedKey = ""; wlSync();
+          if (next && next.dataset && next.dataset.sym) focusWlRow(next.dataset.sym);
+        }
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault(); const n = row.nextElementSibling; if (n && n.classList.contains("wl-row")) n.focus();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault(); const p = row.previousElementSibling; if (p && p.classList.contains("wl-row")) p.focus();
+      } else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+        e.preventDefault(); const r = row.getBoundingClientRect(); wlOpenCtx(sym, r.left + 40, r.top + 30);
+      }
+    });
+    // Drag reorder (edits the list's custom order; switches sort→custom so the
+    // change is visible). HTML5 DnD like the workspace panels.
+    rowsEl.addEventListener("dragstart", (e) => {
+      const row = e.target.closest(".wl-row[data-sym]");
+      if (!row) return;
+      e.dataTransfer.setData("application/x-wl-sym", row.dataset.sym);
+      e.dataTransfer.setData("text/plain", row.dataset.sym);
+      e.dataTransfer.effectAllowed = "move";
+      row.classList.add("dragging");
+    });
+    rowsEl.addEventListener("dragend", (e) => {
+      const row = e.target.closest(".wl-row");
+      if (row) row.classList.remove("dragging");
+    });
+    rowsEl.addEventListener("dragover", (e) => {
+      const dragging = rowsEl.querySelector(".wl-row.dragging");
+      if (!dragging) return;
+      e.preventDefault();
+      const over = e.target.closest(".wl-row[data-sym]");
+      if (!over || over === dragging) return;
+      const rect = over.getBoundingClientRect();
+      const before = e.clientY < rect.top + rect.height / 2;
+      rowsEl.insertBefore(dragging, before ? over : over.nextSibling);
+    });
+    rowsEl.addEventListener("drop", (e) => {
+      const dragging = rowsEl.querySelector(".wl-row.dragging");
+      if (!dragging) return;
+      e.preventDefault();
+      const list = wlActiveList();
+      if (!list) return;
+      const sym = dragging.dataset.sym;
+      const beforeEl = dragging.nextElementSibling;
+      const beforeSym = beforeEl && beforeEl.classList.contains("wl-row") ? beforeEl.dataset.sym : null;
+      if (_wlView.sort !== "custom") {
+        _wlView.sort = "custom";
+        const sel = document.getElementById("wl-sort"); if (sel) sel.value = "custom";
+      }
+      if (wlReorder(_wlDoc, list.id, sym, beforeSym)) { wlPersist(); _wlRenderedKey = ""; wlSync(); wlAutoSaveView(); }
+    });
+  }
+
+  // ---- empty-state quick actions ----
+  const emptyEl = document.getElementById("wl-empty");
+  if (emptyEl) emptyEl.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-wlempty]");
+    if (!b) return;
+    if (b.dataset.wlempty === "add") { if (search) search.focus(); }
+    else if (b.dataset.wlempty === "clear") { if (search) { search.value = ""; wlRenderSearch(); } _wlView.query = ""; _wlRenderedKey = ""; wlSync(); }
+    else if (b.dataset.wlempty === "allfilter") {
+      _wlView.filter = "all";
+      if (filters) filters.querySelectorAll("button").forEach((x) => {
+        const on = x.dataset.filter === "all"; x.classList.toggle("active", on); x.setAttribute("aria-pressed", String(on));
+      });
+      _wlRenderedKey = ""; wlSync();
+    }
+  });
+
+  // ---- context menu global handlers ----
+  const ctx = document.getElementById("wl-ctx");
+  if (ctx) {
+    ctx.addEventListener("click", (e) => {
+      const item = e.target.closest(".wl-ctx-item[data-act]");
+      if (item) wlCtxAction(item.dataset.act, ctx.dataset.sym, item);
+    });
+    ctx.addEventListener("keydown", (e) => {
+      const items = Array.from(ctx.querySelectorAll(".wl-ctx-item"));
+      const i = items.indexOf(document.activeElement);
+      if (e.key === "ArrowDown") { e.preventDefault(); (items[i + 1] || items[0]).focus(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); (items[i - 1] || items[items.length - 1]).focus(); }
+      else if (e.key === "Enter" && i >= 0) { e.preventDefault(); wlCtxAction(items[i].dataset.act, ctx.dataset.sym, items[i]); }
+      else if (e.key === "Escape") { e.preventDefault(); wlCloseCtx(); }
+    });
+    document.addEventListener("click", (e) => { if (!ctx.hidden && !ctx.contains(e.target)) wlCloseCtx(); });
+    document.addEventListener("scroll", () => { if (!ctx.hidden) wlCloseCtx(); }, true);
+  }
+
+  // ---- alert modal ----
+  const alertOverlay = document.getElementById("alert-overlay");
+  if (alertOverlay) {
+    const close = () => { alertOverlay.hidden = true; };
+    const cancelBtn = document.getElementById("alert-cancel");
+    if (cancelBtn) cancelBtn.addEventListener("click", close);
+    alertOverlay.addEventListener("click", (e) => { if (e.target === alertOverlay) close(); });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !alertOverlay.hidden) close(); });
+    const addBtn = document.getElementById("alert-add");
+    if (addBtn) addBtn.addEventListener("click", () => {
+      const kind = document.getElementById("alert-kind").value;
+      const raw = document.getElementById("alert-value").value.trim();
+      const out = document.getElementById("alert-result");
+      const val = Number(raw);
+      if (!raw || !isFinite(val)) { if (out) { out.textContent = "Enter a numeric value."; out.className = "result-msg neg"; } return; }
+      if (_wlDoc.alerts.length >= WL_MAX_ALERTS) { if (out) { out.textContent = `Alert limit reached (${WL_MAX_ALERTS}).`; out.className = "result-msg neg"; } return; }
+      const alert = wlSanitizeAlert({ symbol: _wlAlertSym, kind, value: val });
+      if (!alert) { if (out) { out.textContent = "Invalid alert."; out.className = "result-msg neg"; } return; }
+      _wlDoc.alerts.push(alert); wlPersist();
+      if (out) { out.textContent = `✓ Alert set: ${_wlAlertSym} ${wlAlertLabel(alert)}`; out.className = "result-msg pos"; }
+      document.getElementById("alert-value").value = "";
+      wlRenderAlertExisting();
+    });
+    const existing = document.getElementById("alert-existing");
+    if (existing) existing.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-alid]");
+      if (!b) return;
+      _wlDoc.alerts = _wlDoc.alerts.filter((a) => a.id !== b.dataset.alid);
+      wlPersist(); wlRenderAlertExisting();
+    });
+  }
+}
+
+function focusWlRow(sym) {
+  const row = _wlRowEls[sym];
+  if (row && row.isConnected) { try { row.focus(); } catch (e) {} }
 }
 
 let _historyLoaded = false;
@@ -2895,10 +3836,7 @@ function onHistoryActive() {
 }
 
 function wireMarketsHistory() {
-  const mf = document.getElementById("markets-filter");
-  if (mf) mf.addEventListener("input", () => { if (_marketsData) renderMarkets(); });
-  const mr = document.getElementById("markets-refresh");
-  if (mr) mr.addEventListener("click", fetchMarkets);
+  // (The Markets tab is now the Watchlist — wired in wireWatchlist().)
   const hr = document.getElementById("history-refresh");
   if (hr) hr.addEventListener("click", fetchHistory);
   const hf = document.getElementById("history-filter");
@@ -4121,6 +5059,7 @@ function wsSanitizeState(raw) {
     : [];
   const single = String(chart.single || "").toUpperCase();
   const book = String(src.bookSymbol || "").toUpperCase();
+  const watch = src.watch && typeof src.watch === "object" ? src.watch : {};
   return {
     order: order.length ? order : ["risk", "positions", "orders", "charts"],
     collapsed,
@@ -4132,6 +5071,15 @@ function wsSanitizeState(raw) {
     },
     tab: WS_TABS.includes(src.tab) ? src.tab : "dashboard",
     bookSymbol: WS_SYMBOL_RE.test(book) ? book : "",
+    // Watchlist VIEW the workspace remembers (which list is selected, plus its
+    // sort/filter). The watchlists themselves live in their own store; the
+    // workspace only points at one and remembers how it was being viewed.
+    watch: {
+      listId: typeof watch.listId === "string" ? watch.listId.slice(0, 40) : "",
+      filter: WL_FILTERS.includes(watch.filter) ? watch.filter : "all",
+      sort: WL_SORTS.includes(watch.sort) ? watch.sort : "custom",
+      dir: watch.dir === "asc" ? "asc" : "desc",
+    },
   };
 }
 
@@ -4303,6 +5251,10 @@ function wsCaptureState() {
   const activeTab = document.querySelector("#tabs .tab.active");
   if (activeTab && activeTab.dataset.tab) st.tab = activeTab.dataset.tab;
   st.bookSymbol = state.activeSymbol || "";
+  st.watch = {
+    listId: _wlDoc ? _wlDoc.activeId : "",
+    filter: _wlView.filter, sort: _wlView.sort, dir: _wlView.dir,
+  };
   return wsSanitizeState(st);
 }
 
@@ -4334,6 +5286,22 @@ function wsApplyState(rawState, opts = {}) {
   const tabBtn = document.querySelector(`#tabs .tab[data-tab="${st.tab}"]`);
   if (tabBtn && !tabBtn.classList.contains("active")) tabBtn.click();
   if (st.bookSymbol && st.bookSymbol !== state.activeSymbol) setActiveSymbol(st.bookSymbol);
+  // Restore the watchlist view this workspace remembers (list + sort/filter),
+  // then reflect it in the toolbar controls and re-render.
+  if (_wlDoc) {
+    if (st.watch.listId && wlFindList(_wlDoc, st.watch.listId)) _wlDoc.activeId = st.watch.listId;
+    _wlView = { filter: st.watch.filter, sort: st.watch.sort, dir: st.watch.dir, query: "" };
+    const sortSel = document.getElementById("wl-sort"); if (sortSel) sortSel.value = _wlView.sort;
+    const dirBtn = document.getElementById("wl-sort-dir"); if (dirBtn) dirBtn.textContent = _wlView.dir === "asc" ? "▴" : "▾";
+    const filters = document.getElementById("wl-filters");
+    if (filters) filters.querySelectorAll("button").forEach((x) => {
+      const on = x.dataset.filter === _wlView.filter; x.classList.toggle("active", on); x.setAttribute("aria-pressed", String(on));
+    });
+    Object.keys(_wlRowEls).forEach((k) => delete _wlRowEls[k]);
+    _wlRenderedKey = "";
+    wlRenderLists();
+    wlSync();
+  }
   wsUpdateEmptyState();
   if (!opts.noAnim) {
     const pane = document.querySelector("main .pane:not([hidden])");
@@ -4814,11 +5782,29 @@ function wireCommandPalette() {
     });
     const expand = document.getElementById("chart-expand");
     if (expand) acts.push({ label: "Expand / collapse charts", hint: "esc exits", run: () => expand.click() });
-    [["markets-refresh", "Refresh markets"], ["history-refresh", "Refresh journal"],
+    [["history-refresh", "Refresh journal"],
      ["account-refresh", "Refresh account"]].forEach(([id, label]) => {
       const b = document.getElementById(id);
       if (b) acts.push({ label, hint: "read-only", run: () => b.click() });
     });
+    // Watchlist actions — display/navigation only; none can reach a write.
+    const gotoWatch = () => {
+      const pane = document.querySelector('[data-pane="markets"]');
+      const tab = document.querySelector('#tabs .tab[data-tab="markets"]');
+      if (pane && pane.hidden && tab) tab.click();
+    };
+    acts.push({ label: "Add symbol to watchlist", hint: "A", run: () => { gotoWatch(); const s = document.getElementById("wl-search"); if (s) setTimeout(() => s.focus(), 0); } });
+    acts.push({ label: "New watchlist", hint: "watch", run: () => { gotoWatch(); const b = document.getElementById("wl-new"); if (b) setTimeout(() => b.click(), 0); } });
+    if (_wlDoc) {
+      _wlDoc.lists.forEach((l) => {
+        if (l.id !== _wlDoc.activeId) {
+          acts.push({ label: `Watchlist: ${l.name}`, hint: "switch", run: () => { gotoWatch(); wlSwitchList(l.id); } });
+        }
+      });
+      const active = wlActiveList();
+      if (active) acts.push({ label: `Rename watchlist “${active.name}”`, hint: "watch", run: () => { gotoWatch(); const chip = document.querySelector(`#wl-lists .wl-chip[data-wlid="${CSS.escape(active.id)}"]`); if (chip) setTimeout(() => wlStartRenameChip(chip), 0); } });
+      acts.push({ label: "Export watchlist", hint: "json", run: wlExportActive });
+    }
     acts.push({
       label: document.body.classList.contains("density-compact")
         ? "Table density: comfortable" : "Table density: compact",
@@ -4925,6 +5911,17 @@ document.addEventListener("keydown", (e) => {
   // spec's Ctrl+1..9 / Ctrl+Shift+N/D/R were deliberately NOT bound: browsers
   // own them (tab switching, incognito, bookmark-all, hard-reload).
   if (key === "w") { e.preventDefault(); wsOpenSwitcher(); return; }
+  // "A" jumps to the watchlist add-symbol search: switch to the Watch tab if
+  // needed, then focus the search field. Navigation only.
+  if (key === "a") {
+    e.preventDefault();
+    const watchTab = document.querySelector('#tabs .tab[data-tab="markets"]');
+    const pane = document.querySelector('[data-pane="markets"]');
+    if (pane && pane.hidden && watchTab) watchTab.click();
+    const s = document.getElementById("wl-search");
+    if (s) { try { s.focus(); } catch (err) {} }
+    return;
+  }
   if (e.key !== "/" && key !== "b" && key !== "s") return;
   const form = document.getElementById("order-form");
   if (!form) return;
@@ -4975,6 +5972,7 @@ document.addEventListener("keydown", (e) => {
   wireExplorer();
   wireTabs();
   wireMarketsHistory();
+  wireWatchlist(); // Watchlist & market monitor (loads _wlDoc BEFORE workspaces apply their saved view)
   wireCharts(); // live candlestick charts (read-only; polls while dashboard visible)
   wireWorkspaces(); // multi-workspace system: load/migrate, apply active layout
   wireCommandPalette(); // Ctrl/Cmd+K — navigation & display actions only

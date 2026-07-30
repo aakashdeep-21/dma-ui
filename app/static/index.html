@@ -27,7 +27,7 @@
         </button>
         <button class="tab" data-tab="markets" role="tab" id="tab-markets" aria-controls="panel-markets" aria-selected="false" tabindex="-1">
           <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
-          <span>Markets</span>
+          <span>Watch</span>
         </button>
         <button class="tab" data-tab="history" role="tab" id="tab-history" aria-controls="panel-history" aria-selected="false" tabindex="-1">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
@@ -369,17 +369,60 @@
           </div>
         </div>
 
-        <!-- ============ MARKETS ============ -->
+        <!-- ============ WATCHLIST / MARKET MONITOR ============ -->
         <div class="pane" data-pane="markets" id="panel-markets" role="tabpanel" aria-labelledby="tab-markets" hidden>
-          <section class="panel">
-            <div class="panel-head">
-              <h2>Markets</h2>
-              <div class="panel-head-actions">
-                <input id="markets-filter" placeholder="Filter symbol…" aria-label="Filter markets by symbol" />
-                <button id="markets-refresh" class="btn-ghost sm">Refresh</button>
+          <section class="panel wl-panel">
+            <!-- Watchlist tab strip: one chip per list + a New button. -->
+            <div class="wl-lists" id="wl-lists" role="tablist" aria-label="Watchlists"></div>
+
+            <!-- Toolbar: search-to-add · sort · quick filters · refresh state. -->
+            <div class="wl-toolbar">
+              <div class="wl-search-wrap">
+                <input id="wl-search" type="text" autocomplete="off" spellcheck="false"
+                       placeholder="Search symbol to add…  (press A)" aria-label="Search symbols to add"
+                       role="combobox" aria-expanded="false" aria-controls="wl-search-results" />
+                <div id="wl-search-results" class="wl-search-results" role="listbox" aria-label="Search results" hidden></div>
+              </div>
+              <div class="wl-toolbar-right">
+                <div class="segment wl-filter-seg" id="wl-filters" role="group" aria-label="Quick filters">
+                  <button type="button" class="seg-neutral active" data-filter="all" aria-pressed="true">All</button>
+                  <button type="button" class="seg-neutral" data-filter="fav" aria-pressed="false" title="Only favorites">★</button>
+                  <button type="button" class="seg-neutral" data-filter="gainers" aria-pressed="false">Gainers</button>
+                  <button type="button" class="seg-neutral" data-filter="losers" aria-pressed="false">Losers</button>
+                  <button type="button" class="seg-neutral" data-filter="movers" aria-pressed="false" title="|24h| ≥ 5%">Movers</button>
+                </div>
+                <select id="wl-sort" class="wl-sort" aria-label="Sort watchlist">
+                  <option value="custom">Custom order</option>
+                  <option value="symbol">Symbol A–Z</option>
+                  <option value="price">Price</option>
+                  <option value="pct">24h %</option>
+                  <option value="vol">24h Volume</option>
+                  <option value="funding">Funding</option>
+                  <option value="oi">Open Interest</option>
+                </select>
+                <button id="wl-sort-dir" class="icon-btn" type="button" title="Toggle ascending / descending" aria-label="Toggle sort direction">▾</button>
+                <span id="wl-synced" class="wl-synced muted" role="status" aria-live="polite"></span>
               </div>
             </div>
-            <div id="markets-body" class="explorer-result"><p class="loading-msg muted">Loading markets…</p></div>
+
+            <!-- Column header (grid, aligned with rows) -->
+            <div class="wl-head" id="wl-head" role="row">
+              <span class="wl-c-fav"></span>
+              <span class="wl-c-sym">Symbol</span>
+              <span class="wl-c-spark">Trend</span>
+              <span class="wl-c-num">Last</span>
+              <span class="wl-c-num">24h %</span>
+              <span class="wl-c-num wl-opt">Mark</span>
+              <span class="wl-c-num wl-opt">Index</span>
+              <span class="wl-c-num wl-opt">Funding</span>
+              <span class="wl-c-num wl-opt">Spread</span>
+              <span class="wl-c-num wl-opt">24h Vol</span>
+              <span class="wl-c-num wl-opt">Open Int</span>
+              <span class="wl-c-act"></span>
+            </div>
+
+            <div id="wl-rows" class="wl-rows" role="list" aria-label="Watchlist symbols"></div>
+            <div id="wl-empty" class="wl-empty" hidden></div>
           </section>
         </div>
 
@@ -550,6 +593,38 @@
     </div>
   </div>
 
+  <!-- Watchlist symbol context menu (keyboard-accessible; opened by right-click
+       or the ⋯ row button / ContextMenu key). Actions are navigation/display or
+       list edits only — never a trade. -->
+  <div id="wl-ctx" class="wl-ctx" role="menu" aria-label="Symbol actions" hidden></div>
+
+  <!-- Price-alert composer. Alerts are client-side only and notify via the
+       notification center; they NEVER place or modify an order. -->
+  <div id="alert-overlay" class="modal-overlay" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="alert-title">
+      <h3 id="alert-title">Price alert</h3>
+      <p id="alert-context" class="muted"></p>
+      <label>Condition
+        <select id="alert-kind">
+          <option value="above">Price rises above</option>
+          <option value="below">Price falls below</option>
+          <option value="pct_up">24h change rises above (%)</option>
+          <option value="pct_down">24h change falls below (%)</option>
+          <option value="funding_abs">|Funding rate| exceeds (%)</option>
+        </select>
+      </label>
+      <label>Value
+        <input id="alert-value" type="text" inputmode="decimal" autocomplete="off" placeholder="e.g. 100000" />
+      </label>
+      <div id="alert-existing" class="alert-existing"></div>
+      <div id="alert-result" class="result-msg" role="status" aria-live="polite"></div>
+      <div class="modal-actions">
+        <button id="alert-cancel" class="btn-ghost" type="button">Close</button>
+        <button id="alert-add" class="btn-primary" type="button">Add alert</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Keyboard shortcuts reference -->
   <div id="keys-overlay" class="modal-overlay" hidden>
     <div class="modal keys-modal" role="dialog" aria-modal="true" aria-labelledby="keys-title">
@@ -560,6 +635,7 @@
         <kbd>S</kbd><span>Ticket → Sell / Short side</span>
         <kbd>⌘K</kbd><span>Command palette</span>
         <kbd>W</kbd><span>Workspace switcher (digits 1–9 select inside)</span>
+        <kbd>A</kbd><span>Add symbol (on the Watch tab)</span>
         <kbd>↑ ↓</kbd><span>Navigate rows, tabs &amp; panels</span>
         <kbd>Enter</kbd><span>Expand row · activate</span>
         <kbd>Esc</kbd><span>Close dialogs · exit fullscreen</span>
