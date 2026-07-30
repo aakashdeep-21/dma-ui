@@ -98,9 +98,11 @@ function extractConst(name) {
 }
 const wsConsts = ["WS_SCHEMA_VERSION", "WS_MAX", "WS_PANEL_IDS", "WS_TABS",
   "WS_CHART_VIEWS", "WS_INTERVALS", "WS_SYMBOL_RE",
-  // wsSanitizeState also references the watchlist view allowlists.
-  "WL_FILTERS", "WL_SORTS"].map(extractConst).join("\n");
-const wsFns = ["wsId", "wsSanitizeState", "wsMakeWorkspace", "wsSanitizeWorkspace",
+  // wsSanitizeState also references the watchlist view allowlists…
+  "WL_FILTERS", "WL_SORTS",
+  // …and the scanner view sanitizer + its allowlists.
+  "SC_SYMBOL_RE", "SC_METRICS", "SC_SORTS", "SC_PRESETS", "SC_SECTION_IDS"].map(extractConst).join("\n");
+const wsFns = ["wsId", "scSanitizeViewState", "wsSanitizeState", "wsMakeWorkspace", "wsSanitizeWorkspace",
   "wsNewDoc", "wsMigrateFromV1", "wsParseDoc", "wsValidateImport",
   "wsCreate", "wsDuplicate", "wsRename", "wsDelete"].map(extractFn).join("\n");
 const WS = new Function(wsConsts + "\n" + wsFns +
@@ -328,4 +330,308 @@ for (let i = 0; i < 600; i++) big.push("S" + i + "USDT");
 const bigDoc = WL.wlParseDoc(JSON.stringify({ version: 1, activeId: "b", lists: [{ id: "b", name: "Big", symbols: big }] }));
 assert.equal(bigDoc.doc.lists[0].symbols.length, 500, "WL_MAX_SYMBOLS cap enforced on load");
 
-console.log("snapToStep + projectedPnl + workspace-core + watchlist-core regression tests passed");
+// ---------------------------------------------------------------------------
+// Market Scanner core — the PURE engine of the Scan tab (metric accessors,
+// rule engine, presets/filters/search/sort pipeline, section ranking, alert
+// evaluation, storage sanitization, workspace view state). DOM-free.
+// ---------------------------------------------------------------------------
+const scConsts = ["SC_SCHEMA_VERSION", "SC_MAX_SCANS", "SC_MAX_RULES", "SC_MAX_ALERTS",
+  "SC_MAX_LOG", "SC_MAX_FAVS", "SC_SYMBOL_RE", "SC_TOP_N", "SC_METRICS", "SC_OPS",
+  "SC_SORTS", "SC_PRESETS", "SC_SECTION_IDS", "SC_ALERT_KINDS", "SC_ALERT_COOLDOWN_MS"]
+  .map(extractConst).join("\n");
+const scFns = ["scId", "scMetric", "scSanitizeRule", "scEvalRule", "scScanMatches",
+  "scSanitizeScan", "scSanitizeAlert", "scAlertLabel", "scTopMovers", "scEvalAlerts",
+  "scSanitizeLogEntry", "scNewDoc", "scParseDoc", "scSanitizeViewState", "scFuzzyScore",
+  "scComputeView", "scSectionRows"].map(extractFn).join("\n");
+const SC = new Function(scConsts + "\n" + scFns +
+  "\nreturn { scMetric, scSanitizeRule, scEvalRule, scScanMatches, scSanitizeScan, scSanitizeAlert, scAlertLabel, scTopMovers, scEvalAlerts, scNewDoc, scParseDoc, scSanitizeViewState, scFuzzyScore, scComputeView, scSectionRows };")();
+
+// Row factory shaped like /api/scanner rows (percent metrics are PERCENT
+// numbers; fundingRate stays a fraction exactly as the exchange reports it).
+const scRow = (symbol, over) => Object.assign({
+  symbol, last: 100, pct5m: 0, pct15m: 0, pct1h: 0, pct24h: 0,
+  high24h: 110, low24h: 90, range24hPct: 20, vol15mPct: 0.2,
+  turnover24h: 1e6, turnoverDelta15m: 0, fundingRate: 0.0001, fundingDelta1h: 0,
+  openInterestValue: 5e6, bid1: 99.9, ask1: 100.1, spark: [1, 2],
+}, over || {});
+
+// --- metric accessor: derived metrics + the null trust boundary ---
+assert.equal(SC.scMetric(scRow("A"), "last"), 100);
+assert.equal(SC.scMetric(scRow("A", { fundingRate: 0.0005 }), "fundingPct"), 0.05, "funding fraction → percent");
+assert.equal(SC.scMetric(scRow("A", { fundingDelta1h: -0.0002 }), "fundingDelta1hPct"), -0.02);
+assert.ok(Math.abs(SC.scMetric(scRow("A", { last: 99, high24h: 100 }), "distHigh24hPct") - 1) < 1e-9);
+assert.ok(Math.abs(SC.scMetric(scRow("A", { last: 91, low24h: 90 }), "distLow24hPct") - (1 / 90) * 100) < 1e-9);
+assert.ok(Math.abs(SC.scMetric(scRow("A"), "spreadPct") - 0.2) < 1e-9);
+assert.equal(SC.scMetric(scRow("A", { pct15m: null }), "pct15m"), null, "null stays null");
+assert.equal(SC.scMetric(scRow("A", { pct15m: "garbage" }), "pct15m"), null);
+assert.equal(SC.scMetric(scRow("A", { fundingRate: null }), "fundingPct"), null);
+assert.equal(SC.scMetric(null, "last"), null);
+
+// --- rule engine: operators, null-metric refusal, AND/OR ---
+assert.equal(SC.scEvalRule({ metric: "pct24h", op: "gte", value: 5 }, scRow("A", { pct24h: 5 })), true);
+assert.equal(SC.scEvalRule({ metric: "pct24h", op: "gt", value: 5 }, scRow("A", { pct24h: 5 })), false);
+assert.equal(SC.scEvalRule({ metric: "pct24h", op: "lte", value: -5 }, scRow("A", { pct24h: -6 })), true);
+assert.equal(SC.scEvalRule({ metric: "pct24h", op: "absGte", value: 5 }, scRow("A", { pct24h: -6 })), true);
+assert.equal(SC.scEvalRule({ metric: "pct24h", op: "absLte", value: 5 }, scRow("A", { pct24h: -6 })), false);
+assert.equal(SC.scEvalRule({ metric: "pct15m", op: "gte", value: 0 }, scRow("A", { pct15m: null })), false,
+  "a missing metric can NEVER satisfy a rule — warmup must not fake matches");
+const andScan = SC.scSanitizeScan({ id: "s1", name: "big movers", mode: "and", rules: [
+  { metric: "pct24h", op: "absGte", value: 5 }, { metric: "turnover24h", op: "gte", value: 1e6 }] });
+assert.ok(andScan);
+assert.equal(SC.scScanMatches(andScan, scRow("A", { pct24h: 6, turnover24h: 2e6 })), true);
+assert.equal(SC.scScanMatches(andScan, scRow("A", { pct24h: 6, turnover24h: 1 })), false, "AND needs all");
+const orScan = SC.scSanitizeScan({ id: "s2", mode: "or", rules: [
+  { metric: "pct24h", op: "gte", value: 5 }, { metric: "fundingPct", op: "absGte", value: 0.05 }] });
+assert.equal(SC.scScanMatches(orScan, scRow("A", { pct24h: 0, fundingRate: 0.001 })), true, "OR needs one");
+assert.equal(SC.scScanMatches(orScan, scRow("A", { pct24h: 0 })), false);
+// Sanitization: bad rules dropped; a scan with no valid rule is rejected.
+const dirtyScan = SC.scSanitizeScan({ id: "s3", mode: "xor", rules: [
+  { metric: "nope", op: "gte", value: 1 }, { metric: "pct24h", op: "gte", value: "7" },
+  { metric: "pct24h", op: "gte", value: "NaN" }] });
+assert.equal(dirtyScan.mode, "and", "unknown mode → and");
+assert.equal(dirtyScan.rules.length, 1, "invalid metric / non-numeric value dropped");
+assert.equal(SC.scSanitizeScan({ id: "s4", rules: [{ metric: "nope", op: "gt", value: 1 }] }), null);
+assert.equal(SC.scSanitizeScan({ rules: [{ metric: "pct24h", op: "gt", value: 1 }] }), null, "id required");
+
+// --- alert sanitization ---
+assert.equal(SC.scSanitizeAlert(null), null);
+assert.equal(SC.scSanitizeAlert({ kind: "unknown", symbol: "BTCUSDT", value: 1 }), null);
+const tm = SC.scSanitizeAlert({ kind: "top_mover" });
+assert.ok(tm && tm.symbol === "*" && tm.value === 10, "top_mover defaults: any symbol, rank 10");
+assert.equal(SC.scSanitizeAlert({ kind: "top_mover", value: 99 }).value, 10, "out-of-range rank → default");
+assert.equal(SC.scSanitizeAlert({ kind: "vol_double", symbol: "*", baseline: 100 }), null,
+  "vol_double needs a concrete symbol");
+assert.equal(SC.scSanitizeAlert({ kind: "vol_double", symbol: "BTCUSDT" }), null, "…and a baseline");
+assert.ok(SC.scSanitizeAlert({ kind: "vol_double", symbol: "btcusdt", baseline: 5e6 }).symbol === "BTCUSDT");
+assert.equal(SC.scSanitizeAlert({ kind: "vol15m", symbol: "BTCUSDT", value: 0 }), null, "threshold must be > 0");
+assert.ok(SC.scSanitizeAlert({ kind: "funding_abs", symbol: "*", value: 0.05 }));
+
+// --- alert evaluation ---
+const mkIdx = (rows) => { const o = {}; rows.forEach((r) => { o[r.symbol] = r; }); return o; };
+{
+  const rows = [scRow("AAA", { pct24h: 9 }), scRow("BBB", { pct24h: 8 }), scRow("CCC", { pct24h: 7 })];
+  const top = SC.scTopMovers(rows, 25);
+  assert.deepEqual(top, ["AAA", "BBB", "CCC"]);
+  const alert = SC.scSanitizeAlert({ kind: "top_mover", value: 3 });
+  // First snapshot (prev null): NOTHING fires — boot is not "entering".
+  assert.equal(SC.scEvalAlerts([alert], { index: mkIdx(rows), topMovers: top, prevTopMovers: null }, 1000).length, 0);
+  // Sitting on the board: no fire. New entrant: fires once.
+  assert.equal(SC.scEvalAlerts([alert], { index: mkIdx(rows), topMovers: top, prevTopMovers: top }, 1000).length, 0);
+  const fired = SC.scEvalAlerts([alert], { index: mkIdx(rows), topMovers: top, prevTopMovers: ["AAA", "BBB", "ZZZ"] }, 1000);
+  assert.equal(fired.length, 1);
+  assert.equal(fired[0].symbol, "CCC");
+  // Rank semantics: moving 4th → 2nd ENTERS a top-3 board even though the
+  // symbol sat on the deeper (25-rank) board before.
+  const deepPrev = ["AAA", "BBB", "DDD", "CCC"];
+  const nowTop = ["AAA", "CCC", "BBB", "DDD"];
+  const f2 = SC.scEvalAlerts([alert], { index: mkIdx(rows), topMovers: nowTop, prevTopMovers: deepPrev }, 1000);
+  assert.deepEqual(f2.map((f) => f.symbol), ["CCC"]);
+  // Cooldown: a recent lastFired suppresses the re-fire.
+  const cooled = SC.scSanitizeAlert({ kind: "top_mover", value: 3, lastFired: { CCC: 900 } });
+  assert.equal(SC.scEvalAlerts([cooled], { index: mkIdx(rows), topMovers: top, prevTopMovers: ["AAA", "BBB", "ZZZ"] }, 1000).length, 0);
+  assert.equal(SC.scEvalAlerts([cooled], { index: mkIdx(rows), topMovers: top, prevTopMovers: ["AAA", "BBB", "ZZZ"] },
+    900 + 30 * 60000 + 1).length, 1, "…and expires after the cooldown");
+}
+{
+  const a = SC.scSanitizeAlert({ kind: "vol_double", symbol: "AAA", baseline: 1e6 });
+  const under = [scRow("AAA", { turnover24h: 1.9e6 })];
+  const over = [scRow("AAA", { turnover24h: 2e6 })];
+  assert.equal(SC.scEvalAlerts([a], { index: mkIdx(under), topMovers: [], prevTopMovers: [] }, 1).length, 0);
+  assert.equal(SC.scEvalAlerts([a], { index: mkIdx(over), topMovers: [], prevTopMovers: [] }, 1).length, 1);
+}
+{
+  const vol = SC.scSanitizeAlert({ kind: "vol15m", symbol: "*", value: 2 });
+  const mv = SC.scSanitizeAlert({ kind: "move15m", symbol: "AAA", value: 1 });
+  const fn = SC.scSanitizeAlert({ kind: "funding_abs", symbol: "*", value: 0.05 });
+  const rows = [scRow("AAA", { vol15mPct: 2.5, pct15m: -1.2, fundingRate: -0.001 }),
+                scRow("BBB", { vol15mPct: 0.1, pct15m: 0.1, fundingRate: 0.0001 })];
+  const fired = SC.scEvalAlerts([vol, mv, fn], { index: mkIdx(rows), topMovers: [], prevTopMovers: [] }, 1);
+  const bySym = fired.map((f) => f.alert.kind + ":" + f.symbol).sort();
+  assert.deepEqual(bySym, ["funding_abs:AAA", "move15m:AAA", "vol15m:AAA"],
+    "wildcard scans every symbol; |−1.2%| ≥ 1 and |−0.1%| funding ≥ 0.05 fire");
+  // Warm-up honesty: null metrics never fire threshold alerts.
+  const cold = [scRow("AAA", { vol15mPct: null, pct15m: null })];
+  assert.equal(SC.scEvalAlerts([vol, mv], { index: mkIdx(cold), topMovers: [], prevTopMovers: [] }, 1).length, 0);
+}
+
+// --- storage document: corrupt recovery + caps ---
+assert.equal(SC.scParseDoc("{nope").corrupt, true);
+assert.equal(SC.scParseDoc(JSON.stringify({ version: 99 })).corrupt, true, "future schema quarantined");
+assert.equal(SC.scParseDoc(null).corrupt, false);
+{
+  const doc = SC.scNewDoc();
+  doc.favs = ["BTCUSDT", "bad sym!", "ethusdt", "BTCUSDT"];
+  doc.scans = new Array(30).fill(0).map((_, i) => ({ id: "s" + i, name: "n" + i, rules: [{ metric: "pct24h", op: "gt", value: i }] }));
+  doc.alerts = [{ kind: "vol15m", symbol: "BTCUSDT", value: 1 }, { kind: "vol15m", symbol: "BTCUSDT", value: -1 }];
+  doc.log = [{ ts: 1, msg: "x".repeat(500) }, { msg: "" }];
+  const rt = SC.scParseDoc(JSON.stringify(doc));
+  assert.equal(rt.corrupt, false);
+  assert.deepEqual(rt.doc.favs, ["BTCUSDT", "ETHUSDT"], "favs sanitized + deduped");
+  assert.equal(rt.doc.scans.length, 20, "SC_MAX_SCANS cap");
+  assert.equal(rt.doc.alerts.length, 1, "invalid alert dropped");
+  assert.equal(rt.doc.log.length, 1);
+  assert.equal(rt.doc.log[0].msg.length, 140, "log messages capped");
+}
+
+// --- workspace view state (persisted per workspace) ---
+{
+  const st = SC.scSanitizeViewState(null);
+  assert.equal(st.preset, "all");
+  assert.equal(st.sort, "pct24h");
+  assert.equal(st.dir, "desc");
+  assert.deepEqual(st.sections.order, ["movers", "losers", "volume", "volatility", "funding", "active", "watchlist", "alerts"]);
+  const dirty = SC.scSanitizeViewState({
+    preset: "evil", sort: "<script>", dir: "sideways", pinFavs: 1, cards: false,
+    filters: { priceMin: "5", priceMax: "junk", turnoverMin: 1e6, unknown: 4 },
+    sections: { order: ["alerts", "alerts", "nope", "movers"], collapsed: { movers: true, evil: true } },
+    sel: "btc usdt", scroll: -50,
+  });
+  assert.equal(dirty.preset, "all", "unknown preset → all");
+  assert.equal(dirty.sort, "pct24h");
+  assert.equal(dirty.pinFavs, true);
+  assert.equal(dirty.cards, false);
+  assert.equal(dirty.filters.priceMin, 5);
+  assert.equal(dirty.filters.priceMax, null, "non-numeric filter → off");
+  assert.equal(dirty.filters.unknown, undefined, "unknown filter keys dropped");
+  assert.equal(dirty.sections.order[0], "alerts");
+  assert.equal(dirty.sections.order.length, 8, "missing sections appended, dupes/unknowns dropped");
+  assert.deepEqual(Object.keys(dirty.sections.collapsed), ["movers"]);
+  assert.equal(dirty.sel, "", "invalid symbol dropped");
+  assert.equal(dirty.scroll, 0, "negative scroll clamped");
+  assert.equal(SC.scSanitizeViewState({ preset: "scan:scan_abc123" }).preset, "scan:scan_abc123",
+    "custom scan preset ids survive");
+  // Workspace integration end-to-end: wsSanitizeState carries the scanner view.
+  const ws = WS.wsSanitizeState({ tab: "scanner", scanner: { preset: "momentum", sort: "turnover24h", dir: "asc" } });
+  assert.equal(ws.tab, "scanner", "scanner is a valid workspace tab");
+  assert.equal(ws.scanner.preset, "momentum");
+  assert.equal(ws.scanner.sort, "turnover24h");
+  assert.equal(ws.scanner.dir, "asc");
+  assert.equal(WS.wsSanitizeState({}).scanner.preset, "all", "default scanner state always present");
+}
+
+// --- fuzzy search ---
+assert.equal(SC.scFuzzyScore("BTCUSDT", "BTC"), 3, "prefix");
+assert.equal(SC.scFuzzyScore("WBTCUSDT", "BTC"), 2, "substring");
+assert.equal(SC.scFuzzyScore("BTCUSDT", "BCT"), 1, "in-order subsequence (B…C…T)");
+assert.equal(SC.scFuzzyScore("BTCUSDT", "TDB"), 0, "out-of-order letters never match");
+assert.equal(SC.scFuzzyScore("BTCUSDT", "bud"), 1, "subsequence, case-insensitive");
+assert.equal(SC.scFuzzyScore("BTCUSDT", "XRP"), 0);
+assert.equal(SC.scFuzzyScore("BTCUSDT", ""), 0);
+
+// --- the view pipeline: presets → filters → search → sort ---
+{
+  const rows = [
+    scRow("UPUSDT", { pct24h: 12, pct15m: 1, pct1h: 3, turnover24h: 9e6, openInterestValue: 9e6 }),
+    scRow("DOWNUSDT", { pct24h: -9, pct15m: 0.5, pct1h: -2, turnover24h: 5e6, openInterestValue: 5e6 }),
+    scRow("FLATUSDT", { pct24h: 0.2, pct15m: 0.05, pct1h: 0.1, turnover24h: 1e6, openInterestValue: 1e6 }),
+    scRow("WARMUSDT", { pct24h: 3, pct15m: null, pct1h: null, vol15mPct: null, turnover24h: 3e6, openInterestValue: 3e6 }),
+    scRow("HIUSDT", { pct24h: 4, pct15m: -0.6, pct1h: -1.4, turnover24h: 7e6, openInterestValue: 7e6, last: 5000 }),
+  ];
+  const view = (over) => Object.assign({ preset: "all", query: "", sort: "pct24h", dir: "desc", pinFavs: false, filters: {} }, over || {});
+  const syms = (out) => out.map((r) => r.symbol);
+
+  assert.deepEqual(syms(SC.scComputeView(rows, view(), {})),
+    ["UPUSDT", "HIUSDT", "WARMUSDT", "FLATUSDT", "DOWNUSDT"], "default: 24h% desc");
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ dir: "asc" }), {})),
+    ["DOWNUSDT", "FLATUSDT", "WARMUSDT", "HIUSDT", "UPUSDT"]);
+  // Nulls sink regardless of direction.
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ sort: "pct15m", dir: "desc" }), {})).pop(), "WARMUSDT");
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ sort: "pct15m", dir: "asc" }), {})).pop(), "WARMUSDT");
+  // Presets.
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ preset: "gainers" }), {})),
+    ["UPUSDT", "HIUSDT", "WARMUSDT", "FLATUSDT"]);
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ preset: "losers" }), {})), ["DOWNUSDT"]);
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ preset: "momentum" }), {})), ["UPUSDT", "HIUSDT"],
+    "same-direction 15m+1h moves, either sign; warming rows excluded");
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ preset: "meanrevert" }), {})), ["DOWNUSDT"],
+    "|24h|≥8 with 15m pulling the other way");
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ preset: "highvolume" }), {})), ["UPUSDT", "HIUSDT"],
+    "top decile by turnover (5-sample quantile lands at 7e6)");
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ preset: "largecaps" }), {})), ["UPUSDT", "HIUSDT"],
+    "top quintile by OI value");
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ preset: "smallcaps" }), {})),
+    ["WARMUSDT", "FLATUSDT", "DOWNUSDT"], "bottom half by OI value");
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ preset: "active" }), {})), ["UPUSDT", "HIUSDT", "DOWNUSDT"],
+    "|15m| ≥ 0.3 only; WARMUSDT's null 15m is not active");
+  const nearHigh = [scRow("BRKUSDT", { last: 109.8, high24h: 110, low24h: 90 }), scRow("MIDUSDT", { last: 100 })];
+  assert.deepEqual(syms(SC.scComputeView(nearHigh, view({ preset: "breakout" }), {})), ["BRKUSDT"]);
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ preset: "favorites" }), { favs: ["FLATUSDT"] })), ["FLATUSDT"]);
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ preset: "watchlist" }), { watch: ["HIUSDT", "NOPEUSDT"] })), ["HIUSDT"]);
+  // Custom scan preset via ctx.scans.
+  const scan = SC.scSanitizeScan({ id: "x1", name: "hot", rules: [{ metric: "pct24h", op: "absGte", value: 8 }] });
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ preset: "scan:x1" }), { scans: [scan] })), ["UPUSDT", "DOWNUSDT"]);
+  // Filters combine; rows missing a filtered metric are excluded.
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ filters: { turnoverMin: 5e6, pct24hAbsMin: 5 } }), {})),
+    ["UPUSDT", "DOWNUSDT"]);
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ filters: { vol15mMin: 0.1 } }), {})).includes("WARMUSDT"), false,
+    "null vol15m cannot pass a volatility filter");
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ filters: { priceMin: 1000 } }), {})), ["HIUSDT"]);
+  // Search filters the universe…
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ query: "UP" }), {})), ["UPUSDT"]);
+  // …and ranks matches: a prefix match outranks a substring match even when
+  // the active sort would order them the other way.
+  assert.deepEqual(syms(SC.scComputeView([scRow("ZUPUSDT"), scRow("UPZUSDT")],
+    view({ query: "UP", sort: "symbol", dir: "asc" }), {})), ["UPZUSDT", "ZUPUSDT"]);
+  // Pinned favorites float, groups keep sort inside.
+  assert.deepEqual(syms(SC.scComputeView(rows, view({ pinFavs: true }), { favs: ["FLATUSDT", "DOWNUSDT"] })),
+    ["FLATUSDT", "DOWNUSDT", "UPUSDT", "HIUSDT", "WARMUSDT"]);
+}
+
+// --- overview-card ranking ---
+{
+  const rows = [
+    scRow("AAA", { pct24h: 9, pct15m: 2, vol15mPct: 3, turnover24h: 1e6, fundingRate: 0.002, fundingDelta1h: 0.0001 }),
+    scRow("BBB", { pct24h: -7, pct15m: -3, vol15mPct: 4, turnover24h: 9e6, fundingRate: -0.003, fundingDelta1h: -0.0009 }),
+    scRow("CCC", { pct24h: 2, pct15m: 0.5, vol15mPct: 1, turnover24h: 5e6, fundingRate: 0.0005, fundingDelta1h: 0.0004 }),
+  ];
+  const sy = (res) => res.rows.map((r) => r.symbol);
+  assert.deepEqual(sy(SC.scSectionRows(rows, "movers", {})), ["AAA", "CCC"]);
+  assert.deepEqual(sy(SC.scSectionRows(rows, "losers", {})), ["BBB"]);
+  assert.deepEqual(sy(SC.scSectionRows(rows, "volume", {})), ["BBB", "CCC", "AAA"]);
+  assert.deepEqual(sy(SC.scSectionRows(rows, "volatility", {})), ["BBB", "AAA", "CCC"]);
+  assert.equal(SC.scSectionRows(rows, "volatility", {}).metric, "vol15mPct");
+  // Volatility falls back to 24h range while 15m warms — and says so.
+  const warm = rows.map((r) => scRow(r.symbol, { vol15mPct: null, range24hPct: r.turnover24h / 1e6 }));
+  assert.equal(SC.scSectionRows(warm, "volatility", {}).metric, "range24hPct");
+  assert.deepEqual(sy(SC.scSectionRows(rows, "funding", { fundingMode: "pos" })), ["AAA", "CCC", "BBB"]);
+  assert.deepEqual(sy(SC.scSectionRows(rows, "funding", { fundingMode: "neg" })), ["BBB", "CCC", "AAA"]);
+  assert.deepEqual(sy(SC.scSectionRows(rows, "funding", { fundingMode: "delta" })), ["BBB", "CCC", "AAA"]);
+  assert.deepEqual(sy(SC.scSectionRows(rows, "active", {})), ["BBB", "AAA", "CCC"], "by |15m|");
+  assert.deepEqual(sy(SC.scSectionRows(rows, "watchlist", { watch: ["CCC", "BBB"] })), ["BBB", "CCC"]);
+  assert.deepEqual(sy(SC.scSectionRows(rows, "movers", { limit: 1 })), ["AAA"], "limit respected");
+  // No funding data → empty rows (the DOM shows the capability note instead).
+  const noFund = rows.map((r) => scRow(r.symbol, { fundingRate: null, fundingDelta1h: null }));
+  assert.equal(SC.scSectionRows(noFund, "funding", {}).rows.length, 0);
+}
+
+// --- performance guard: the full pipeline over a large universe ---
+{
+  const big = [];
+  for (let i = 0; i < 2000; i++) {
+    big.push(scRow("S" + i + "USDT", {
+      pct24h: (i % 41) - 20, pct15m: ((i * 7) % 11) - 5, pct1h: ((i * 3) % 13) - 6,
+      turnover24h: 1e4 + i * 1e4, last: 1 + (i % 500),
+    }));
+  }
+  const t0 = Date.now();
+  let out;
+  for (let k = 0; k < 10; k++) {
+    out = SC.scComputeView(big, { preset: "momentum", query: "S1", sort: "turnover24h", dir: "desc",
+      filters: { turnoverMin: 1e5 } }, { favs: [], watch: [], scans: [] });
+  }
+  const elapsed = Date.now() - t0;
+  assert.ok(out.length > 0 && out.length < big.length);
+  for (let k = 1; k < out.length; k++) {
+    const sPrev = SC.scFuzzyScore(out[k - 1].symbol, "S1");
+    const sCur = SC.scFuzzyScore(out[k].symbol, "S1");
+    assert.ok(sCur > 0, "search applied");
+    assert.ok(sPrev >= sCur, "ranked by match quality first");
+    if (sPrev === sCur) {
+      assert.ok(SC.scMetric(out[k - 1], "turnover24h") >= SC.scMetric(out[k], "turnover24h"),
+        "sorted by turnover within equal match rank");
+    }
+  }
+  assert.ok(elapsed < 2000, `10 full pipeline passes over 2000 symbols took ${elapsed}ms (must stay interactive)`);
+}
+
+console.log("snapToStep + projectedPnl + workspace-core + watchlist-core + scanner-core regression tests passed");

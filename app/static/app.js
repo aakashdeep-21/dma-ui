@@ -2642,6 +2642,10 @@ function wireTabs() {
     panes.forEach((p) => { p.hidden = p.dataset.pane !== name; });
     if (name !== "markets") clearInterval(_marketsTimer); // stop polling when away
     if (name === "markets") onMarketsActive();
+    // Scanner: poll only while visible (its background alert tick, when armed,
+    // is managed separately by scEnsureAlertTimer).
+    if (name !== "scanner") clearInterval(_scTimer);
+    if (name === "scanner") onScannerActive();
     if (name === "history") onHistoryActive();
     if (name === "account") onAccountActive();
     // The order-book widget only polls while the dashboard is visible.
@@ -4520,6 +4524,7 @@ function wireCurrencyToggle() {
 function rerenderForCurrency() {
   if (state.lastDashboard) renderDashboard(state.lastDashboard);
   if (_marketsData) renderMarkets();
+  if (_scData) scRerender();
   // Re-render history from the cached payloads — a currency flip is a pure
   // display change and must not refetch (an "Overall" read is ~10k rows/mirror).
   if (_historyLoaded) {
@@ -5014,6 +5019,1731 @@ function wireCharts() {
 }
 
 // ===========================================================================
+// MARKET SCANNER  (the "Scan" tab)
+// ---------------------------------------------------------------------------
+// A live market-intelligence dashboard over the whole tradable universe:
+// overview cards (movers / losers / volume / volatility / funding / activity /
+// watchlist / alerts) + a virtualized, sortable, rule-filterable screener.
+//
+// Data: /api/scanner — a snapshot the BACKEND sampler maintains from ONE
+// shared ticker poll (app/scanner.py). This tab polls that in-memory endpoint
+// on the Watch tab's cadence while visible (plus a slow background tick only
+// while alerts are armed), so N tabs never add upstream exchange calls.
+// Honesty rule inherited from the backend: a metric whose window hasn't
+// warmed up (or that the exchange doesn't supply) arrives as null and renders
+// as "—" — nothing is ever fabricated.
+//
+// Layout mirrors the watchlist module: a PURE, DOM-free core first (top-level
+// functions + one-line consts so tests/test_snap.mjs can extract and unit-test
+// them), then the DOM manager. Everything here is display/navigation state —
+// nothing in this module can place, modify or cancel an order, and scanner
+// alerts only ever notify (toast + notification center).
+// ===========================================================================
+
+const SC_STORE_KEY = "dma.scanner.v1";
+const SC_SCHEMA_VERSION = 1;
+const SC_MAX_SCANS = 20;
+const SC_MAX_RULES = 8;
+const SC_MAX_ALERTS = 50;
+const SC_MAX_LOG = 50;
+const SC_MAX_FAVS = 200;
+const SC_SYMBOL_RE = /^[A-Z0-9]{1,20}$/;
+const SC_TOP_N = 10;
+// Metrics the rule engine, sorting and filters can reference. Derived ones
+// (funding as %, distance to 24h high/low, spread) are computed on demand by
+// scMetric so new server fields plug in without touching the engine.
+const SC_METRICS = ["last", "pct5m", "pct15m", "pct1h", "pct24h", "range24hPct", "vol15mPct", "turnover24h", "turnoverDelta15m", "fundingPct", "fundingDelta1hPct", "openInterestValue", "distHigh24hPct", "distLow24hPct", "spreadPct"];
+const SC_OPS = ["gt", "gte", "lt", "lte", "absGte", "absLte"];
+const SC_SORTS = SC_METRICS.concat(["symbol"]);
+const SC_PRESETS = ["all", "favorites", "gainers", "losers", "momentum", "breakout", "meanrevert", "highvolume", "largecaps", "smallcaps", "active", "watchlist"];
+const SC_SECTION_IDS = ["movers", "losers", "volume", "volatility", "funding", "active", "watchlist", "alerts"];
+const SC_ALERT_KINDS = ["top_mover", "vol_double", "vol15m", "move15m", "funding_abs"];
+const SC_ALERT_COOLDOWN_MS = 30 * 60000;
+
+function scId(prefix) {
+  return (prefix || "sc") + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+// Metric accessor — the single place a metric name becomes a number. Returns a
+// FINITE number or null; null means "not available", which no rule, filter or
+// rank may ever satisfy (missing data must not fake a match).
+function scMetric(row, key) {
+  if (!row) return null;
+  const num = (v) => {
+    if (v === null || v === undefined || v === "") return null;
+    const n = Number(v);
+    return isFinite(n) ? n : null;
+  };
+  switch (key) {
+    case "fundingPct": {
+      const f = num(row.fundingRate);
+      return f === null ? null : f * 100;
+    }
+    case "fundingDelta1hPct": {
+      const f = num(row.fundingDelta1h);
+      return f === null ? null : f * 100;
+    }
+    case "distHigh24hPct": {
+      const h = num(row.high24h), l = num(row.last);
+      return h !== null && h > 0 && l !== null ? ((h - l) / h) * 100 : null;
+    }
+    case "distLow24hPct": {
+      const lo = num(row.low24h), l = num(row.last);
+      return lo !== null && lo > 0 && l !== null ? ((l - lo) / lo) * 100 : null;
+    }
+    case "spreadPct": {
+      const b = num(row.bid1), a = num(row.ask1), l = num(row.last);
+      return b !== null && a !== null && l !== null && l > 0 && a >= b ? ((a - b) / l) * 100 : null;
+    }
+    default:
+      return num(row[key]);
+  }
+}
+
+// ---- rule engine (custom scans) ----
+function scSanitizeRule(r) {
+  if (!r || typeof r !== "object") return null;
+  const value = Number(r.value);
+  if (!SC_METRICS.includes(r.metric) || !SC_OPS.includes(r.op) || !isFinite(value)) return null;
+  return { metric: r.metric, op: r.op, value };
+}
+function scEvalRule(rule, row) {
+  if (!rule) return false;
+  const v = scMetric(row, rule.metric);
+  if (v === null) return false; // missing data never satisfies a rule
+  switch (rule.op) {
+    case "gt": return v > rule.value;
+    case "gte": return v >= rule.value;
+    case "lt": return v < rule.value;
+    case "lte": return v <= rule.value;
+    case "absGte": return Math.abs(v) >= rule.value;
+    case "absLte": return Math.abs(v) <= rule.value;
+    default: return false;
+  }
+}
+function scScanMatches(scan, row) {
+  if (!scan || !Array.isArray(scan.rules) || !scan.rules.length) return false;
+  return scan.mode === "or"
+    ? scan.rules.some((r) => scEvalRule(r, row))
+    : scan.rules.every((r) => scEvalRule(r, row));
+}
+function scSanitizeScan(s) {
+  if (!s || typeof s !== "object" || typeof s.id !== "string" || !s.id) return null;
+  const rules = (Array.isArray(s.rules) ? s.rules : [])
+    .map(scSanitizeRule).filter(Boolean).slice(0, SC_MAX_RULES);
+  if (!rules.length) return null; // a scan with no valid rules matches nothing useful
+  return {
+    id: s.id.slice(0, 40),
+    name: String(s.name || "Scan").slice(0, 40),
+    mode: s.mode === "or" ? "or" : "and",
+    rules,
+    createdAt: Number(s.createdAt) || Date.now(),
+  };
+}
+
+// ---- alerts (notify-only; evaluated against each snapshot) ----
+function scSanitizeAlert(a) {
+  if (!a || typeof a !== "object" || !SC_ALERT_KINDS.includes(a.kind)) return null;
+  const kind = a.kind;
+  const rawSym = typeof a.symbol === "string" ? a.symbol.trim().toUpperCase() : "";
+  let symbol = rawSym === "*" ? "*" : (SC_SYMBOL_RE.test(rawSym) ? rawSym : null);
+  let value = Number(a.value);
+  let baseline = Number(a.baseline);
+  if (kind === "vol_double") {
+    // Needs a concrete baseline captured at creation; a universe-wide "volume
+    // doubled vs when?" has no honest meaning.
+    if (!symbol || symbol === "*" || !isFinite(baseline) || baseline <= 0) return null;
+    value = null;
+  } else if (kind === "top_mover") {
+    if (!symbol) symbol = "*";
+    value = isFinite(value) ? Math.round(value) : SC_TOP_N;
+    if (value < 3 || value > 25) value = SC_TOP_N;
+    baseline = null;
+  } else {
+    if (!symbol) return null;
+    if (!isFinite(value) || value <= 0) return null;
+    baseline = null;
+  }
+  const lastFired = {};
+  if (a.lastFired && typeof a.lastFired === "object") {
+    Object.keys(a.lastFired).slice(0, 200).forEach((s) => {
+      const t = Number(a.lastFired[s]);
+      if (isFinite(t)) lastFired[s] = t;
+    });
+  }
+  return {
+    id: typeof a.id === "string" && a.id ? a.id.slice(0, 40) : scId("al"),
+    kind, symbol, value, baseline,
+    createdAt: Number(a.createdAt) || Date.now(),
+    lastFired,
+  };
+}
+function scAlertLabel(a) {
+  if (!a) return "";
+  const sym = a.symbol === "*" ? "Any market" : a.symbol;
+  switch (a.kind) {
+    case "top_mover": return sym + " enters the top " + a.value + " movers";
+    case "vol_double": return sym + " 24h volume doubles";
+    case "vol15m": return sym + " 15m volatility ≥ " + a.value + "%";
+    case "move15m": return sym + " |15m move| ≥ " + a.value + "%";
+    case "funding_abs": return sym + " |funding| ≥ " + a.value + "%";
+    default: return sym;
+  }
+}
+// Ranked top movers (24h gainers) — feeds the movers card + top_mover alerts.
+function scTopMovers(rows, n) {
+  return (rows || [])
+    .filter((r) => r && scMetric(r, "pct24h") !== null && scMetric(r, "pct24h") > 0)
+    .sort((a, b) => scMetric(b, "pct24h") - scMetric(a, "pct24h") || a.symbol.localeCompare(b.symbol))
+    .slice(0, n || SC_TOP_N)
+    .map((r) => r.symbol);
+}
+// Evaluate every alert against a snapshot. PURE: reads alert.lastFired but
+// mutates nothing; returns [{alert, symbol, message}]. ctx: {index (symbol →
+// row), topMovers, prevTopMovers (null on the very first snapshot — top_mover
+// alerts are skipped then, otherwise boot would report the whole leaderboard
+// as "new entries")}.
+function scEvalAlerts(alerts, ctx, now) {
+  const fired = [];
+  const idx = (ctx && ctx.index) || {};
+  const topNow = (ctx && ctx.topMovers) || [];
+  const prevTopArr = ctx && Array.isArray(ctx.prevTopMovers) ? ctx.prevTopMovers : null;
+  (alerts || []).forEach((a) => {
+    if (!a) return;
+    const cooling = (sym) => {
+      const t = a.lastFired && Number(a.lastFired[sym]);
+      return isFinite(t) && now - t < SC_ALERT_COOLDOWN_MS;
+    };
+    if (a.kind === "top_mover") {
+      if (prevTopArr === null) return; // no baseline yet — entering vs booting is indistinguishable
+      const rank = a.value || SC_TOP_N;
+      // Compare boards at THIS alert's rank: rising from #15 to #8 must count
+      // as entering a top-10 board even though #15 was on the deeper list.
+      const prevSet = new Set(prevTopArr.slice(0, rank));
+      topNow.slice(0, rank).forEach((sym) => {
+        if (prevSet.has(sym)) return; // must ENTER the board, not sit on it
+        if (a.symbol !== "*" && a.symbol !== sym) return;
+        if (cooling(sym)) return;
+        fired.push({ alert: a, symbol: sym, message: sym + " entered the top " + rank + " movers" });
+      });
+      return;
+    }
+    const evalSym = (sym) => {
+      const row = idx[sym];
+      if (!row || cooling(sym)) return;
+      let ok = false, message = "";
+      if (a.kind === "vol_double") {
+        const v = scMetric(row, "turnover24h");
+        ok = v !== null && a.baseline > 0 && v >= a.baseline * 2;
+        message = sym + " 24h volume doubled since the alert was set";
+      } else if (a.kind === "vol15m") {
+        const v = scMetric(row, "vol15mPct");
+        ok = v !== null && v >= a.value;
+        if (ok) message = sym + " 15m volatility " + v.toFixed(2) + "% ≥ " + a.value + "%";
+      } else if (a.kind === "move15m") {
+        const v = scMetric(row, "pct15m");
+        ok = v !== null && Math.abs(v) >= a.value;
+        if (ok) message = sym + " moved " + v.toFixed(2) + "% in 15m (≥ " + a.value + "%)";
+      } else if (a.kind === "funding_abs") {
+        const v = scMetric(row, "fundingPct");
+        ok = v !== null && Math.abs(v) >= a.value;
+        if (ok) message = sym + " funding " + v.toFixed(4) + "% ≥ ±" + a.value + "%";
+      }
+      if (ok) fired.push({ alert: a, symbol: sym, message });
+    };
+    if (a.symbol === "*") Object.keys(idx).forEach(evalSym);
+    else evalSym(a.symbol);
+  });
+  return fired;
+}
+
+// ---- persisted document ({favs, scans, alerts, log}) ----
+function scSanitizeLogEntry(e) {
+  if (!e || typeof e !== "object") return null;
+  const msg = String(e.msg || "").slice(0, 140);
+  if (!msg) return null;
+  const rawSym = typeof e.symbol === "string" ? e.symbol.trim().toUpperCase() : "";
+  return {
+    ts: Number(e.ts) || Date.now(),
+    msg,
+    symbol: SC_SYMBOL_RE.test(rawSym) ? rawSym : "",
+  };
+}
+function scNewDoc() {
+  return { version: SC_SCHEMA_VERSION, favs: [], scans: [], alerts: [], log: [] };
+}
+// Parse storage into a guaranteed-valid doc; corrupt:true = caller quarantines
+// the original blob (user data is never silently discarded), same contract as
+// the watchlist/workspace stores.
+function scParseDoc(raw) {
+  if (raw === null || raw === undefined || raw === "") return { doc: scNewDoc(), corrupt: false };
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (e) { return { doc: scNewDoc(), corrupt: true }; }
+  if (!parsed || typeof parsed !== "object" || parsed.version !== SC_SCHEMA_VERSION) {
+    return { doc: scNewDoc(), corrupt: true };
+  }
+  const favs = [];
+  const seen = new Set();
+  (Array.isArray(parsed.favs) ? parsed.favs : []).forEach((s) => {
+    const up = String(s === null || s === undefined ? "" : s).trim().toUpperCase();
+    if (SC_SYMBOL_RE.test(up) && !seen.has(up) && favs.length < SC_MAX_FAVS) { seen.add(up); favs.push(up); }
+  });
+  return {
+    doc: {
+      version: SC_SCHEMA_VERSION,
+      favs,
+      scans: (Array.isArray(parsed.scans) ? parsed.scans : []).map(scSanitizeScan).filter(Boolean).slice(0, SC_MAX_SCANS),
+      alerts: (Array.isArray(parsed.alerts) ? parsed.alerts : []).map(scSanitizeAlert).filter(Boolean).slice(0, SC_MAX_ALERTS),
+      log: (Array.isArray(parsed.log) ? parsed.log : []).map(scSanitizeLogEntry).filter(Boolean).slice(0, SC_MAX_LOG),
+    },
+    corrupt: false,
+  };
+}
+
+// ---- per-workspace view state (what §Workspaces persists for this tab) ----
+function scSanitizeViewState(raw) {
+  const src = raw && typeof raw === "object" ? raw : {};
+  const fsrc = src.filters && typeof src.filters === "object" ? src.filters : {};
+  const fnum = (x) => {
+    if (x === null || x === undefined || x === "") return null;
+    const n = Number(x);
+    return isFinite(n) ? n : null;
+  };
+  const secsrc = src.sections && typeof src.sections === "object" ? src.sections : {};
+  const order = Array.isArray(secsrc.order)
+    ? secsrc.order.filter((id, i) => SC_SECTION_IDS.includes(id) && secsrc.order.indexOf(id) === i)
+    : [];
+  SC_SECTION_IDS.forEach((id) => { if (!order.includes(id)) order.push(id); }); // future sections append
+  const collapsed = {};
+  SC_SECTION_IDS.forEach((id) => { if (secsrc.collapsed && secsrc.collapsed[id]) collapsed[id] = true; });
+  const preset = typeof src.preset === "string" &&
+    (SC_PRESETS.includes(src.preset) || /^scan:[A-Za-z0-9_]{1,40}$/.test(src.preset)) ? src.preset : "all";
+  const sel = typeof src.sel === "string" && SC_SYMBOL_RE.test(src.sel) ? src.sel : "";
+  return {
+    preset,
+    sort: SC_SORTS.includes(src.sort) ? src.sort : "pct24h",
+    dir: src.dir === "asc" ? "asc" : "desc",
+    pinFavs: !!src.pinFavs,
+    cards: src.cards !== false,
+    filters: {
+      priceMin: fnum(fsrc.priceMin), priceMax: fnum(fsrc.priceMax),
+      pct24hAbsMin: fnum(fsrc.pct24hAbsMin), turnoverMin: fnum(fsrc.turnoverMin),
+      vol15mMin: fnum(fsrc.vol15mMin), fundingAbsMin: fnum(fsrc.fundingAbsMin),
+    },
+    sections: { order, collapsed },
+    sel,
+    scroll: Math.max(0, Number(src.scroll) || 0),
+  };
+}
+
+// ---- fuzzy search: 3 = prefix, 2 = substring, 1 = in-order subsequence ----
+function scFuzzyScore(symbol, query) {
+  const s = String(symbol || "").toUpperCase();
+  const q = String(query || "").trim().toUpperCase();
+  if (!q) return 0;
+  if (s.startsWith(q)) return 3;
+  if (s.includes(q)) return 2;
+  let i = 0;
+  for (let j = 0; j < s.length && i < q.length; j++) {
+    if (s[j] === q[i]) i++;
+  }
+  return i === q.length ? 1 : 0;
+}
+
+// ---- the view pipeline: preset/scan → numeric filters → search → sort ----
+// rows: server snapshot rows; view: scSanitizeViewState shape (+ query);
+// ctx: {favs, watch, scans}. Pure; returns a NEW ordered array of rows.
+function scComputeView(rows, view, ctx) {
+  const v = view || {};
+  const c = ctx || {};
+  const favSet = new Set(c.favs || []);
+  const watchSet = new Set(c.watch || []);
+  const m = scMetric;
+  const universe = (rows || []).filter(Boolean);
+  let out = universe.slice();
+
+  // Quantile over the FULL universe so "high volume"/"caps" presets keep one
+  // meaning regardless of the other active filters.
+  const quantile = (key, q) => {
+    const vals = [];
+    universe.forEach((r) => { const x = m(r, key); if (x !== null) vals.push(x); });
+    if (!vals.length) return null;
+    vals.sort((a, b) => a - b);
+    return vals[Math.min(vals.length - 1, Math.max(0, Math.floor(q * (vals.length - 1))))];
+  };
+  // Size proxy: open-interest value when the venue provides it, else turnover.
+  const capsKey = universe.some((r) => m(r, "openInterestValue") !== null) ? "openInterestValue" : "turnover24h";
+
+  const preset = typeof v.preset === "string" ? v.preset : "all";
+  if (preset === "favorites") out = out.filter((r) => favSet.has(r.symbol));
+  else if (preset === "watchlist") out = out.filter((r) => watchSet.has(r.symbol));
+  else if (preset === "gainers") out = out.filter((r) => { const p = m(r, "pct24h"); return p !== null && p > 0; });
+  else if (preset === "losers") out = out.filter((r) => { const p = m(r, "pct24h"); return p !== null && p < 0; });
+  else if (preset === "momentum") out = out.filter((r) => {
+    const p15 = m(r, "pct15m"), p1h = m(r, "pct1h");
+    return p15 !== null && p1h !== null && ((p15 >= 0.5 && p1h >= 1) || (p15 <= -0.5 && p1h <= -1));
+  });
+  else if (preset === "breakout") out = out.filter((r) => {
+    const dh = m(r, "distHigh24hPct"), dl = m(r, "distLow24hPct");
+    return (dh !== null && dh <= 0.5) || (dl !== null && dl <= 0.5);
+  });
+  else if (preset === "meanrevert") out = out.filter((r) => {
+    const p24 = m(r, "pct24h"), p15 = m(r, "pct15m");
+    return p24 !== null && p15 !== null && Math.abs(p24) >= 8 &&
+      Math.abs(p15) >= 0.3 && (p15 > 0) !== (p24 > 0);
+  });
+  else if (preset === "highvolume") {
+    const q = quantile("turnover24h", 0.9);
+    out = q === null ? [] : out.filter((r) => { const t = m(r, "turnover24h"); return t !== null && t >= q; });
+  } else if (preset === "largecaps") {
+    const q = quantile(capsKey, 0.8);
+    out = q === null ? [] : out.filter((r) => { const t = m(r, capsKey); return t !== null && t >= q; });
+  } else if (preset === "smallcaps") {
+    const q = quantile(capsKey, 0.5);
+    out = q === null ? [] : out.filter((r) => { const t = m(r, capsKey); return t !== null && t <= q; });
+  } else if (preset === "active") {
+    out = out.filter((r) => { const p = m(r, "pct15m"); return p !== null && Math.abs(p) >= 0.3; });
+  } else if (preset.indexOf("scan:") === 0) {
+    const scan = (c.scans || []).find((s) => "scan:" + s.id === preset);
+    if (scan) out = out.filter((r) => scScanMatches(scan, r));
+  }
+
+  // Numeric filters combine (AND) with whatever preset/scan is active. A row
+  // missing a FILTERED metric is excluded — an unknown value can't pass a bound.
+  const f = v.filters || {};
+  const fnum = (x) => {
+    if (x === null || x === undefined || x === "") return null;
+    const n = Number(x);
+    return isFinite(n) ? n : null;
+  };
+  [["priceMin", "last", (mv, fv) => mv >= fv],
+   ["priceMax", "last", (mv, fv) => mv <= fv],
+   ["pct24hAbsMin", "pct24h", (mv, fv) => Math.abs(mv) >= fv],
+   ["turnoverMin", "turnover24h", (mv, fv) => mv >= fv],
+   ["vol15mMin", "vol15mPct", (mv, fv) => mv >= fv],
+   ["fundingAbsMin", "fundingPct", (mv, fv) => Math.abs(mv) >= fv],
+  ].forEach(([fk, mk, test]) => {
+    const fv = fnum(f[fk]);
+    if (fv === null) return;
+    out = out.filter((r) => { const mv = m(r, mk); return mv !== null && test(mv, fv); });
+  });
+
+  // Fuzzy search; matches also rank the results (prefix > substring > subsequence).
+  const q = String(v.query || "").trim().toUpperCase();
+  let scores = null;
+  if (q) {
+    scores = {};
+    out = out.filter((r) => {
+      const s = scFuzzyScore(r.symbol, q);
+      if (s > 0) { scores[r.symbol] = s; return true; }
+      return false;
+    });
+  }
+
+  const sortKey = SC_SORTS.includes(v.sort) ? v.sort : "pct24h";
+  const dir = v.dir === "asc" ? 1 : -1;
+  out.sort((a, b) => {
+    if (scores) {
+      const d = (scores[b.symbol] || 0) - (scores[a.symbol] || 0);
+      if (d) return d;
+    }
+    if (v.pinFavs) {
+      const d = (favSet.has(b.symbol) ? 1 : 0) - (favSet.has(a.symbol) ? 1 : 0);
+      if (d) return d;
+    }
+    if (sortKey === "symbol") {
+      const d = a.symbol.localeCompare(b.symbol) * dir;
+      if (d) return d;
+    } else {
+      const av = m(a, sortKey), bv = m(b, sortKey);
+      if (av === null && bv !== null) return 1;  // unknowns sink, either direction
+      if (bv === null && av !== null) return -1;
+      if (av !== null && bv !== null && av !== bv) return (av - bv) * dir;
+    }
+    return a.symbol.localeCompare(b.symbol);     // total order => stable resorts
+  });
+  return out;
+}
+
+// ---- overview-card ranking (pure) ----
+// Returns {rows, metric} — `metric` tells the renderer which value the card
+// features (volatility falls back to 24h range while the 15m window warms).
+function scSectionRows(rows, id, ctx) {
+  const c = ctx || {};
+  const limit = c.limit || 6;
+  const m = scMetric;
+  const has = (r, k) => m(r, k) !== null;
+  const desc = (k) => (a, b) => m(b, k) - m(a, k) || a.symbol.localeCompare(b.symbol);
+  const absDesc = (k) => (a, b) => Math.abs(m(b, k)) - Math.abs(m(a, k)) || a.symbol.localeCompare(b.symbol);
+  const list = (rows || []).filter(Boolean);
+  switch (id) {
+    case "movers":
+      return { rows: list.filter((r) => has(r, "pct24h") && m(r, "pct24h") > 0).sort(desc("pct24h")).slice(0, limit), metric: "pct24h" };
+    case "losers":
+      return { rows: list.filter((r) => has(r, "pct24h") && m(r, "pct24h") < 0).sort((a, b) => m(a, "pct24h") - m(b, "pct24h") || a.symbol.localeCompare(b.symbol)).slice(0, limit), metric: "pct24h" };
+    case "volume":
+      return { rows: list.filter((r) => has(r, "turnover24h")).sort(desc("turnover24h")).slice(0, limit), metric: "turnover24h" };
+    case "volatility": {
+      const live = list.filter((r) => has(r, "vol15mPct"));
+      if (live.length) return { rows: live.sort(desc("vol15mPct")).slice(0, limit), metric: "vol15mPct" };
+      return { rows: list.filter((r) => has(r, "range24hPct")).sort(desc("range24hPct")).slice(0, limit), metric: "range24hPct" };
+    }
+    case "funding": {
+      const f = list.filter((r) => has(r, "fundingPct"));
+      const mode = c.fundingMode || "pos";
+      if (mode === "neg") return { rows: f.sort((a, b) => m(a, "fundingPct") - m(b, "fundingPct") || a.symbol.localeCompare(b.symbol)).slice(0, limit), metric: "fundingPct" };
+      if (mode === "delta") return { rows: f.filter((r) => has(r, "fundingDelta1hPct")).sort(absDesc("fundingDelta1hPct")).slice(0, limit), metric: "fundingDelta1hPct" };
+      return { rows: f.sort(desc("fundingPct")).slice(0, limit), metric: "fundingPct" };
+    }
+    case "active":
+      return { rows: list.filter((r) => has(r, "pct15m")).sort(absDesc("pct15m")).slice(0, limit), metric: "pct15m" };
+    case "watchlist": {
+      const set = new Set(c.watch || []);
+      return { rows: list.filter((r) => set.has(r.symbol) && has(r, "pct24h")).sort(absDesc("pct24h")).slice(0, limit), metric: "pct24h" };
+    }
+    default:
+      return { rows: [], metric: null };
+  }
+}
+
+// ------------------------------ DOM manager -------------------------------
+
+let _scData = null;            // last /api/scanner envelope
+let _scIndex = {};             // symbol → row (rebuilt each poll)
+let _scTimer = null;           // visible-tab poll
+let _scBgTimer = null;         // slow background tick, only while alerts armed
+let _scDoc = null;             // persisted doc (favs/scans/alerts/log)
+let _scView = scSanitizeViewState(null); // per-workspace view (preset/sort/…)
+let _scQuery = "";             // live search text (session-only by design)
+let _scVisible = [];           // computed, ordered row list for the table
+let _scSel = "";               // selected symbol (kept per workspace)
+let _scPrevTop = null;         // previous top-movers board (null until 2nd poll)
+let _scPrevPrice = {};         // symbol → last painted price (tick flash)
+let _scRowEls = {};            // symbol → row element (keyed, in-place patched)
+let _scRowH = 0;               // measured row height for virtualization
+let _scFundingMode = "pos";    // funding card mode: pos | neg | delta
+let _scPendingScroll = 0;      // scroll restored after the first data render
+let _scStorageWarned = false;
+let _scSaveTimer = null;
+let _scLastSyncTs = 0;         // wall time of the last applied snapshot
+
+function scPersist() {
+  if (!_scDoc) return;
+  try { localStorage.setItem(SC_STORE_KEY, JSON.stringify(_scDoc)); }
+  catch (e) {
+    if (!_scStorageWarned) { _scStorageWarned = true; toast("Could not persist scanner data (storage unavailable)", "warn"); }
+  }
+}
+function scLoad() {
+  let raw = null;
+  try { raw = localStorage.getItem(SC_STORE_KEY); } catch (e) {}
+  const { doc, corrupt } = scParseDoc(raw);
+  _scDoc = doc;
+  if (corrupt && raw !== null) {
+    try { localStorage.setItem(SC_STORE_KEY + ".corrupt", raw); } catch (e) {}
+    toast("Scanner data was unreadable — reset to defaults (old data kept under …corrupt)", "warn", 8000);
+  }
+  scPersist();
+}
+function scAutoSaveView() {
+  clearTimeout(_scSaveTimer);
+  _scSaveTimer = setTimeout(() => { wsAutoSave(); }, 300);
+}
+
+// Union of every watchlist's symbols (the scanner's "Watchlist" surfaces).
+function scWatchSymbols() {
+  if (!_wlDoc) return [];
+  const seen = new Set();
+  _wlDoc.lists.forEach((l) => l.symbols.forEach((s) => seen.add(s)));
+  return Array.from(seen);
+}
+
+// ---- formatting ----
+function scFmtPct(v, digits) {
+  if (v === null || v === undefined || !isFinite(Number(v))) return "—";
+  const n = Number(v);
+  const d = digits === undefined ? 2 : digits;
+  return (n > 0 ? "+" : n < 0 ? "−" : "") + Math.abs(n).toFixed(d) + "%";
+}
+function scFmtPrice(v) {
+  if (v === null || v === undefined || !isFinite(Number(v))) return "—";
+  return fmtMoney(v, wlPriceDp(v));
+}
+// Compact money (respects the INR display lens like every read-only surface).
+function scFmtCompact(v, signed) {
+  if (v === null || v === undefined || !isFinite(Number(v))) return "—";
+  const n = cvtNum(v);
+  if (!isFinite(n)) return "—";
+  const sign = signed ? (n > 0 ? "+" : n < 0 ? "−" : "") : (n < 0 ? "−" : "");
+  const a = Math.abs(n);
+  const body = a >= 1e9 ? (a / 1e9).toFixed(2) + "B"
+    : a >= 1e6 ? (a / 1e6).toFixed(1) + "M"
+    : a >= 1e3 ? (a / 1e3).toFixed(1) + "K"
+    : a.toFixed(a >= 1 ? 1 : 4);
+  return sign + body;
+}
+// Graded heat tint behind % cells — magnitude readable at a glance without
+// hue-only encoding (the signed number stays the primary carrier).
+function scHeatStyle(v, fullAt) {
+  const n = Number(v);
+  if (!isFinite(n) || n === 0) return "";
+  const alpha = Math.min(0.26, (Math.abs(n) / (fullAt || 10)) * 0.26);
+  return "background:" + (n > 0 ? "rgba(0,201,141," : "rgba(255,77,103,") + alpha.toFixed(3) + ")";
+}
+function scSparkSVG(series, cls) {
+  if (!Array.isArray(series) || series.length < 2) return "";
+  const w = 60, ht = 20, pad = 2;
+  let min = Infinity, max = -Infinity;
+  for (const v of series) { if (v < min) min = v; if (v > max) max = v; }
+  const span = (max - min) || 1;
+  const dx = (w - pad * 2) / (series.length - 1);
+  const pts = series.map((v, i) =>
+    `${(pad + i * dx).toFixed(1)},${(ht - pad - ((v - min) / span) * (ht - pad * 2)).toFixed(1)}`).join(" ");
+  const up = series[series.length - 1] >= series[0];
+  const col = up ? "var(--pos)" : "var(--neg)";
+  return `<svg class="${cls || "wl-spark"}" viewBox="0 0 ${w} ${ht}" preserveAspectRatio="none" aria-hidden="true">` +
+    `<polyline points="${pts}" style="fill:none;stroke:${col};stroke-width:1.4;vector-effect:non-scaling-stroke"/></svg>`;
+}
+
+// ---- data poll ----
+async function fetchScanner() {
+  let data;
+  try {
+    data = await api("/api/scanner");
+  } catch (e) {
+    // First-load failure: show a real error state (the empty-state element sits
+    // in normal flow; the virtualized rows container does not). With data
+    // already on screen, keep the last snapshot and let the status line warn.
+    const emptyEl = document.getElementById("sc-empty");
+    if (emptyEl && !_scData) {
+      emptyEl.hidden = false;
+      emptyEl.innerHTML = errorMsg(e.message);
+      const rowsEl = document.getElementById("sc-rows");
+      if (rowsEl) rowsEl.replaceChildren();
+    }
+    scRenderStatus();
+    return;
+  }
+  _scData = data;
+  _scLastSyncTs = Date.now();
+  const idx = {};
+  (data.rows || []).forEach((r) => { if (r && SC_SYMBOL_RE.test(String(r.symbol))) idx[r.symbol] = r; });
+  _scIndex = idx;
+  scRunAlerts();
+  scSyncAll();
+}
+
+function scPaneVisible() {
+  const pane = document.querySelector('[data-pane="scanner"]');
+  return !!pane && !pane.hidden;
+}
+
+function onScannerActive() {
+  if (!_scData) { scRenderLoading(); fetchScanner(); }
+  else scSyncAll();
+  clearInterval(_scTimer);
+  // Same visible-tab cadence + self-cancel discipline as the Watch tab poll;
+  // the endpoint is served from backend memory, so this costs the exchange
+  // nothing regardless of how many viewers poll it.
+  const id = setInterval(() => {
+    if (!scPaneVisible()) { clearInterval(id); return; }
+    if (!document.hidden) fetchScanner();
+  }, 10000);
+  _scTimer = id;
+}
+
+// Slow background tick ONLY while alerts are armed, so alerts keep working
+// from any tab. Skipped when the scanner pane's own poll is running or the
+// browser tab is hidden.
+function scEnsureAlertTimer() {
+  clearInterval(_scBgTimer);
+  _scBgTimer = null;
+  if (!_scDoc || !_scDoc.alerts.length) return;
+  _scBgTimer = setInterval(() => {
+    if (document.hidden || scPaneVisible()) return;
+    fetchScanner();
+  }, 45000);
+}
+
+// ---- alerts runtime ----
+function scRunAlerts() {
+  if (!_scData) return;
+  // Depth 25 = the deepest rank an alert may watch (sanitizer clamps to ≤25);
+  // each alert compares boards truncated to its own rank.
+  const topNow = scTopMovers(Object.values(_scIndex), 25);
+  if (_scDoc && _scDoc.alerts.length) {
+    const fired = scEvalAlerts(_scDoc.alerts, {
+      index: _scIndex, topMovers: topNow, prevTopMovers: _scPrevTop,
+    }, Date.now());
+    if (fired.length) {
+      const now = Date.now();
+      fired.forEach((f) => {
+        f.alert.lastFired[f.symbol] = now;
+        _scDoc.log.unshift({ ts: now, msg: f.message, symbol: f.symbol });
+        toast("Scanner · " + f.message, "warn", 8000);
+      });
+      if (_scDoc.log.length > SC_MAX_LOG) _scDoc.log.length = SC_MAX_LOG;
+      scPersist();
+    }
+  }
+  _scPrevTop = topNow;
+}
+
+// ---- status line ----
+function scRenderStatus() {
+  const el = document.getElementById("sc-status");
+  if (!el) return;
+  if (!_scData) { el.textContent = "connecting…"; el.classList.remove("sc-stale"); return; }
+  const d = _scData;
+  if (d.enabled === false) { el.textContent = "scanner disabled on the server"; return; }
+  const parts = [];
+  parts.push(d.universe + " markets");
+  if (d.asOfMs && d.nowMs) {
+    const age = Math.max(0, Math.round((d.nowMs - d.asOfMs) / 1000)) + Math.max(0, Math.round((Date.now() - _scLastSyncTs) / 1000));
+    parts.push("updated " + fmtAge(age) + " ago");
+    const stale = (d.nowMs - d.asOfMs) > Math.max(30000, (d.intervalMs || 10000) * 3);
+    el.classList.toggle("sc-stale", stale);
+    if (stale) parts.push("⚠ stale");
+  }
+  const hist = Number(d.historyMs) || 0;
+  const warm = [];
+  if (hist < 15 * 60000 * 0.85) warm.push("15m");
+  if (hist < 60 * 60000 * 0.85 && !(d.capabilities && d.capabilities.pct1h)) warm.push("1h");
+  if (warm.length) parts.push(warm.join("/") + " metrics warming (" + Math.round(hist / 60000) + "m)");
+  if (d.error) parts.push("⚠ " + d.error);
+  el.textContent = parts.join(" · ");
+}
+
+// ---- presets strip ----
+const SC_PRESET_DEFS = [
+  { id: "all", label: "All" },
+  { id: "favorites", label: "★ Favorites" },
+  { id: "gainers", label: "Gainers" },
+  { id: "losers", label: "Losers" },
+  { id: "momentum", label: "Momentum", title: "15m and 1h moving the same way (±0.5% / ±1%)" },
+  { id: "breakout", label: "Breakouts", title: "Within 0.5% of the 24h high or low" },
+  { id: "meanrevert", label: "Mean-revert", title: "|24h| ≥ 8% with the last 15m pulling the other way" },
+  { id: "highvolume", label: "High volume", title: "Top 10% by 24h turnover" },
+  { id: "largecaps", label: "Large caps", title: "Top 20% by open-interest value (turnover when OI is unavailable)" },
+  { id: "smallcaps", label: "Small caps", title: "Bottom half by open-interest value (turnover when OI is unavailable)" },
+  { id: "active", label: "Active now", title: "|15m move| ≥ 0.3%" },
+  { id: "watchlist", label: "Watchlist", title: "Symbols from all your watchlists" },
+];
+function scRenderPresets() {
+  const el = document.getElementById("sc-presets");
+  if (!el || !_scDoc) return;
+  const chips = SC_PRESET_DEFS.map((p) => {
+    const on = _scView.preset === p.id;
+    return `<button type="button" class="sc-chip${on ? " active" : ""}" role="tab" aria-selected="${on}"` +
+      ` data-preset="${p.id}"${p.title ? ` title="${esc(p.title)}"` : ""}>${esc(p.label)}</button>`;
+  });
+  _scDoc.scans.forEach((s) => {
+    const pid = "scan:" + s.id;
+    const on = _scView.preset === pid;
+    chips.push(`<button type="button" class="sc-chip sc-chip-scan${on ? " active" : ""}" role="tab" aria-selected="${on}"` +
+      ` data-preset="${esc(pid)}" title="Custom scan · ${s.mode.toUpperCase()} of ${s.rules.length} condition${s.rules.length === 1 ? "" : "s"} · click again to edit">` +
+      `<span class="sc-chip-name">${esc(s.name)}</span><span class="sc-chip-edit" aria-hidden="true">✎</span></button>`);
+  });
+  el.innerHTML = chips.join("");
+}
+function scSetPreset(id) {
+  if (_scView.preset === id) return;
+  _scView.preset = id;
+  scRenderPresets();
+  scSyncTable();
+  scAutoSaveView();
+}
+
+// ---- screener table (virtualized) ----
+const SC_COLUMNS = [
+  { key: "fav", cls: "sc-c-fav", label: "" },
+  { key: "symbol", cls: "sc-c-sym", label: "Symbol", sortable: true },
+  { key: "spark", cls: "sc-c-spark", label: "Trend", title: "Sampled trend over the rolling history (≤1h)" },
+  { key: "last", cls: "sc-c-num", label: "Last", sortable: true },
+  { key: "pct5m", cls: "sc-c-num sc-opt2", label: "5m %", sortable: true },
+  { key: "pct15m", cls: "sc-c-num", label: "15m %", sortable: true },
+  { key: "pct1h", cls: "sc-c-num sc-opt", label: "1h %", sortable: true },
+  { key: "pct24h", cls: "sc-c-num", label: "24h %", sortable: true },
+  { key: "range24hPct", cls: "sc-c-num sc-opt", label: "Range", sortable: true, title: "24h high−low as % of price" },
+  { key: "vol15mPct", cls: "sc-c-num sc-opt2", label: "Vol 15m", sortable: true, title: "Realized 15-minute range %" },
+  { key: "turnover24h", cls: "sc-c-num", label: "Volume", sortable: true, title: "24h turnover" },
+  { key: "turnoverDelta15m", cls: "sc-c-num sc-opt", label: "ΔVol 15m", sortable: true, title: "Change of the rolling 24h turnover over the last 15m" },
+  { key: "fundingPct", cls: "sc-c-num sc-opt", label: "Funding", sortable: true, title: "Current funding rate (Δ1h below when available)" },
+  { key: "openInterestValue", cls: "sc-c-num sc-opt2", label: "OI", sortable: true, title: "Open-interest value" },
+  { key: "act", cls: "sc-c-act", label: "" },
+];
+function scRenderHead() {
+  const el = document.getElementById("sc-head");
+  if (!el) return;
+  el.innerHTML = SC_COLUMNS.map((c) => {
+    if (!c.sortable) return `<span class="${c.cls}"${c.title ? ` title="${esc(c.title)}"` : ""}>${esc(c.label)}</span>`;
+    const on = _scView.sort === c.key;
+    const arrow = on ? (_scView.dir === "asc" ? " ▴" : " ▾") : "";
+    return `<button type="button" class="sc-th ${c.cls}${on ? " on" : ""}" data-sort="${c.key}"` +
+      ` aria-sort="${on ? (_scView.dir === "asc" ? "ascending" : "descending") : "none"}"` +
+      `${c.title ? ` title="${esc(c.title)}"` : ""}>${esc(c.label)}${arrow}</button>`;
+  }).join("");
+}
+function scBuildRow(sym) {
+  const row = document.createElement("div");
+  row.className = "sc-row";
+  row.id = "sc-row-" + sym;
+  row.dataset.sym = sym;
+  row.setAttribute("role", "option");
+  row.setAttribute("aria-selected", "false");
+  row.tabIndex = -1;
+  row.innerHTML = SC_COLUMNS.map((c) => {
+    if (c.key === "fav") return `<button class="sc-fav" type="button" tabindex="-1" aria-label="Toggle scanner favorite ${esc(sym)}" title="Favorite">★</button>`;
+    if (c.key === "symbol") return `<span class="sc-c-sym mono">${esc(sym)}</span>`;
+    if (c.key === "spark") return `<span class="sc-c-spark sc-spark-cell"></span>`;
+    if (c.key === "act") return `<button class="sc-more" type="button" tabindex="-1" aria-label="Actions for ${esc(sym)}" title="Actions (right-click or Menu key)">⋯</button>`;
+    return `<span class="${c.cls} sc-cell" data-k="${c.key}"></span>`;
+  }).join("");
+  return row;
+}
+// Patch ONLY changed cells (each row caches what it last painted) so a poll
+// touches a handful of text nodes, not the DOM tree.
+function scPatchRow(row, r) {
+  const sym = r.symbol;
+  const cache = row._v || (row._v = {});
+  const isFav = _scDoc && _scDoc.favs.includes(sym);
+  row.classList.toggle("is-fav", !!isFav);
+  const favBtn = row.querySelector(".sc-fav");
+  if (favBtn) favBtn.classList.toggle("on", !!isFav);
+  const selected = _scSel === sym;
+  row.classList.toggle("sel", selected);
+  row.setAttribute("aria-selected", String(selected));
+
+  const last = scMetric(r, "last");
+  const prev = _scPrevPrice[sym];
+  if (last !== null && isFinite(prev) && last !== prev) {
+    const cls = last > prev ? "tick-up" : "tick-down";
+    row.classList.remove("tick-up", "tick-down");
+    void row.offsetWidth;
+    row.classList.add(cls);
+  }
+
+  const set = (key, text, cls, style) => {
+    const sig = text + "|" + (cls || "") + "|" + (style || "");
+    if (cache[key] === sig) return;
+    cache[key] = sig;
+    const el = row.querySelector(`[data-k="${key}"]`);
+    if (!el) return;
+    el.textContent = text;
+    el.className = el.className.replace(/\s*(pos|neg|flat|sc-hot)\b/g, "") + (cls ? " " + cls : "");
+    el.style.cssText = style || "";
+  };
+  set("last", scFmtPrice(last));
+  [["pct5m", 8], ["pct15m", 8], ["pct1h", 8], ["pct24h", 12]].forEach(([k, fullAt]) => {
+    const v = scMetric(r, k);
+    set(k, scFmtPct(v), pnlClass(v), scHeatStyle(v, fullAt));
+  });
+  const range = scMetric(r, "range24hPct");
+  set("range24hPct", range === null ? "—" : range.toFixed(2) + "%");
+  const v15 = scMetric(r, "vol15mPct");
+  set("vol15mPct", v15 === null ? "—" : v15.toFixed(2) + "%", v15 !== null && v15 >= 1.5 ? "sc-hot" : "");
+  set("turnover24h", scFmtCompact(scMetric(r, "turnover24h")));
+  const dv = scMetric(r, "turnoverDelta15m");
+  set("turnoverDelta15m", dv === null ? "—" : scFmtCompact(dv, true), pnlClass(dv));
+  const fp = scMetric(r, "fundingPct");
+  set("fundingPct", fp === null ? "—" : scFmtPct(fp, 4), fp === null ? "" : (fp > 0 ? "pos" : fp < 0 ? "neg" : "flat"));
+  set("openInterestValue", scFmtCompact(scMetric(r, "openInterestValue")));
+
+  const sparkSig = Array.isArray(r.spark) ? r.spark.length + ":" + r.spark[0] + ":" + r.spark[r.spark.length - 1] : "";
+  if (cache.spark !== sparkSig) {
+    cache.spark = sparkSig;
+    const cell = row.querySelector(".sc-spark-cell");
+    if (cell) cell.innerHTML = scSparkSVG(r.spark);
+  }
+  if (last !== null) _scPrevPrice[sym] = last;
+}
+
+function scRowH() {
+  if (_scRowH) return _scRowH;
+  const probe = document.querySelector("#sc-rows .sc-row");
+  if (probe && probe.offsetHeight) _scRowH = probe.offsetHeight;
+  return _scRowH || 34;
+}
+
+// Windowed render: only the rows near the viewport exist in the DOM, so the
+// table stays smooth with the entire universe loaded (§performance).
+function scRenderTable() {
+  const vp = document.getElementById("sc-viewport");
+  const spacer = document.getElementById("sc-spacer");
+  const rowsEl = document.getElementById("sc-rows");
+  const emptyEl = document.getElementById("sc-empty");
+  if (!vp || !spacer || !rowsEl || !emptyEl) return;
+
+  const total = _scVisible.length;
+  if (!total) {
+    rowsEl.replaceChildren();
+    spacer.style.height = "0px";
+    if (_scData) {
+      emptyEl.hidden = false;
+      const hasQuery = !!_scQuery.trim();
+      const filtered = _scView.preset !== "all" || scActiveFilterCount() > 0 || hasQuery;
+      emptyEl.innerHTML =
+        `<div class="wl-empty-glyph" aria-hidden="true">◎</div>` +
+        `<p class="wl-empty-title">${_scData.rows && _scData.rows.length ? "No markets match" : "Waiting for market data…"}</p>` +
+        `<p class="wl-empty-hint">${filtered ? "Loosen the preset, filters or search to see more." : "The scanner feed will populate this table shortly."}</p>` +
+        (filtered ? `<div class="wl-empty-actions"><button class="btn-ghost sm" data-scempty="reset">Show all markets</button></div>` : "");
+    }
+    return;
+  }
+  emptyEl.hidden = true;
+
+  const rowH = scRowH();
+  spacer.style.height = (total * rowH) + "px";
+  const buffer = 8;
+  const first = Math.max(0, Math.floor(vp.scrollTop / rowH) - buffer);
+  const count = Math.ceil(vp.clientHeight / rowH) + buffer * 2;
+  const slice = _scVisible.slice(first, first + count);
+  rowsEl.style.transform = `translateY(${first * rowH}px)`;
+
+  const frag = document.createDocumentFragment();
+  slice.forEach((r) => {
+    let row = _scRowEls[r.symbol];
+    if (!row) { row = _scRowEls[r.symbol] = scBuildRow(r.symbol); }
+    frag.appendChild(row);
+  });
+  rowsEl.replaceChildren(frag);
+  slice.forEach((r) => scPatchRow(_scRowEls[r.symbol], r));
+
+  // Bound the element pool to the current universe.
+  if (Object.keys(_scRowEls).length > (_scData ? (_scData.rows || []).length : 0) + 50) {
+    const live = new Set(Object.keys(_scIndex));
+    Object.keys(_scRowEls).forEach((s) => { if (!live.has(s)) delete _scRowEls[s]; });
+  }
+}
+
+function scActiveFilterCount() {
+  const f = _scView.filters || {};
+  return ["priceMin", "priceMax", "pct24hAbsMin", "turnoverMin", "vol15mMin", "fundingAbsMin"]
+    .filter((k) => f[k] !== null && f[k] !== undefined).length;
+}
+function scRenderFilterBadge() {
+  const n = scActiveFilterCount();
+  const badge = document.getElementById("sc-filter-count");
+  const btn = document.getElementById("sc-filter-btn");
+  if (badge) { badge.hidden = n === 0; badge.textContent = String(n); }
+  if (btn) btn.classList.toggle("on", n > 0);
+}
+
+function scRenderLoading() {
+  const rowsEl = document.getElementById("sc-rows");
+  if (!rowsEl || _scData) return;
+  rowsEl.innerHTML = new Array(12).fill('<div class="sc-row sc-row-skel"><span class="skel"></span></div>').join("");
+  // The rows layer is absolutely positioned; give the spacer real height so
+  // the skeletons are visible before the first snapshot sizes it.
+  const spacer = document.getElementById("sc-spacer");
+  if (spacer) spacer.style.height = (12 * 36) + "px";
+  const cardsEl = document.getElementById("sc-sections");
+  if (cardsEl && !cardsEl.children.length) {
+    cardsEl.innerHTML = new Array(4).fill('<section class="sc-card sc-card-skel"><span class="skel"></span><span class="skel"></span><span class="skel"></span></section>').join("");
+  }
+}
+
+// Recompute the table view from the latest snapshot + view state.
+function scSyncTable() {
+  if (!_scData) return;
+  _scRowH = 0; // re-measure once per sync (density toggles change row height)
+  _scVisible = scComputeView(_scData.rows || [], {
+    preset: _scView.preset, query: _scQuery, sort: _scView.sort, dir: _scView.dir,
+    pinFavs: _scView.pinFavs, filters: _scView.filters,
+  }, { favs: _scDoc ? _scDoc.favs : [], watch: scWatchSymbols(), scans: _scDoc ? _scDoc.scans : [] });
+  scRenderHead();
+  scRenderTable();
+  scRenderFilterBadge();
+}
+
+// ---- overview cards ----
+const SC_SECTION_DEFS = {
+  movers: { title: "Top Movers", meta: "24h gainers" },
+  losers: { title: "Top Losers", meta: "24h decliners" },
+  volume: { title: "Highest Volume", meta: "24h turnover" },
+  volatility: { title: "Volatility", meta: "biggest ranges" },
+  funding: { title: "Funding", meta: "perp funding rates" },
+  active: { title: "Recently Active", meta: "largest 15m moves" },
+  watchlist: { title: "Watchlist Movers", meta: "across your lists" },
+  alerts: { title: "Recent Alerts", meta: "scanner alerts" },
+};
+function scBuildCard(id) {
+  const def = SC_SECTION_DEFS[id];
+  const card = document.createElement("section");
+  card.className = "sc-card";
+  card.dataset.scsec = id;
+  const fundingSeg = id === "funding"
+    ? `<div class="segment sc-fmode" role="group" aria-label="Funding view">` +
+      `<button type="button" data-fmode="pos" class="seg-neutral active" aria-pressed="true">+</button>` +
+      `<button type="button" data-fmode="neg" class="seg-neutral" aria-pressed="false">−</button>` +
+      `<button type="button" data-fmode="delta" class="seg-neutral" aria-pressed="false">Δ1h</button></div>`
+    : "";
+  card.innerHTML =
+    `<div class="sc-card-head">` +
+      `<button class="sc-card-drag" type="button" title="Drag to rearrange · arrow keys move" aria-label="Move ${esc(def.title)} card">⠿</button>` +
+      `<h3>${esc(def.title)}</h3>` +
+      `<span class="sc-card-meta muted">${esc(def.meta)}</span>` +
+      fundingSeg +
+      `<button class="sc-card-collapse" type="button" aria-expanded="true" title="Collapse">▾</button>` +
+    `</div>` +
+    `<div class="sc-card-body"></div>`;
+  return card;
+}
+function scCardEmpty(text) {
+  return `<p class="sc-card-empty muted">${esc(text)}</p>`;
+}
+function scPatchCard(card, id) {
+  const body = card.querySelector(".sc-card-body");
+  if (!body) return;
+  const collapsed = !!_scView.sections.collapsed[id];
+  card.classList.toggle("collapsed", collapsed);
+  const colBtn = card.querySelector(".sc-card-collapse");
+  if (colBtn) { colBtn.setAttribute("aria-expanded", String(!collapsed)); colBtn.textContent = collapsed ? "▸" : "▾"; }
+  if (collapsed) return;
+
+  if (id === "alerts") {
+    const log = _scDoc ? _scDoc.log.slice(0, 6) : [];
+    const armed = _scDoc ? _scDoc.alerts.length : 0;
+    const metaEl = card.querySelector(".sc-card-meta");
+    if (metaEl) metaEl.textContent = armed ? armed + " armed" : "scanner alerts";
+    const sig = log.map((l) => l.ts + l.msg).join("|") + "#" + armed;
+    if (body.dataset.sig === sig) return;
+    body.dataset.sig = sig;
+    body.innerHTML = (log.length
+      ? log.map((l) =>
+          `<div class="sc-alert-row" ${l.symbol ? `data-sym="${esc(l.symbol)}" role="button" tabindex="0"` : ""}>` +
+          `<span class="sc-alert-msg">${esc(l.msg)}</span>` +
+          `<span class="sc-alert-t muted">${new Date(l.ts).toLocaleTimeString()}</span></div>`).join("")
+      : scCardEmpty("No alerts fired yet.")) +
+      `<button class="btn-ghost sm sc-card-btn" data-scact="newalert" type="button">＋ New alert</button>`;
+    return;
+  }
+
+  if (id === "funding" && _scData && _scData.capabilities && !_scData.capabilities.funding) {
+    // The venue doesn't supply funding: keep the card (the metric slots in
+    // later without layout changes) but say why it is empty. Never fake rates.
+    if (body.dataset.sig !== "nofunding") {
+      body.dataset.sig = "nofunding";
+      body.innerHTML = scCardEmpty("Funding rates are not provided by this exchange feed.");
+    }
+    return;
+  }
+
+  const res = scSectionRows(_scData ? _scData.rows || [] : [], id,
+    { limit: 6, fundingMode: _scFundingMode, watch: scWatchSymbols() });
+  if (!res.rows.length) {
+    const msg = id === "active" ? "Warming up — 15m activity appears a few minutes after the feed starts."
+      : id === "watchlist" ? "No watchlist symbols in the current universe."
+      : "Nothing to rank yet.";
+    if (body.dataset.sig !== "empty:" + id) { body.dataset.sig = "empty:" + id; body.innerHTML = scCardEmpty(msg); }
+    return;
+  }
+  const syms = res.rows.map((r) => r.symbol).join(",");
+  if (body.dataset.sig !== syms) {
+    body.dataset.sig = syms;
+    body.innerHTML = res.rows.map((r, i) =>
+      `<div class="sc-mini" data-sym="${esc(r.symbol)}" role="button" tabindex="0" title="Click to select · Enter to open chart & book">` +
+      `<span class="sc-mini-rank muted">${i + 1}</span>` +
+      `<span class="sc-mini-sym mono">${esc(r.symbol)}</span>` +
+      `<span class="sc-mini-spark"></span>` +
+      `<span class="sc-mini-price mono"></span>` +
+      `<span class="sc-mini-val mono"></span></div>`).join("");
+  }
+  res.rows.forEach((r) => {
+    const rowEl = body.querySelector(`.sc-mini[data-sym="${CSS.escape(r.symbol)}"]`);
+    if (!rowEl) return;
+    rowEl.classList.toggle("sel", _scSel === r.symbol);
+    const priceEl = rowEl.querySelector(".sc-mini-price");
+    if (priceEl) priceEl.textContent = scFmtPrice(scMetric(r, "last"));
+    const valEl = rowEl.querySelector(".sc-mini-val");
+    if (valEl) {
+      const v = scMetric(r, res.metric);
+      let text, cls = "";
+      if (res.metric === "turnover24h") text = scFmtCompact(v);
+      else if (res.metric === "fundingPct" || res.metric === "fundingDelta1hPct") { text = scFmtPct(v, 4); cls = pnlClass(v); }
+      else { text = scFmtPct(v); cls = pnlClass(v); }
+      valEl.textContent = text;
+      valEl.className = "sc-mini-val mono " + cls;
+    }
+    const sparkEl = rowEl.querySelector(".sc-mini-spark");
+    if (sparkEl) {
+      const sig = Array.isArray(r.spark) ? r.spark.length + ":" + r.spark[r.spark.length - 1] : "";
+      if (sparkEl.dataset.sig !== sig) { sparkEl.dataset.sig = sig; sparkEl.innerHTML = scSparkSVG(r.spark); }
+    }
+  });
+  // Volatility card: surface which metric is being ranked while 15m warms.
+  if (id === "volatility") {
+    const metaEl = card.querySelector(".sc-card-meta");
+    if (metaEl) metaEl.textContent = res.metric === "vol15mPct" ? "15m realized range" : "24h range (15m warming)";
+  }
+}
+function scRenderSections() {
+  const wrap = document.getElementById("sc-sections");
+  if (!wrap) return;
+  wrap.hidden = !_scView.cards;
+  const tgl = document.getElementById("sc-cards-toggle");
+  if (tgl) tgl.setAttribute("aria-pressed", String(_scView.cards));
+  if (!_scView.cards) return;
+  // Create/reorder card elements to match the workspace's saved order.
+  const want = _scView.sections.order;
+  const have = {};
+  Array.from(wrap.querySelectorAll(":scope > .sc-card[data-scsec]")).forEach((el) => { have[el.dataset.scsec] = el; });
+  if (want.some((sid) => !have[sid]) || Object.keys(have).length !== want.length) {
+    wrap.replaceChildren();
+    want.forEach((sid) => { wrap.appendChild(have[sid] || scBuildCard(sid)); });
+  } else {
+    want.forEach((sid) => wrap.appendChild(have[sid]));
+  }
+  want.forEach((sid) => {
+    const card = wrap.querySelector(`:scope > .sc-card[data-scsec="${sid}"]`);
+    if (card) scPatchCard(card, sid);
+  });
+}
+
+function scSyncAll() {
+  if (!scPaneVisible()) { scRenderStatus(); return; }
+  scRenderStatus();
+  scRenderPresets();
+  scSyncTable();
+  scRenderSections();
+  if (_scPendingScroll) {
+    const vp = document.getElementById("sc-viewport");
+    if (vp && _scVisible.length) { vp.scrollTop = _scPendingScroll; _scPendingScroll = 0; scRenderTable(); }
+  }
+}
+// Currency-lens re-render hook (mirrors renderMarkets for the Watch tab).
+function scRerender() {
+  Object.values(_scRowEls).forEach((row) => { row._v = {}; });
+  const wrap = document.getElementById("sc-sections");
+  if (wrap) wrap.querySelectorAll(".sc-card-body").forEach((b) => { b.dataset.sig = ""; });
+  scSyncAll();
+}
+
+// ---- workspace integration (view state captured/applied per workspace) ----
+function scCaptureViewState() {
+  const vp = document.getElementById("sc-viewport");
+  return {
+    preset: _scView.preset, sort: _scView.sort, dir: _scView.dir,
+    pinFavs: _scView.pinFavs, cards: _scView.cards, filters: _scView.filters,
+    sections: _scView.sections, sel: _scSel,
+    scroll: vp ? Math.round(vp.scrollTop) : _scView.scroll,
+  };
+}
+function scApplyViewState(raw) {
+  const st = scSanitizeViewState(raw);
+  _scView = st;
+  _scSel = st.sel || "";
+  _scPendingScroll = st.scroll || 0;
+  // Reflect toolbar controls.
+  const pin = document.getElementById("sc-pin-favs");
+  if (pin) { pin.setAttribute("aria-pressed", String(st.pinFavs)); pin.classList.toggle("on", st.pinFavs); }
+  document.querySelectorAll("#sc-filter-pop [data-scfilter]").forEach((inp) => {
+    const v = st.filters[inp.dataset.scfilter];
+    inp.value = v === null || v === undefined ? "" : String(v);
+  });
+  if (_scData) scSyncAll(); else scRenderPresets();
+}
+
+// ---- selection / navigation ----
+function scSelect(sym, opts) {
+  _scSel = sym || "";
+  const o = opts || {};
+  if (_scSel && !o.silent) scAutoSaveView();
+  // Patch selection classes in place (cheap; no recompute).
+  Object.keys(_scRowEls).forEach((s) => {
+    _scRowEls[s].classList.toggle("sel", s === _scSel);
+    _scRowEls[s].setAttribute("aria-selected", String(s === _scSel));
+  });
+  const wrap = document.getElementById("sc-sections");
+  if (wrap) wrap.querySelectorAll(".sc-mini").forEach((el) => el.classList.toggle("sel", el.dataset.sym === _scSel));
+  const vp = document.getElementById("sc-viewport");
+  if (vp && _scSel) vp.setAttribute("aria-activedescendant", "sc-row-" + _scSel);
+}
+function scScrollToSelected() {
+  const vp = document.getElementById("sc-viewport");
+  if (!vp || !_scSel) return;
+  const idx = _scVisible.findIndex((r) => r.symbol === _scSel);
+  if (idx < 0) return;
+  const rowH = scRowH();
+  const top = idx * rowH;
+  if (top < vp.scrollTop) vp.scrollTop = top;
+  else if (top + rowH > vp.scrollTop + vp.clientHeight) vp.scrollTop = top + rowH - vp.clientHeight;
+  scRenderTable();
+}
+function scMoveSelection(delta, absolute) {
+  if (!_scVisible.length) return;
+  let idx = _scVisible.findIndex((r) => r.symbol === _scSel);
+  if (absolute === "home") idx = 0;
+  else if (absolute === "end") idx = _scVisible.length - 1;
+  else idx = idx < 0 ? (delta > 0 ? 0 : _scVisible.length - 1) : Math.max(0, Math.min(_scVisible.length - 1, idx + delta));
+  scSelect(_scVisible[idx].symbol);
+  scScrollToSelected();
+}
+function scPageSize() {
+  const vp = document.getElementById("sc-viewport");
+  return vp ? Math.max(1, Math.floor(vp.clientHeight / scRowH()) - 1) : 20;
+}
+
+// ---- context menu (navigation/display/list edits only — never a trade) ----
+function scCloseCtx() {
+  const menu = document.getElementById("sc-ctx");
+  if (menu) { menu.hidden = true; menu.innerHTML = ""; }
+}
+function scOpenCtx(sym, x, y) {
+  const menu = document.getElementById("sc-ctx");
+  if (!menu || !_scDoc) return;
+  const isAdmin = state.role === "admin" && !!document.getElementById("order-form");
+  const isFav = _scDoc.favs.includes(sym);
+  const lists = _wlDoc ? _wlDoc.lists.slice(0, 6) : [];
+  const item = (act, label, extra) => `<button class="wl-ctx-item" role="menuitem" tabindex="-1" data-act="${act}"${extra || ""}>${label}</button>`;
+  menu.innerHTML =
+    `<div class="wl-ctx-head mono">${esc(sym)}</div>` +
+    (isAdmin ? item("trade", "Trade this symbol") : "") +
+    item("chart", "Open chart &amp; book") +
+    item("fav", isFav ? "★ Remove scanner favorite" : "☆ Add scanner favorite") +
+    item("alert", "Scanner alert…") +
+    item("copy", "Copy symbol") +
+    item("journal", "Open journal") +
+    (lists.length ? `<div class="wl-ctx-sep"></div><div class="wl-ctx-label">Add to watchlist</div>` +
+      lists.map((l) => item("watch", `→ ${esc(l.name)}`, ` data-listid="${esc(l.id)}"`)).join("") : "");
+  menu.dataset.sym = sym;
+  menu.hidden = false;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = Math.min(x, vw - rect.width - 8) + "px";
+  menu.style.top = Math.min(y, vh - rect.height - 8) + "px";
+  const first = menu.querySelector(".wl-ctx-item");
+  if (first) first.focus();
+}
+function scCtxAction(act, sym, el) {
+  switch (act) {
+    case "trade": wlOpenSymbol(sym, { trade: true }); break;
+    case "chart": wlOpenSymbol(sym, { trade: false }); break;
+    case "fav": scToggleFav(sym); break;
+    case "alert": scOpenAlert(sym); break;
+    case "copy":
+      try { navigator.clipboard.writeText(sym); toast(`Copied ${sym}`, "info", 1500); }
+      catch (e) { toast("Clipboard unavailable", "warn"); }
+      break;
+    case "journal": {
+      const t = document.querySelector('#tabs .tab[data-tab="history"]');
+      const filter = document.getElementById("history-filter");
+      if (filter) { filter.value = sym; filter.dispatchEvent(new Event("input", { bubbles: true })); }
+      if (t) t.click();
+      break;
+    }
+    case "watch": {
+      const listId = el && el.dataset.listid;
+      if (listId && _wlDoc && wlAddSymbol(_wlDoc, listId, sym)) {
+        wlPersist();
+        const l = wlFindList(_wlDoc, listId);
+        toast(`Added ${sym} to “${l ? l.name : "watchlist"}”`, "pos", 2000);
+      } else toast(`${sym} is already there (or the list is full)`, "info", 2000);
+      break;
+    }
+  }
+}
+function scToggleFav(sym) {
+  if (!_scDoc || !SC_SYMBOL_RE.test(sym)) return;
+  if (_scDoc.favs.includes(sym)) _scDoc.favs = _scDoc.favs.filter((s) => s !== sym);
+  else if (_scDoc.favs.length < SC_MAX_FAVS) _scDoc.favs.push(sym);
+  scPersist();
+  scSyncTable();
+  scRenderSections();
+}
+
+// ---- scanner alert composer ----
+let _scAlertSym = null; // symbol context, or null = universe-wide
+function scRenderAlertExisting() {
+  const box = document.getElementById("sc-alert-existing");
+  if (!box || !_scDoc) return;
+  const rel = _scDoc.alerts.filter((a) => !_scAlertSym || a.symbol === _scAlertSym || a.symbol === "*");
+  box.innerHTML = rel.length
+    ? `<div class="ae-title">Active alerts</div>` + rel.map((a) =>
+        `<div class="ae-row"><span>${esc(scAlertLabel(a))}</span>` +
+        `<button class="btn-ghost sm" data-alid="${esc(a.id)}" aria-label="Delete alert">✕</button></div>`).join("")
+    : `<div class="ae-empty muted">No scanner alerts yet. Alerts notify only — they never place or modify an order.</div>`;
+}
+function scAlertSyncInputs() {
+  const kind = document.getElementById("sc-alert-kind").value;
+  const valWrap = document.getElementById("sc-alert-value-wrap");
+  const valInput = document.getElementById("sc-alert-value");
+  const anyWrap = document.getElementById("sc-alert-any-wrap");
+  const anyCheck = document.getElementById("sc-alert-any");
+  if (valWrap) {
+    valWrap.hidden = kind === "vol_double";
+    const label = valWrap.firstChild;
+    if (label && label.nodeType === 3) {
+      label.textContent = kind === "top_mover" ? "Top-N rank (3–25) " : "Threshold (%) ";
+    }
+    if (valInput) valInput.placeholder = kind === "top_mover" ? "10" : kind === "funding_abs" ? "0.05" : "2";
+  }
+  if (anyWrap && anyCheck) {
+    const forced = !_scAlertSym;            // opened without a symbol => universe-wide
+    const disallowed = kind === "vol_double"; // needs a concrete baseline symbol
+    anyWrap.hidden = disallowed;
+    anyCheck.disabled = forced || disallowed;
+    if (forced) anyCheck.checked = true;
+    if (disallowed) anyCheck.checked = false;
+  }
+}
+function scOpenAlert(sym) {
+  const overlay = document.getElementById("sc-alert-overlay");
+  if (!overlay || !_scDoc) return;
+  _scAlertSym = sym && SC_SYMBOL_RE.test(sym) ? sym : null;
+  const ctxEl = document.getElementById("sc-alert-context");
+  if (ctxEl) {
+    if (_scAlertSym) {
+      const r = _scIndex[_scAlertSym];
+      ctxEl.textContent = _scAlertSym + (r ? " · last " + scFmtPrice(scMetric(r, "last")) + " · 24h " + scFmtPct(scMetric(r, "pct24h")) : "");
+    } else ctxEl.textContent = "Universe-wide alert — watches every market in the scanner.";
+  }
+  const kindSel = document.getElementById("sc-alert-kind");
+  const dbl = kindSel ? kindSel.querySelector('option[value="vol_double"]') : null;
+  if (dbl) dbl.disabled = !_scAlertSym;
+  if (kindSel && !_scAlertSym && kindSel.value === "vol_double") kindSel.value = "top_mover";
+  const res = document.getElementById("sc-alert-result");
+  if (res) { res.textContent = ""; res.className = "result-msg"; }
+  scAlertSyncInputs();
+  scRenderAlertExisting();
+  overlay.hidden = false;
+  const kindEl = document.getElementById("sc-alert-kind");
+  if (kindEl) kindEl.focus();
+}
+function scAddAlertFromModal() {
+  if (!_scDoc) return;
+  const res = document.getElementById("sc-alert-result");
+  const say = (msg, ok) => { if (res) { res.textContent = msg; res.className = "result-msg " + (ok ? "ok" : "err"); } };
+  if (_scDoc.alerts.length >= SC_MAX_ALERTS) { say(`Alert limit reached (${SC_MAX_ALERTS})`, false); return; }
+  const kind = document.getElementById("sc-alert-kind").value;
+  const anyCheck = document.getElementById("sc-alert-any");
+  const useAny = !_scAlertSym || (anyCheck && anyCheck.checked && kind !== "vol_double");
+  const symbol = useAny ? "*" : _scAlertSym;
+  const raw = { kind, symbol, value: (document.getElementById("sc-alert-value") || {}).value };
+  if (kind === "vol_double") {
+    const r = _scIndex[_scAlertSym];
+    const baseline = r ? scMetric(r, "turnover24h") : null;
+    if (baseline === null) { say("No live volume for this symbol yet — try again once the feed shows it.", false); return; }
+    raw.baseline = baseline;
+  }
+  const alert = scSanitizeAlert(raw);
+  if (!alert) { say(kind === "top_mover" ? "Rank must be a number from 3 to 25." : "Enter a positive numeric threshold.", false); return; }
+  _scDoc.alerts.push(alert);
+  scPersist();
+  scEnsureAlertTimer();
+  scRenderAlertExisting();
+  scRenderSections();
+  say("Alert added — you'll be notified here and in the notification center.", true);
+}
+
+// ---- custom scan builder ----
+let _scEditScanId = null;
+const SC_METRIC_LABELS = {
+  last: "Price", pct5m: "5m %", pct15m: "15m %", pct1h: "1h %", pct24h: "24h %",
+  range24hPct: "24h range %", vol15mPct: "15m volatility %", turnover24h: "24h volume",
+  turnoverDelta15m: "Δ volume 15m", fundingPct: "Funding %", fundingDelta1hPct: "Funding Δ1h %",
+  openInterestValue: "Open interest", distHigh24hPct: "Distance to 24h high %",
+  distLow24hPct: "Distance to 24h low %", spreadPct: "Spread %",
+};
+const SC_OP_LABELS = { gt: ">", gte: "≥", lt: "<", lte: "≤", absGte: "|x| ≥", absLte: "|x| ≤" };
+function scScanRuleRow(rule) {
+  const r = rule || { metric: "pct24h", op: "gte", value: "" };
+  return `<div class="sc-rule">` +
+    `<select class="sc-rule-metric" aria-label="Metric">` +
+    SC_METRICS.map((k) => `<option value="${k}"${k === r.metric ? " selected" : ""}>${esc(SC_METRIC_LABELS[k] || k)}</option>`).join("") +
+    `</select>` +
+    `<select class="sc-rule-op" aria-label="Comparison">` +
+    SC_OPS.map((o) => `<option value="${o}"${o === r.op ? " selected" : ""}>${esc(SC_OP_LABELS[o])}</option>`).join("") +
+    `</select>` +
+    `<input class="sc-rule-value" type="text" inputmode="decimal" autocomplete="off" placeholder="value" value="${r.value === "" ? "" : esc(String(r.value))}" aria-label="Value" />` +
+    `<button class="icon-btn sc-rule-del" type="button" aria-label="Remove condition">✕</button></div>`;
+}
+function scScanCollect() {
+  const rules = [];
+  document.querySelectorAll("#sc-scan-rules .sc-rule").forEach((row) => {
+    rules.push({
+      metric: row.querySelector(".sc-rule-metric").value,
+      op: row.querySelector(".sc-rule-op").value,
+      value: row.querySelector(".sc-rule-value").value,
+    });
+  });
+  const modeBtn = document.querySelector("#sc-scan-mode button.active");
+  return {
+    id: _scEditScanId || scId("scan"),
+    name: (document.getElementById("sc-scan-name") || {}).value,
+    mode: modeBtn ? modeBtn.dataset.val : "and",
+    rules,
+  };
+}
+function scScanPreview() {
+  const el = document.getElementById("sc-scan-preview");
+  if (!el) return;
+  const scan = scSanitizeScan(scScanCollect());
+  if (!scan) { el.textContent = "Add at least one complete condition (metric, comparison, numeric value)."; return; }
+  if (_scData) {
+    const n = (_scData.rows || []).filter((r) => scScanMatches(scan, r)).length;
+    el.textContent = `Matches ${n} of ${(_scData.rows || []).length} markets right now.`;
+  } else el.textContent = "";
+}
+function scOpenScanBuilder(scanId) {
+  const overlay = document.getElementById("sc-scan-overlay");
+  if (!overlay || !_scDoc) return;
+  _scEditScanId = null;
+  let scan = null;
+  if (scanId) {
+    scan = _scDoc.scans.find((s) => s.id === scanId) || null;
+    if (scan) _scEditScanId = scan.id;
+  }
+  const name = document.getElementById("sc-scan-name");
+  if (name) name.value = scan ? scan.name : "";
+  document.querySelectorAll("#sc-scan-mode button").forEach((b) => {
+    const on = b.dataset.val === (scan ? scan.mode : "and");
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-pressed", String(on));
+  });
+  const rulesEl = document.getElementById("sc-scan-rules");
+  if (rulesEl) rulesEl.innerHTML = (scan ? scan.rules : [null]).map(scScanRuleRow).join("");
+  const del = document.getElementById("sc-scan-delete");
+  if (del) del.hidden = !scan;
+  const res = document.getElementById("sc-scan-result");
+  if (res) { res.textContent = ""; res.className = "result-msg"; }
+  scScanPreview();
+  overlay.hidden = false;
+  if (name) name.focus();
+}
+function scSaveScanFromModal() {
+  if (!_scDoc) return;
+  const res = document.getElementById("sc-scan-result");
+  const say = (msg) => { if (res) { res.textContent = msg; res.className = "result-msg err"; } };
+  const scan = scSanitizeScan(scScanCollect());
+  if (!scan) { say("A scan needs a name-able rule set: every condition must have a numeric value."); return; }
+  if (!String(scan.name).trim() || scan.name === "Scan") scan.name = "Scan " + (_scDoc.scans.length + 1);
+  const existing = _scDoc.scans.findIndex((s) => s.id === scan.id);
+  if (existing >= 0) _scDoc.scans[existing] = scan;
+  else {
+    if (_scDoc.scans.length >= SC_MAX_SCANS) { say(`Scan limit reached (${SC_MAX_SCANS}).`); return; }
+    _scDoc.scans.push(scan);
+  }
+  scPersist();
+  document.getElementById("sc-scan-overlay").hidden = true;
+  scSetPresetForce("scan:" + scan.id);
+  toast(`Saved scan “${scan.name}”`, "pos", 2000);
+}
+function scSetPresetForce(id) {
+  _scView.preset = id;
+  scRenderPresets();
+  scSyncTable();
+  scAutoSaveView();
+}
+
+// ---- wiring ----
+function wireScanner() {
+  scLoad();
+  const pane = document.querySelector('[data-pane="scanner"]');
+  if (!pane) return;
+  scRenderHead();
+  scRenderPresets();
+  scEnsureAlertTimer();
+
+  // Presets strip (click chip = activate; click ACTIVE custom chip = edit).
+  const presetsEl = document.getElementById("sc-presets");
+  presetsEl.addEventListener("click", (e) => {
+    const chip = e.target.closest("[data-preset]");
+    if (!chip) return;
+    const id = chip.dataset.preset;
+    if (id === _scView.preset && id.indexOf("scan:") === 0) { scOpenScanBuilder(id.slice(5)); return; }
+    scSetPreset(id);
+  });
+
+  // Search (instant, debounce-free — the compute is cheap and pure).
+  const search = document.getElementById("sc-search");
+  const searchClear = document.getElementById("sc-search-clear");
+  const paintClear = () => { if (searchClear) searchClear.hidden = !search.value; };
+  search.addEventListener("input", () => { _scQuery = search.value; paintClear(); scSyncTable(); });
+  search.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { search.value = ""; _scQuery = ""; paintClear(); scSyncTable(); search.blur(); }
+    else if (e.key === "ArrowDown" || e.key === "Enter") {
+      e.preventDefault();
+      const vp = document.getElementById("sc-viewport");
+      if (_scVisible.length) { scSelect(_scVisible[0].symbol); scScrollToSelected(); }
+      if (vp) vp.focus();
+    }
+  });
+  if (searchClear) searchClear.addEventListener("click", () => {
+    search.value = ""; _scQuery = ""; paintClear(); scSyncTable(); search.focus();
+  });
+
+  // Filters popover.
+  const filterBtn = document.getElementById("sc-filter-btn");
+  const filterPop = document.getElementById("sc-filter-pop");
+  const closePop = () => { filterPop.hidden = true; filterBtn.setAttribute("aria-expanded", "false"); };
+  filterBtn.addEventListener("click", () => {
+    const open = filterPop.hidden;
+    filterPop.hidden = !open;
+    filterBtn.setAttribute("aria-expanded", String(open));
+    if (open) { const f = filterPop.querySelector("input"); if (f) f.focus(); }
+  });
+  filterPop.addEventListener("input", (e) => {
+    const inp = e.target.closest("[data-scfilter]");
+    if (!inp) return;
+    const v = inp.value.trim();
+    const n = Number(v);
+    _scView.filters[inp.dataset.scfilter] = v !== "" && isFinite(n) ? n : null;
+    scSyncTable();
+    scAutoSaveView();
+  });
+  document.getElementById("sc-filter-clear").addEventListener("click", () => {
+    Object.keys(_scView.filters).forEach((k) => { _scView.filters[k] = null; });
+    filterPop.querySelectorAll("[data-scfilter]").forEach((inp) => { inp.value = ""; });
+    scSyncTable();
+    scAutoSaveView();
+  });
+  document.addEventListener("click", (e) => {
+    if (!filterPop.hidden && !filterPop.contains(e.target) && !filterBtn.contains(e.target)) closePop();
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !filterPop.hidden) closePop(); });
+
+  // Favorites pin + overview toggle.
+  const pin = document.getElementById("sc-pin-favs");
+  pin.addEventListener("click", () => {
+    _scView.pinFavs = !_scView.pinFavs;
+    pin.setAttribute("aria-pressed", String(_scView.pinFavs));
+    pin.classList.toggle("on", _scView.pinFavs);
+    scSyncTable();
+    scAutoSaveView();
+  });
+  document.getElementById("sc-cards-toggle").addEventListener("click", () => {
+    _scView.cards = !_scView.cards;
+    scRenderSections();
+    scAutoSaveView();
+  });
+
+  // Header sort.
+  document.getElementById("sc-head").addEventListener("click", (e) => {
+    const th = e.target.closest("[data-sort]");
+    if (!th) return;
+    const key = th.dataset.sort;
+    if (_scView.sort === key) _scView.dir = _scView.dir === "asc" ? "desc" : "asc";
+    else { _scView.sort = key; _scView.dir = key === "symbol" ? "asc" : "desc"; }
+    scSyncTable();
+    scAutoSaveView();
+  });
+
+  // Table interactions: virtual scroll, click-select, dblclick-open, context menu.
+  const vp = document.getElementById("sc-viewport");
+  let scrollTick = false;
+  vp.addEventListener("scroll", () => {
+    if (scrollTick) return;
+    scrollTick = true;
+    requestAnimationFrame(() => { scrollTick = false; scRenderTable(); });
+    scAutoSaveView(); // scroll position is part of the workspace
+  });
+  vp.addEventListener("click", (e) => {
+    const fav = e.target.closest(".sc-fav");
+    const more = e.target.closest(".sc-more");
+    const row = e.target.closest(".sc-row[data-sym]");
+    if (!row) return;
+    const sym = row.dataset.sym;
+    if (fav) { scToggleFav(sym); return; }
+    if (more) { const r = row.getBoundingClientRect(); scSelect(sym); scOpenCtx(sym, r.right - 180, r.bottom); return; }
+    scSelect(sym);
+  });
+  vp.addEventListener("dblclick", (e) => {
+    const row = e.target.closest(".sc-row[data-sym]");
+    if (row) wlOpenSymbol(row.dataset.sym, { trade: false });
+  });
+  vp.addEventListener("contextmenu", (e) => {
+    const row = e.target.closest(".sc-row[data-sym]");
+    if (!row) return;
+    e.preventDefault();
+    scSelect(row.dataset.sym);
+    scOpenCtx(row.dataset.sym, e.clientX, e.clientY);
+  });
+  // Full keyboard navigation (never a trade: Enter opens chart & book only).
+  vp.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") { e.preventDefault(); scMoveSelection(1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); scMoveSelection(-1); }
+    else if (e.key === "PageDown") { e.preventDefault(); scMoveSelection(scPageSize()); }
+    else if (e.key === "PageUp") { e.preventDefault(); scMoveSelection(-scPageSize()); }
+    else if (e.key === "Home") { e.preventDefault(); scMoveSelection(0, "home"); }
+    else if (e.key === "End") { e.preventDefault(); scMoveSelection(0, "end"); }
+    else if (e.key === "Enter" && _scSel) { e.preventDefault(); wlOpenSymbol(_scSel, { trade: false }); }
+    else if ((e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) && _scSel) {
+      e.preventDefault();
+      const row = _scRowEls[_scSel];
+      const r = row ? row.getBoundingClientRect() : vp.getBoundingClientRect();
+      scOpenCtx(_scSel, r.left + 120, r.bottom);
+    }
+  });
+  window.addEventListener("resize", () => { if (scPaneVisible()) scRenderTable(); });
+
+  // Empty-state reset.
+  document.getElementById("sc-empty").addEventListener("click", (e) => {
+    if (!e.target.closest('[data-scempty="reset"]')) return;
+    _scQuery = "";
+    search.value = "";
+    paintClear();
+    Object.keys(_scView.filters).forEach((k) => { _scView.filters[k] = null; });
+    filterPop.querySelectorAll("[data-scfilter]").forEach((inp) => { inp.value = ""; });
+    scSetPresetForce("all");
+  });
+
+  // Overview cards: select/open, funding mode, collapse, drag + keyboard move.
+  const sections = document.getElementById("sc-sections");
+  sections.addEventListener("click", (e) => {
+    const fmode = e.target.closest("[data-fmode]");
+    if (fmode) {
+      _scFundingMode = fmode.dataset.fmode;
+      fmode.parentElement.querySelectorAll("button").forEach((b) => {
+        const on = b === fmode;
+        b.classList.toggle("active", on);
+        b.setAttribute("aria-pressed", String(on));
+      });
+      scRenderSections();
+      return;
+    }
+    const collapse = e.target.closest(".sc-card-collapse");
+    if (collapse) {
+      const card = collapse.closest(".sc-card");
+      const id = card.dataset.scsec;
+      if (_scView.sections.collapsed[id]) delete _scView.sections.collapsed[id];
+      else _scView.sections.collapsed[id] = true;
+      scPatchCard(card, id);
+      scAutoSaveView();
+      return;
+    }
+    if (e.target.closest('[data-scact="newalert"]')) { scOpenAlert(null); return; }
+    const mini = e.target.closest(".sc-mini[data-sym], .sc-alert-row[data-sym]");
+    if (mini) scSelect(mini.dataset.sym);
+  });
+  sections.addEventListener("dblclick", (e) => {
+    const mini = e.target.closest(".sc-mini[data-sym]");
+    if (mini) wlOpenSymbol(mini.dataset.sym, { trade: false });
+  });
+  sections.addEventListener("keydown", (e) => {
+    const mini = e.target.closest(".sc-mini[data-sym], .sc-alert-row[data-sym]");
+    if (mini && e.key === "Enter") { e.preventDefault(); scSelect(mini.dataset.sym); wlOpenSymbol(mini.dataset.sym, { trade: false }); }
+    const drag = e.target.closest(".sc-card-drag");
+    if (drag && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+      e.preventDefault();
+      const card = drag.closest(".sc-card");
+      const id = card.dataset.scsec;
+      const order = _scView.sections.order;
+      const i = order.indexOf(id);
+      const j = e.key === "ArrowLeft" ? i - 1 : i + 1;
+      if (i < 0 || j < 0 || j >= order.length) return;
+      order.splice(i, 1);
+      order.splice(j, 0, id);
+      scRenderSections();
+      const nd = sections.querySelector(`.sc-card[data-scsec="${id}"] .sc-card-drag`);
+      if (nd) nd.focus();
+      scAutoSaveView();
+    }
+  });
+  // HTML5 drag-to-rearrange (initiated from the ⠿ handle only).
+  let dragCard = null;
+  sections.addEventListener("mousedown", (e) => {
+    const handle = e.target.closest(".sc-card-drag");
+    const card = handle && handle.closest(".sc-card");
+    sections.querySelectorAll(".sc-card").forEach((c) => { c.draggable = c === card; });
+  });
+  sections.addEventListener("dragstart", (e) => {
+    dragCard = e.target.closest(".sc-card");
+    if (dragCard) dragCard.classList.add("dragging");
+  });
+  sections.addEventListener("dragover", (e) => {
+    if (!dragCard) return;
+    e.preventDefault();
+    const over = e.target.closest(".sc-card");
+    if (!over || over === dragCard) return;
+    const rect = over.getBoundingClientRect();
+    const before = e.clientX < rect.left + rect.width / 2;
+    sections.insertBefore(dragCard, before ? over : over.nextSibling);
+  });
+  sections.addEventListener("dragend", () => {
+    if (!dragCard) return;
+    dragCard.classList.remove("dragging");
+    dragCard.draggable = false;
+    dragCard = null;
+    _scView.sections.order = Array.from(sections.querySelectorAll(":scope > .sc-card[data-scsec]")).map((c) => c.dataset.scsec);
+    scAutoSaveView();
+  });
+
+  // Context menu plumbing (mirrors the watchlist menu).
+  const ctx = document.getElementById("sc-ctx");
+  ctx.addEventListener("click", (e) => {
+    const item = e.target.closest(".wl-ctx-item");
+    if (!item) return;
+    const sym = ctx.dataset.sym;
+    scCloseCtx();
+    scCtxAction(item.dataset.act, sym, item);
+  });
+  ctx.addEventListener("keydown", (e) => {
+    const items = Array.from(ctx.querySelectorAll(".wl-ctx-item"));
+    const cur = items.indexOf(document.activeElement);
+    if (e.key === "Escape") { e.preventDefault(); scCloseCtx(); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); (items[cur + 1] || items[0]).focus(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); (items[cur - 1] || items[items.length - 1]).focus(); }
+  });
+  document.addEventListener("click", (e) => { if (!ctx.hidden && !ctx.contains(e.target)) scCloseCtx(); });
+
+  // Alert modal.
+  const alertOverlay = document.getElementById("sc-alert-overlay");
+  document.getElementById("sc-alert-btn").addEventListener("click", () => scOpenAlert(_scSel || null));
+  document.getElementById("sc-alert-kind").addEventListener("change", scAlertSyncInputs);
+  document.getElementById("sc-alert-add").addEventListener("click", scAddAlertFromModal);
+  document.getElementById("sc-alert-cancel").addEventListener("click", () => { alertOverlay.hidden = true; });
+  alertOverlay.addEventListener("click", (e) => { if (e.target === alertOverlay) alertOverlay.hidden = true; });
+  document.getElementById("sc-alert-existing").addEventListener("click", (e) => {
+    const del = e.target.closest("[data-alid]");
+    if (!del || !_scDoc) return;
+    _scDoc.alerts = _scDoc.alerts.filter((a) => a.id !== del.dataset.alid);
+    scPersist();
+    scEnsureAlertTimer();
+    scRenderAlertExisting();
+    scRenderSections();
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !alertOverlay.hidden) alertOverlay.hidden = true; });
+
+  // Scan builder modal.
+  const scanOverlay = document.getElementById("sc-scan-overlay");
+  document.getElementById("sc-scan-new").addEventListener("click", () => scOpenScanBuilder(null));
+  document.getElementById("sc-scan-addrule").addEventListener("click", () => {
+    const rulesEl = document.getElementById("sc-scan-rules");
+    if (rulesEl.querySelectorAll(".sc-rule").length >= SC_MAX_RULES) return;
+    rulesEl.insertAdjacentHTML("beforeend", scScanRuleRow(null));
+    scScanPreview();
+  });
+  document.getElementById("sc-scan-rules").addEventListener("click", (e) => {
+    const del = e.target.closest(".sc-rule-del");
+    if (del) { del.closest(".sc-rule").remove(); scScanPreview(); }
+  });
+  document.getElementById("sc-scan-rules").addEventListener("input", scScanPreview);
+  document.getElementById("sc-scan-rules").addEventListener("change", scScanPreview);
+  document.querySelectorAll("#sc-scan-mode button").forEach((b) => b.addEventListener("click", () => {
+    document.querySelectorAll("#sc-scan-mode button").forEach((x) => {
+      const on = x === b;
+      x.classList.toggle("active", on);
+      x.setAttribute("aria-pressed", String(on));
+    });
+    scScanPreview();
+  }));
+  document.getElementById("sc-scan-save").addEventListener("click", scSaveScanFromModal);
+  document.getElementById("sc-scan-cancel").addEventListener("click", () => { scanOverlay.hidden = true; });
+  document.getElementById("sc-scan-delete").addEventListener("click", () => {
+    if (!_scEditScanId || !_scDoc) return;
+    _scDoc.scans = _scDoc.scans.filter((s) => s.id !== _scEditScanId);
+    scPersist();
+    scanOverlay.hidden = true;
+    if (_scView.preset === "scan:" + _scEditScanId) scSetPresetForce("all");
+    else scRenderPresets();
+    toast("Scan deleted", "info", 1800);
+  });
+  scanOverlay.addEventListener("click", (e) => { if (e.target === scanOverlay) scanOverlay.hidden = true; });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !scanOverlay.hidden) scanOverlay.hidden = true; });
+}
+
+// ===========================================================================
 // WORKSPACES — a workspace is a complete named trading environment (panel
 // order + collapsed state, table density, chart view/interval/symbol, active
 // tab, order-book symbol). Any number of them; switching restores everything
@@ -5034,7 +6764,7 @@ const WS_MAX = 20;
 // Allowlists for sanitizing stored/imported state (one-line consts so the
 // test harness can extract them alongside the functions).
 const WS_PANEL_IDS = ["risk", "positions", "orders", "charts", "token", "ticket", "book"];
-const WS_TABS = ["dashboard", "markets", "history", "account", "tools"];
+const WS_TABS = ["dashboard", "scanner", "markets", "history", "account", "tools"];
 const WS_CHART_VIEWS = ["grid", "single"];
 const WS_INTERVALS = ["1", "5", "15", "60"]; // keep in sync with CHART_INTERVALS codes
 const WS_SYMBOL_RE = /^[A-Z0-9]{1,20}$/;
@@ -5080,6 +6810,11 @@ function wsSanitizeState(raw) {
       sort: WL_SORTS.includes(watch.sort) ? watch.sort : "custom",
       dir: watch.dir === "asc" ? "asc" : "desc",
     },
+    // Scanner VIEW (preset/sort/filters/card layout/selection/scroll) — the
+    // scans/alerts/favorites themselves live in the scanner's own store; the
+    // workspace only remembers how the tab was being viewed (§same contract
+    // as `watch` above). Sanitized by the scanner's own pure sanitizer.
+    scanner: scSanitizeViewState(src.scanner),
   };
 }
 
@@ -5255,6 +6990,7 @@ function wsCaptureState() {
     listId: _wlDoc ? _wlDoc.activeId : "",
     filter: _wlView.filter, sort: _wlView.sort, dir: _wlView.dir,
   };
+  st.scanner = scCaptureViewState();
   return wsSanitizeState(st);
 }
 
@@ -5302,6 +7038,8 @@ function wsApplyState(rawState, opts = {}) {
     wlRenderLists();
     wlSync();
   }
+  // Restore this workspace's scanner view (preset/sort/filters/cards/scroll).
+  scApplyViewState(st.scanner);
   wsUpdateEmptyState();
   if (!opts.noAnim) {
     const pane = document.querySelector("main .pane:not([hidden])");
@@ -5805,6 +7543,27 @@ function wireCommandPalette() {
       if (active) acts.push({ label: `Rename watchlist “${active.name}”`, hint: "watch", run: () => { gotoWatch(); const chip = document.querySelector(`#wl-lists .wl-chip[data-wlid="${CSS.escape(active.id)}"]`); if (chip) setTimeout(() => wlStartRenameChip(chip), 0); } });
       acts.push({ label: "Export watchlist", hint: "json", run: wlExportActive });
     }
+    // Scanner actions — display/navigation only; none can reach a write.
+    const gotoScan = () => {
+      const pane = document.querySelector('[data-pane="scanner"]');
+      const tab = document.querySelector('#tabs .tab[data-tab="scanner"]');
+      if (pane && pane.hidden && tab) tab.click();
+    };
+    acts.push({ label: "Search markets (scanner)", hint: "F", run: () => { gotoScan(); const s = document.getElementById("sc-search"); if (s) setTimeout(() => s.focus(), 0); } });
+    acts.push({ label: "New custom scan", hint: "scanner", run: () => { gotoScan(); setTimeout(() => scOpenScanBuilder(null), 0); } });
+    acts.push({ label: "New scanner alert", hint: "notify only", run: () => { gotoScan(); setTimeout(() => scOpenAlert(null), 0); } });
+    SC_PRESET_DEFS.forEach((p) => {
+      if (_scView.preset !== p.id) {
+        acts.push({ label: `Scanner: ${p.label.replace(/^★ /, "")}`, hint: "preset", run: () => { gotoScan(); scSetPresetForce(p.id); } });
+      }
+    });
+    if (_scDoc) {
+      _scDoc.scans.forEach((s) => {
+        if (_scView.preset !== "scan:" + s.id) {
+          acts.push({ label: `Scanner: ${s.name}`, hint: "custom scan", run: () => { gotoScan(); scSetPresetForce("scan:" + s.id); } });
+        }
+      });
+    }
     acts.push({
       label: document.body.classList.contains("density-compact")
         ? "Table density: comfortable" : "Table density: compact",
@@ -5911,6 +7670,17 @@ document.addEventListener("keydown", (e) => {
   // spec's Ctrl+1..9 / Ctrl+Shift+N/D/R were deliberately NOT bound: browsers
   // own them (tab switching, incognito, bookmark-all, hard-reload).
   if (key === "w") { e.preventDefault(); wsOpenSwitcher(); return; }
+  // "F" focuses the scanner's market search — only while the Scan tab is
+  // visible, so the key keeps its normal meaning everywhere else.
+  if (key === "f") {
+    const scanPane = document.querySelector('[data-pane="scanner"]');
+    if (scanPane && !scanPane.hidden) {
+      e.preventDefault();
+      const s = document.getElementById("sc-search");
+      if (s) { try { s.focus(); s.select(); } catch (err) {} }
+      return;
+    }
+  }
   // "A" jumps to the watchlist add-symbol search: switch to the Watch tab if
   // needed, then focus the search field. Navigation only.
   if (key === "a") {
@@ -5973,6 +7743,7 @@ document.addEventListener("keydown", (e) => {
   wireTabs();
   wireMarketsHistory();
   wireWatchlist(); // Watchlist & market monitor (loads _wlDoc BEFORE workspaces apply their saved view)
+  wireScanner(); // Market scanner (loads _scDoc BEFORE workspaces apply their saved view)
   wireCharts(); // live candlestick charts (read-only; polls while dashboard visible)
   wireWorkspaces(); // multi-workspace system: load/migrate, apply active layout
   wireCommandPalette(); // Ctrl/Cmd+K — navigation & display actions only

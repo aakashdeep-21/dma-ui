@@ -35,9 +35,10 @@ from fastapi.staticfiles import StaticFiles
 from bson.errors import BSONError
 from pathlib import Path
 from pymongo.errors import PyMongoError
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import Response as StarletteResponse
 
-from . import auth, db, dma_client, history_sync, market_data, notifier, signer
+from . import auth, db, dma_client, history_sync, market_data, notifier, scanner, signer
 from .config import settings
 
 def _configure_logging() -> None:
@@ -101,12 +102,15 @@ async def lifespan(app: FastAPI):
     # Background history sync: the ONLY place the exchange's trade/closed-PnL
     # history is fetched from; the dashboard reads MongoDB.
     syncer = asyncio.create_task(history_sync.run_scheduler())
+    # Background market-scanner sampler: ONE shared ticker poll per interval
+    # feeds /api/scanner for every viewer (read-only; no-op when disabled).
+    scanner_task = asyncio.create_task(scanner.run_sampler())
     try:
         yield
     finally:
         # The WS broadcaster is started lazily on the first client (so tests and
         # idle deploys never spin it); include it here if it is running.
-        tasks = [db_init, watcher, syncer]
+        tasks = [db_init, watcher, syncer, scanner_task]
         if _ws_broadcast_task is not None:
             tasks.append(_ws_broadcast_task)
         for task in tasks:
@@ -193,6 +197,12 @@ logger.info(
 # still carries the security headers (later-registered middleware wraps this).
 # --------------------------------------------------------------------------
 _MAX_BODY_BYTES = 64 * 1024
+
+# Compress large JSON responses (the scanner snapshot is a few hundred KB of
+# highly repetitive JSON that gzips ~8×; history reads benefit too). Safe here:
+# response bodies never mix secrets with attacker-reflected input (the classic
+# BREACH precondition), and WebSocket frames are untouched by this middleware.
+app.add_middleware(GZipMiddleware, minimum_size=2048)
 
 
 @app.middleware("http")
@@ -542,6 +552,13 @@ def healthz():
                 "trades": _sync_age_s(db.TRADES),
                 "closedPnl": _sync_age_s(db.CLOSED_PNL),
             },
+            # Seconds since the market scanner last sampled the ticker list
+            # (null until its first sample, or forever when disabled). Like the
+            # sync ages: not sensitive, watchable by a monitor.
+            "scannerAgeSeconds": (
+                round((now_ms - scanner.last_sample_ms()) / 1000)
+                if scanner.last_sample_ms() else None
+            ),
         },
     )
 
@@ -855,6 +872,15 @@ async def api_server_time(user: dict = Depends(current_user)):
 @app.get("/api/tickers")
 async def api_tickers(symbol: str | None = None, user: dict = Depends(current_user)):
     return await dma_client.get_tickers(_norm_symbol_opt(symbol))
+
+
+@app.get("/api/scanner")
+async def api_scanner(user: dict = Depends(current_user)):
+    """Market Scanner snapshot. Served ENTIRELY from the in-memory snapshot the
+    background sampler maintains (app/scanner.py) — this handler performs no
+    upstream call, so any number of scanner tabs cost the exchange nothing
+    beyond the sampler's one poll per interval. Read-only market data."""
+    return scanner.snapshot_response()
 
 
 @app.get("/api/orderbook")

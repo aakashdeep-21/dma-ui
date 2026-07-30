@@ -146,6 +146,20 @@ class Settings:
         # disable the only upstream back-pressure.
         self.CHART_CACHE_TTL: float = max(0.5, _float_env("CHART_CACHE_TTL", 1.0))
 
+        # --- Market Scanner sampler (READ-ONLY) ---
+        # A background task (app/scanner.py) polls the full ticker list — ONE
+        # signed read-only request per interval regardless of how many browser
+        # tabs are open — and keeps a rolling in-memory history so the scanner
+        # can compute 5m/15m/1h changes, volatility and funding drift honestly.
+        # Floored at 5s: each sample is a full-universe upstream read, so a
+        # typo'd sub-second interval must never hammer the venue.
+        self.SCANNER_SAMPLE_INTERVAL: float = max(5.0, _float_env("SCANNER_SAMPLE_INTERVAL", 10.0))
+        # Kill switch: SCANNER_ENABLED=0 starts no sampler and the scanner API
+        # serves an empty (clearly-flagged) snapshot.
+        self.SCANNER_ENABLED: bool = (
+            os.environ.get("SCANNER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+        )
+
         # --- Execution alerts via Telegram (READ-ONLY, opt-in) ---
         # A background watcher (app/notifier.py) polls the account's executions
         # and pushes a Telegram message on each fill / TP-SL / liquidation. It is

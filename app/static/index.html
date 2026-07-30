@@ -25,6 +25,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
           <span>Trade</span>
         </button>
+        <button class="tab" data-tab="scanner" role="tab" id="tab-scanner" aria-controls="panel-scanner" aria-selected="false" tabindex="-1">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="0.5"/><line x1="12" y1="3" x2="12" y2="7.5"/><line x1="16" y1="8" x2="19.5" y2="4.5"/></svg>
+          <span>Scan</span>
+        </button>
         <button class="tab" data-tab="markets" role="tab" id="tab-markets" aria-controls="panel-markets" aria-selected="false" tabindex="-1">
           <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
           <span>Watch</span>
@@ -369,6 +373,71 @@
           </div>
         </div>
 
+        <!-- ============ MARKET SCANNER ============ -->
+        <!-- Live market-intelligence dashboard: overview cards + a virtualized
+             full-universe screener. READ-ONLY market data fed by /api/scanner
+             (one shared backend poll, zero upstream calls per tab). Nothing in
+             this pane can place, modify or cancel an order. -->
+        <div class="pane" data-pane="scanner" id="panel-scanner" role="tabpanel" aria-labelledby="tab-scanner" hidden>
+          <section class="panel sc-panel">
+            <!-- Preset strip: built-in scans + the user's saved custom scans. -->
+            <div class="sc-presets-row">
+              <div class="sc-presets" id="sc-presets" role="tablist" aria-label="Scanner presets"></div>
+              <span id="sc-status" class="sc-status muted" role="status" aria-live="polite">connecting…</span>
+            </div>
+
+            <!-- Toolbar: fuzzy search · numeric filters · custom scan builder ·
+                 favorites pin · overview cards toggle. -->
+            <div class="sc-toolbar">
+              <div class="sc-search-wrap">
+                <input id="sc-search" type="text" autocomplete="off" spellcheck="false"
+                       placeholder="Search markets…  (press F)" aria-label="Search markets" />
+                <button id="sc-search-clear" class="sc-search-clear" type="button" aria-label="Clear search" hidden>✕</button>
+              </div>
+              <div class="sc-toolbar-right">
+                <button id="sc-filter-btn" class="btn-ghost sm" type="button" aria-haspopup="dialog" aria-expanded="false">
+                  Filters <span id="sc-filter-count" class="sc-filter-count" hidden>0</span>
+                </button>
+                <button id="sc-scan-new" class="btn-ghost sm" type="button" title="Build a custom scan (saved rules)">＋ Scan</button>
+                <button id="sc-alert-btn" class="btn-ghost sm" type="button" title="Scanner alerts — notify only, never a trade">Alerts</button>
+                <button id="sc-pin-favs" class="icon-btn sc-pin" type="button" aria-pressed="false" title="Pin favorites to the top">★</button>
+                <button id="sc-cards-toggle" class="btn-ghost sm" type="button" aria-pressed="true" title="Show or hide the overview cards">Overview</button>
+              </div>
+            </div>
+
+            <!-- Numeric filters popover (all filters combine with the active
+                 preset/scan and search). -->
+            <div id="sc-filter-pop" class="sc-filter-pop" role="dialog" aria-label="Scanner filters" hidden>
+              <div class="sc-filter-grid">
+                <label>Price ≥ <input data-scfilter="priceMin" type="text" inputmode="decimal" autocomplete="off" placeholder="any" /></label>
+                <label>Price ≤ <input data-scfilter="priceMax" type="text" inputmode="decimal" autocomplete="off" placeholder="any" /></label>
+                <label>|24h %| ≥ <input data-scfilter="pct24hAbsMin" type="text" inputmode="decimal" autocomplete="off" placeholder="any" /></label>
+                <label>24h volume ≥ <input data-scfilter="turnoverMin" type="text" inputmode="decimal" autocomplete="off" placeholder="USDT" /></label>
+                <label>15m volatility ≥ % <input data-scfilter="vol15mMin" type="text" inputmode="decimal" autocomplete="off" placeholder="any" /></label>
+                <label>|Funding| ≥ % <input data-scfilter="fundingAbsMin" type="text" inputmode="decimal" autocomplete="off" placeholder="any" /></label>
+              </div>
+              <div class="sc-filter-foot">
+                <span class="muted">Blank = off · symbols missing a filtered metric are excluded</span>
+                <button id="sc-filter-clear" class="btn-ghost sm" type="button">Clear all</button>
+              </div>
+            </div>
+
+            <!-- Overview cards (collapse / drag-to-rearrange; layout is saved
+                 per workspace). Populated by JS. -->
+            <div id="sc-sections" class="sc-sections" aria-label="Market overview"></div>
+
+            <!-- Full-universe screener (virtualized). -->
+            <div class="sc-table">
+              <div class="sc-head" id="sc-head" role="row"></div>
+              <div id="sc-viewport" class="sc-viewport" tabindex="0" role="listbox"
+                   aria-label="All markets — arrow keys navigate, Enter opens chart and book">
+                <div id="sc-spacer" class="sc-spacer"><div id="sc-rows" class="sc-rows"></div></div>
+              </div>
+              <div id="sc-empty" class="sc-empty" hidden></div>
+            </div>
+          </section>
+        </div>
+
         <!-- ============ WATCHLIST / MARKET MONITOR ============ -->
         <div class="pane" data-pane="markets" id="panel-markets" role="tabpanel" aria-labelledby="tab-markets" hidden>
           <section class="panel wl-panel">
@@ -598,6 +667,66 @@
        list edits only — never a trade. -->
   <div id="wl-ctx" class="wl-ctx" role="menu" aria-label="Symbol actions" hidden></div>
 
+  <!-- Scanner symbol context menu — same rules as the watchlist menu: only
+       navigation/display actions and list/alert edits, never a trade. -->
+  <div id="sc-ctx" class="wl-ctx" role="menu" aria-label="Scanner symbol actions" hidden></div>
+
+  <!-- Custom scan builder: named AND/OR rule sets over scanner metrics, saved
+       locally and shown as presets. Filtering only — no rule can trade. -->
+  <div id="sc-scan-overlay" class="modal-overlay" hidden>
+    <div class="modal sc-scan-modal" role="dialog" aria-modal="true" aria-labelledby="sc-scan-title">
+      <h3 id="sc-scan-title">Custom scan</h3>
+      <label>Name
+        <input id="sc-scan-name" type="text" maxlength="40" autocomplete="off" placeholder="e.g. Quiet compressions" />
+      </label>
+      <label>Match
+        <div class="segment" id="sc-scan-mode" role="group" aria-label="Combine conditions with AND or OR">
+          <button type="button" data-val="and" class="seg-neutral" aria-pressed="true">ALL (and)</button>
+          <button type="button" data-val="or" class="seg-neutral" aria-pressed="false">ANY (or)</button>
+        </div>
+      </label>
+      <div id="sc-scan-rules" class="sc-scan-rules"></div>
+      <button id="sc-scan-addrule" class="btn-ghost sm" type="button">＋ Add condition</button>
+      <p id="sc-scan-preview" class="muted sc-scan-preview"></p>
+      <div id="sc-scan-result" class="result-msg" role="status" aria-live="polite"></div>
+      <div class="modal-actions">
+        <button id="sc-scan-delete" class="btn-danger" type="button" hidden>Delete scan</button>
+        <button id="sc-scan-cancel" class="btn-ghost" type="button">Cancel</button>
+        <button id="sc-scan-save" class="btn-primary" type="button">Save scan</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Scanner alert composer. Alerts are client-side, notify via toasts + the
+       notification center, and NEVER place or modify an order. -->
+  <div id="sc-alert-overlay" class="modal-overlay" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="sc-alert-title">
+      <h3 id="sc-alert-title">Scanner alert</h3>
+      <p id="sc-alert-context" class="muted"></p>
+      <label>Condition
+        <select id="sc-alert-kind">
+          <option value="top_mover">Symbol enters the Top-10 movers</option>
+          <option value="vol_double">24h volume doubles (from now)</option>
+          <option value="vol15m">15m volatility exceeds (%)</option>
+          <option value="move15m">|15m move| exceeds (%)</option>
+          <option value="funding_abs">|Funding rate| exceeds (%)</option>
+        </select>
+      </label>
+      <label id="sc-alert-value-wrap">Value
+        <input id="sc-alert-value" type="text" inputmode="decimal" autocomplete="off" placeholder="e.g. 2" />
+      </label>
+      <label class="checkbox" id="sc-alert-any-wrap">
+        <input type="checkbox" id="sc-alert-any" /> Watch every market (not just one symbol)
+      </label>
+      <div id="sc-alert-existing" class="alert-existing"></div>
+      <div id="sc-alert-result" class="result-msg" role="status" aria-live="polite"></div>
+      <div class="modal-actions">
+        <button id="sc-alert-cancel" class="btn-ghost" type="button">Close</button>
+        <button id="sc-alert-add" class="btn-primary" type="button">Add alert</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Price-alert composer. Alerts are client-side only and notify via the
        notification center; they NEVER place or modify an order. -->
   <div id="alert-overlay" class="modal-overlay" hidden>
@@ -636,8 +765,10 @@
         <kbd>⌘K</kbd><span>Command palette</span>
         <kbd>W</kbd><span>Workspace switcher (digits 1–9 select inside)</span>
         <kbd>A</kbd><span>Add symbol (on the Watch tab)</span>
+        <kbd>F</kbd><span>Search markets (on the Scan tab)</span>
         <kbd>↑ ↓</kbd><span>Navigate rows, tabs &amp; panels</span>
-        <kbd>Enter</kbd><span>Expand row · activate</span>
+        <kbd>PgUp PgDn</kbd><span>Scanner: jump a page · Home/End first/last</span>
+        <kbd>Enter</kbd><span>Expand row · activate · open chart &amp; book</span>
         <kbd>Esc</kbd><span>Close dialogs · exit fullscreen</span>
         <kbd>?</kbd><span>This reference</span>
       </div>
