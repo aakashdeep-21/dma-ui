@@ -294,6 +294,16 @@ def last_sample_ms() -> int | None:
     return _last_sample_ms
 
 
+def is_known_symbol(symbol: str) -> bool:
+    """True if `symbol` is part of the venue's live ticker universe as observed
+    by the sampler (symbols vanish from here ~10 min after delisting). Used by
+    the chart kline proxy to extend its static allowlist to every real market
+    WITHOUT ever accepting an arbitrary string — the set is bounded by what the
+    venue itself lists. Empty (False for everything) until the first sample or
+    when the scanner is disabled; callers must keep their own static fallback."""
+    return symbol in _histories
+
+
 def ingest(tickers: list, now_ms: float) -> dict:
     """Fold one ticker-list sample into the rolling histories and build the
     snapshot. Pure-ish (module state in, module state out) and synchronous so

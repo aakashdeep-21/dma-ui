@@ -25,6 +25,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
           <span>Trade</span>
         </button>
+        <button class="tab" data-tab="risk" role="tab" id="tab-risk" aria-controls="panel-risk" aria-selected="false" tabindex="-1">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><line x1="12" y1="8" x2="12" y2="12.5"/><circle cx="12" cy="15.5" r="0.5"/></svg>
+          <span>Risk</span>
+        </button>
         <button class="tab" data-tab="scanner" role="tab" id="tab-scanner" aria-controls="panel-scanner" aria-selected="false" tabindex="-1">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="0.5"/><line x1="12" y1="3" x2="12" y2="7.5"/><line x1="16" y1="8" x2="19.5" y2="4.5"/></svg>
           <span>Scan</span>
@@ -158,6 +162,7 @@
                 <div class="panel-head">
                   <h2>Risk Overview</h2>
                   <span class="muted" id="risk-note">live · derived from open positions</span>
+                  <button type="button" id="rk-open" class="btn-ghost sm rk-openbtn" title="Open the full risk dashboard">Full dashboard →</button>
                 </div>
                 <div id="risk-body" class="risk-body"><p class="muted center" style="padding:18px">Waiting for data…</p></div>
               </section>
@@ -218,25 +223,24 @@
                 </div>
               </section>
 
-              <!-- Live candlestick charts (read-only public market data). -->
+              <!-- Multi-chart workspace (read-only public market data).
+                   Layout picker / link toggles rendered by wireCharts() in
+                   charts.js; every card manages its own symbol + interval. -->
               <section class="panel" id="charts-panel" data-wpanel="charts">
                 <div class="panel-head">
                   <h2>Live Charts</h2>
                   <div class="chart-controls">
-                    <div class="segment chart-seg" id="chart-view" role="group" aria-label="Chart view">
-                      <button type="button" class="seg-neutral active" data-view="grid" aria-pressed="true">BTC · ETH · SOL</button>
-                      <button type="button" class="seg-neutral" data-view="single" aria-pressed="false">Single</button>
-                    </div>
-                    <div class="segment chart-seg" id="chart-sym" role="group" aria-label="Chart symbol" hidden></div>
-                    <!-- Interval buttons rendered by wireCharts() from CHART_INTERVALS. -->
-                    <div class="segment chart-seg" id="chart-iv" role="group" aria-label="Candle interval"></div>
+                    <div class="segment chart-seg mc-layoutseg" id="mc-layouts" role="group" aria-label="Chart layout"></div>
+                    <div class="segment chart-seg mc-linkseg" id="mc-links" role="group" aria-label="Chart link synchronization"></div>
+                    <button type="button" id="mc-add" class="icon-btn" title="Add chart" aria-label="Add chart">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                    </button>
                     <button type="button" id="chart-expand" class="icon-btn" title="Expand charts (Esc to exit)" aria-label="Expand charts" aria-pressed="false">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
                     </button>
                   </div>
                 </div>
-                <div id="charts-grid" class="charts-grid"></div>
-                <div id="charts-single" class="charts-single" hidden></div>
+                <div id="mc-grid" class="mc-grid" aria-label="Chart grid"></div>
               </section>
 
               <!-- Shown only when EVERY main panel is collapsed in the active
@@ -371,6 +375,68 @@
               </section>
             </aside>
           </div>
+        </div>
+
+        <!-- ============ RISK COMMAND CENTER ============ -->
+        <!-- Portfolio risk dashboard (risk.js): metrics/score/alerts all feed
+             off the SAME live dashboard snapshot the tables render (no extra
+             polling); daily context reads the history mirror once a minute
+             while visible. READ-ONLY: nothing in this pane can place, modify
+             or cancel an order — alerts are notifications only. -->
+        <div class="pane" data-pane="risk" id="panel-risk" role="tabpanel" aria-labelledby="tab-risk" hidden>
+          <section class="panel" data-wpanel="rk-head">
+            <div class="panel-head">
+              <h2>Risk Command Center</h2>
+              <div class="rk-headtools">
+                <span class="muted" id="rk-updated" role="status" aria-live="polite"></span>
+                <button type="button" id="rk-alerts-toggle" class="btn-ghost sm" aria-pressed="true">🔔 Alerts armed</button>
+              </div>
+            </div>
+            <div id="rk-head-body" class="rk-body"><p class="muted center" style="padding:22px">Waiting for the live snapshot…</p></div>
+          </section>
+
+          <div class="rk-cols">
+            <section class="panel" data-wpanel="rk-exposure">
+              <div class="panel-head"><h2>Exposure &amp; Allocation</h2><span class="muted">live · exchange values</span></div>
+              <div id="rk-exposure-body" class="rk-body"></div>
+            </section>
+            <section class="panel" data-wpanel="rk-margin">
+              <div class="panel-head"><h2>Margin</h2><span class="muted">live · exchange + derived</span></div>
+              <div id="rk-margin-body" class="rk-body"></div>
+            </section>
+          </div>
+
+          <div class="rk-cols">
+            <section class="panel" data-wpanel="rk-liq">
+              <div class="panel-head"><h2>Liquidation Analysis</h2><span class="muted">exchange mark &amp; liq prices</span></div>
+              <div id="rk-liq-body" class="rk-body"></div>
+            </section>
+            <section class="panel" data-wpanel="rk-conc">
+              <div class="panel-head"><h2>Concentration</h2><span class="muted">derived from exposure</span></div>
+              <div id="rk-conc-body" class="rk-body"></div>
+            </section>
+          </div>
+
+          <section class="panel" data-wpanel="rk-positions">
+            <div class="panel-head"><h2>Position Risk</h2><span class="muted">click a column to sort</span></div>
+            <div id="rk-positions-body" class="rk-body"></div>
+          </section>
+
+          <div class="rk-cols">
+            <section class="panel" data-wpanel="rk-daily">
+              <div class="panel-head"><h2>Daily Risk &amp; Drawdown</h2><span class="muted">history mirror + session</span></div>
+              <div id="rk-daily-body" class="rk-body"></div>
+            </section>
+            <section class="panel" data-wpanel="rk-timeline">
+              <div class="panel-head"><h2>Risk Timeline</h2><span class="muted">this session</span></div>
+              <div id="rk-timeline-body" class="rk-body"></div>
+            </section>
+          </div>
+
+          <section class="panel" data-wpanel="rk-history">
+            <div class="panel-head"><h2>Risk History</h2><span class="muted">session-local series</span></div>
+            <div id="rk-history-body" class="rk-body"></div>
+          </section>
         </div>
 
         <!-- ============ MARKET SCANNER ============ -->
@@ -765,7 +831,10 @@
         <kbd>⌘K</kbd><span>Command palette</span>
         <kbd>W</kbd><span>Workspace switcher (digits 1–9 select inside)</span>
         <kbd>A</kbd><span>Add symbol (on the Watch tab)</span>
-        <kbd>F</kbd><span>Search markets (on the Scan tab)</span>
+        <kbd>F</kbd><span>Search markets (Scan tab) · fullscreen chart (focused chart)</span>
+        <kbd>⌥1–8</kbd><span>Chart layout: 1 · 2 · 2 stacked · 3 · 2×2 · 3×2 · 4×2 · 3×3</span>
+        <kbd>← →</kbd><span>Move between charts (focused chart) · <kbd>R</kbd> reset zoom · <kbd>+ −</kbd> zoom</span>
+        <kbd>⌖</kbd><span>Charts: wheel zooms · drag pans history · double-click resets</span>
         <kbd>↑ ↓</kbd><span>Navigate rows, tabs &amp; panels</span>
         <kbd>PgUp PgDn</kbd><span>Scanner: jump a page · Home/End first/last</span>
         <kbd>Enter</kbd><span>Expand row · activate · open chart &amp; book</span>
@@ -786,6 +855,10 @@
     </div>
   </div>
 
+  <!-- Module scripts first (charts.js = multi-chart, risk.js = risk system);
+       app.js boots them and feeds risk.js every live snapshot. -->
+  <script src="/static/charts.js"></script>
+  <script src="/static/risk.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

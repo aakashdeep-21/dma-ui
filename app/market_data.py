@@ -9,16 +9,20 @@ cannot place, cancel, or read account / funds data — it serves public OHLC
 candles only. There is no write capability anywhere in this file.
 
 Abuse / SSRF protection: the route layer requires a logged-in session, and the
-symbol + interval are validated against a server-side whitelist BEFORE any
-upstream call. The upstream URL/host is fixed from configuration and only the
-(whitelisted) symbol/interval/limit vary — so this proxy can never be coerced
-into fetching an arbitrary URL or market.
+symbol + interval are validated server-side BEFORE any upstream call. A symbol
+is allowed only if it is on the static CHART_SYMBOLS allowlist OR is a symbol
+the market scanner has actually observed in the venue's live ticker universe
+(a bounded, venue-authoritative set — never an arbitrary string). The upstream
+URL/host is fixed from configuration and only the (validated) symbol/interval/
+limit vary — so this proxy can never be coerced into fetching an arbitrary URL
+or market.
 """
 import asyncio
 import time
 
 import httpx
 
+from . import scanner
 from .config import settings
 
 
@@ -34,8 +38,10 @@ class MarketDataError(Exception):
 # UI interval label / Bybit code -> Bybit v5 kline `interval`. Anything not in
 # this map is rejected; arbitrary intervals are never passed through.
 _INTERVALS = {
-    "1m": "1", "5m": "5", "15m": "15", "1h": "60",
-    "1": "1", "5": "5", "15": "15", "60": "60",
+    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+    "1h": "60", "4h": "240", "1d": "D",
+    "1": "1", "3": "3", "5": "5", "15": "15", "30": "30",
+    "60": "60", "240": "240", "d": "D",
 }
 
 _DEFAULT_LIMIT = 200
@@ -64,10 +70,13 @@ async def aclose() -> None:
 
 
 def _validate(symbol: str, interval: str) -> tuple[str, str]:
-    """Whitelist the symbol + interval. Raises MarketDataError(400) on anything
-    not explicitly allowed (the symbol whitelist is the SSRF/abuse guard)."""
+    """Validate the symbol + interval. Raises MarketDataError(400) on anything
+    not explicitly allowed. A symbol passes if it is on the static
+    CHART_SYMBOLS allowlist OR the scanner has observed it in the venue's live
+    ticker universe — both are bounded, venue-real sets, so this remains the
+    SSRF/abuse guard (never an arbitrary passthrough)."""
     sym = (symbol or "").strip().upper()
-    if sym not in set(settings.CHART_SYMBOLS):
+    if sym not in set(settings.CHART_SYMBOLS) and not scanner.is_known_symbol(sym):
         raise MarketDataError(400, "symbol not allowed for charts")
     raw = (interval or "").strip()
     code = _INTERVALS.get(raw.lower()) or _INTERVALS.get(raw)
@@ -156,13 +165,22 @@ async def get_kline(symbol: str, interval: str, limit=None) -> dict:
             return hit
         data = await _fetch_upstream(sym, code, lim)
         if ttl > 0:
-            # _cache and _locks are bounded by the whitelist (≤ symbols × intervals
-            # × limit-buckets ≈ 60 keys), so this 256 cap is a paranoid backstop
-            # that never trips in practice. Clear ONLY _cache — never _locks: the
-            # lock we currently hold must not be orphaned mid-flight (a new caller
-            # would otherwise mint a second lock and issue a redundant GET).
-            if len(_cache) > 256:
-                _cache.clear()
+            # The key space is bounded by real markets × intervals × limit-buckets
+            # (the scanner universe made it wider than the old 3-symbol allowlist),
+            # so cap growth in two stages: drop expired entries first, and only if
+            # a sweep somehow keeps thousands warm, clear. Clear ONLY _cache —
+            # never a held lock: the lock we currently hold must not be orphaned
+            # mid-flight (a new caller would otherwise mint a second lock and
+            # issue a redundant GET). Un-held locks are safe to prune.
+            if len(_cache) > 1024:
+                now2 = time.monotonic()
+                for k in [k for k, (ts, _) in _cache.items() if (now2 - ts) >= ttl]:
+                    _cache.pop(k, None)
+                if len(_cache) > 4096:
+                    _cache.clear()
+            if len(_locks) > 1024:
+                for k in [k for k, lk in _locks.items() if not lk.locked()]:
+                    _locks.pop(k, None)
             # NOTE: the cached payload is SHARED by reference across concurrent
             # callers; it is read-only here (the route only serializes it) and
             # must never be mutated in place by a future consumer.

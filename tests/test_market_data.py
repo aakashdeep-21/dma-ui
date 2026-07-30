@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from app import market_data
+from app import market_data, scanner
 from app.config import settings
 
 
@@ -39,12 +39,36 @@ def fake_kline(monkeypatch):
     market_data._locks.clear()
 
 
+@pytest.fixture
+def empty_universe():
+    """Scanner has observed nothing → only the static allowlist passes."""
+    saved = dict(scanner._histories)
+    scanner._histories.clear()
+    yield
+    scanner._histories.clear()
+    scanner._histories.update(saved)
+
+
 # ---- validation (the SSRF/abuse guard) --------------------------------------
 
-def test_validate_rejects_off_whitelist_symbol():
+def test_validate_rejects_off_whitelist_symbol(empty_universe):
     with pytest.raises(market_data.MarketDataError) as ei:
         market_data._validate("DOGEUSDT", "1m")
     assert ei.value.status == 400
+
+
+def test_validate_accepts_scanner_known_symbol(empty_universe):
+    """The live venue universe (as observed by the scanner) extends the static
+    allowlist — a real market charts without env changes."""
+    scanner._histories["DOGEUSDT"] = scanner.SymbolHistory()
+    assert market_data._validate("DOGEUSDT", "1m") == ("DOGEUSDT", "1")
+    # …but the set stays bounded by what the venue lists: junk still fails.
+    with pytest.raises(market_data.MarketDataError):
+        market_data._validate("TOTALLYFAKE", "1m")
+
+
+def test_validate_static_allowlist_still_works_without_scanner(empty_universe):
+    assert market_data._validate("BTCUSDT", "1m") == ("BTCUSDT", "1")
 
 
 def test_validate_rejects_unknown_interval():
@@ -53,7 +77,12 @@ def test_validate_rejects_unknown_interval():
     assert ei.value.status == 400
 
 
-@pytest.mark.parametrize("raw,code", [("1m", "1"), ("1", "1"), ("1h", "60"), ("1H", "60"), ("60", "60")])
+@pytest.mark.parametrize("raw,code", [
+    ("1m", "1"), ("1", "1"), ("1h", "60"), ("1H", "60"), ("60", "60"),
+    # Multi-chart additions: the full ladder the chart toolbar offers.
+    ("3m", "3"), ("3", "3"), ("30m", "30"), ("30", "30"),
+    ("4h", "240"), ("240", "240"), ("1d", "D"), ("D", "D"), ("d", "D"),
+])
 def test_validate_maps_interval_labels(raw, code):
     assert market_data._validate("BTCUSDT", raw) == ("BTCUSDT", code)
 
@@ -103,7 +132,7 @@ def test_upstream_nonzero_retcode_maps_to_502(fake_kline):
     assert ei.value.status == 502
 
 
-def test_rejected_symbol_never_reaches_upstream(fake_kline):
+def test_rejected_symbol_never_reaches_upstream(fake_kline, empty_universe):
     with pytest.raises(market_data.MarketDataError):
         asyncio.run(market_data.get_kline("EVILUSDT", "1m", 60))
     assert fake_kline["n"] == 0

@@ -1001,72 +1001,10 @@ function renderDashboard(d) {
   renderOrders(d.orders);
   renderErrors(d.errors);
   notifyPositionChanges(d);
-  renderRiskOverview(d);
-}
-
-// ---------------------------------------------------------------------------
-// Risk overview — derived entirely from the snapshot the tables already
-// render (no extra requests): gross/net exposure, long/short split, margin
-// utilization, nearest liquidation, largest position. Every figure is `.priv`.
-// ---------------------------------------------------------------------------
-let _lastRiskHTML = null;
-function renderRiskOverview(d) {
-  const body = document.getElementById("risk-body");
-  if (!body) return;
-  // Partial snapshot (positions read failed upstream): keep the last good view
-  // rather than painting "no exposure" over live risk.
-  if (d.errors && d.errors.positions) return;
-  const rows = (d.positions || []).filter((p) => Number(p.size) !== 0);
-  const num = (v) => (v !== undefined && v !== "" && isFinite(Number(v)) ? Number(v) : null);
-
-  let long = 0, short = 0, largest = null, nearestLiq = null;
-  rows.forEach((p) => {
-    const value = Number(p.positionValue) || 0;
-    if ((p.side || "").toLowerCase() === "buy") long += value; else short += value;
-    if (!largest || value > largest.value) largest = { value, sym: String(p.symbol || "?") };
-    const mark = Number(p.markPrice), liq = Number(p.liqPrice);
-    if (isFinite(mark) && mark > 0 && isFinite(liq) && liq > 0) {
-      const dist = (Math.abs(mark - liq) / mark) * 100;
-      if (!nearestLiq || dist < nearestLiq.dist) nearestLiq = { dist, sym: String(p.symbol || "?") };
-    }
-  });
-  const gross = long + short;
-  const net = long - short;
-  const longPct = gross > 0 ? (long / gross) * 100 : 50;
-  const acct = walletAccount(d.balance);
-  const im = acct ? num(acct.totalInitialMargin) : null;
-  const marginBal = acct ? num(acct.totalMarginBalance) : null;
-  const util = im != null && marginBal && marginBal > 0 ? (im / marginBal) * 100 : null;
-
-  let html;
-  if (!rows.length) {
-    html = `<p class="muted center" style="padding:20px 12px">No open positions — no market exposure.</p>`;
-  } else {
-    const liqCls = nearestLiq ? (nearestLiq.dist < 5 ? "neg" : nearestLiq.dist < 10 ? "warn" : "pos") : "flat";
-    const utilCls = util != null ? (util >= 80 ? "neg" : util >= 50 ? "warn" : "pos") : "flat";
-    html =
-      `<div class="risk-grid">` +
-        jTile("Gross exposure", `${fmtMoney(gross)} ${esc(curUnit())}`, "flat") +
-        jTile("Net exposure", `${fmtMoneySigned(net)}`, pnlClass(net)) +
-        jTile("Margin utilization", util != null ? fmtPct(util, false) : "—", utilCls) +
-        jTile("Nearest liquidation",
-          nearestLiq ? `${esc(nearestLiq.sym)} · ${nearestLiq.dist.toFixed(1)}%` : "—", liqCls) +
-        jTile("Largest position",
-          largest ? `${esc(largest.sym)} · ${fmtMoney(largest.value)}` : "—", "flat") +
-        jTile("Open positions", String(rows.length), "flat") +
-      `</div>` +
-      `<div class="risk-split" role="img" aria-label="Long ${longPct.toFixed(0)} percent of gross exposure">` +
-        `<span class="rs-long" style="width:${longPct.toFixed(1)}%"></span>` +
-        `<span class="rs-short" style="width:${(100 - longPct).toFixed(1)}%"></span>` +
-      `</div>` +
-      `<div class="risk-split-labels">` +
-        `<span class="pos priv">Long ${fmtMoney(long)}</span>` +
-        `<span class="neg priv">Short ${fmtMoney(short)}</span>` +
-      `</div>`;
-  }
-  if (html === _lastRiskHTML) return; // dirty-check like the tables
-  _lastRiskHTML = html;
-  body.innerHTML = html;
+  // Risk system (risk.js): metrics, score, alerts, timeline, and both risk
+  // surfaces (the compact dashboard panel + the Risk tab) all feed off this
+  // one snapshot — no extra requests.
+  rkIngest(d);
 }
 
 // In-app fill/close awareness: announce position open/close/size changes by
@@ -2648,6 +2586,9 @@ function wireTabs() {
     if (name === "scanner") onScannerActive();
     if (name === "history") onHistoryActive();
     if (name === "account") onAccountActive();
+    // Risk tab: refresh the daily history context while visible (the live
+    // metrics themselves ride the shared WS snapshot, no extra polling).
+    if (name === "risk") onRiskActive();
     // The order-book widget only polls while the dashboard is visible.
     if (name === "dashboard") { if (state.activeSymbol) startBookPolling(); }
     else stopBookPolling();
@@ -4209,15 +4150,13 @@ document.addEventListener("click", (e) => {
   const br = e.target.closest(".book-row.clickable[data-px]");
   if (br) fillPriceFromBookRow(br);
 });
-// Keyboard parity for clickable book rows AND clickable chart cards (both are
-// non-<button> elements made operable with role="button" tabindex="0").
+// Keyboard parity for clickable book rows (non-<button> elements made
+// operable with role="button" tabindex="0"). Chart cards use real buttons.
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
   if (!e.target || !e.target.closest) return;
   const br = e.target.closest(".book-row.clickable[data-px]");
-  if (br && e.target === br) { e.preventDefault(); fillPriceFromBookRow(br); return; }
-  const card = e.target.closest(".cc-card.clickable[data-trade]");
-  if (card && e.target === card) { e.preventDefault(); loadSymbolIntoTicket(card.getAttribute("data-trade")); }
+  if (br && e.target === br) { e.preventDefault(); fillPriceFromBookRow(br); }
 });
 
 // ---------------------------------------------------------------------------
@@ -4546,477 +4485,13 @@ function syncHeaderHeight() {
 }
 
 // ---------------------------------------------------------------------------
-// Live candlestick charts (read-only public market data via /api/klines).
-// Bybit kline → hand-drawn SVG candles (CSP-safe, like svgAreaChart). Polls
-// every 1s WHILE the Dashboard tab is visible — independent of the 5s account
-// feed — and pauses when the tab/pane is hidden. No write or account data.
+// Live charts — the multi-chart workspace now lives in charts.js (loaded
+// before this file). It preserves this module's contracts: wireCharts(),
+// startChartPolling()/stopChartPolling() (tab switch, panel collapse and
+// visibility hooks below call them), the /api/klines polling economics, and
+// the CSP-safe hand-drawn SVG renderer. Workspace persistence goes through
+// mcCaptureState()/mcApplyState()/mcSanitizeCharts() from that file.
 // ---------------------------------------------------------------------------
-// Must mirror the server-side CHART_SYMBOLS whitelist (the server stays
-// authoritative and rejects anything off-list). dp = price decimal places.
-const CHART_SYMBOLS = [
-  { id: "BTCUSDT", label: "BTC", dp: 1 },
-  { id: "ETHUSDT", label: "ETH", dp: 2 },
-  { id: "SOLUSDT", label: "SOL", dp: 2 },
-];
-const CHART_LIMIT = { grid: 60, single: 160 };
-// Single source for the interval set: the #chart-iv buttons AND the footer label
-// both derive from this. The backend _INTERVALS map stays the authoritative gate.
-const CHART_INTERVALS = [
-  { code: "1", label: "1m" },
-  { code: "5", label: "5m" },
-  { code: "15", label: "15m" },
-  { code: "60", label: "1H" },
-];
-// Poll cadence per candle interval: a 1m candle changes every tick, a 1H one
-// barely moves for minutes — matching the request rate to the data's actual
-// change rate cuts most of the continuous load on the public kline proxy
-// (a region-fragile third-party dependency) with no visible latency cost.
-const CHART_POLL_MS = { "1": 2000, "5": 3000, "15": 5000, "60": 10000 };
-const chartState = {
-  view: "grid",         // "grid" | "single"
-  interval: "15",       // Bybit kline code (1 | 5 | 15 | 60) — the SELECTED interval
-  loadedInterval: "15", // interval the on-screen candles were actually fetched with
-  loadedView: null,     // view the on-screen candles were fetched at (grid=60 vs single=160 candles)
-  loadedSingle: null,   // single-view symbol the on-screen candles were fetched for
-  single: "BTCUSDT",
-  data: {},             // symbol -> ascending candle[] {o,h,l,c,v}
-  failures: {},         // symbol -> consecutive fetch failures (drives the empty-state note)
-  fetching: false,      // single-flight guard so poll ticks never pile up
-  pending: false,       // a control change arrived mid-fetch -> fetch once more after
-};
-let _chartTimer = null;
-
-function chartSymById(id) {
-  return CHART_SYMBOLS.find((s) => s.id === id) || CHART_SYMBOLS[0];
-}
-function intervalLabel(code) {
-  const m = CHART_INTERVALS.find((i) => i.code === code);
-  return m ? m.label : code;
-}
-// Compact HH:MM for the candle time axis (a candle's `start` is epoch-ms).
-function fmtClock(ms) {
-  const n = Number(ms);
-  if (!isFinite(n) || n <= 0) return "";
-  const d = new Date(n);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-}
-
-// Parse a Bybit kline payload into ascending {o,h,l,c,v} numbers. Bybit returns
-// result.list as [start, open, high, low, close, volume, turnover] strings,
-// NEWEST first — iterate in reverse to get chronological order.
-function parseKline(data) {
-  const list = (data && data.result && data.result.list) || [];
-  const out = [];
-  for (let i = list.length - 1; i >= 0; i--) {
-    const k = list[i];
-    if (!Array.isArray(k) || k.length < 5) continue;
-    const t = Number(k[0]);
-    const o = Number(k[1]), h = Number(k[2]), l = Number(k[3]), c = Number(k[4]), v = Number(k[5]);
-    if (!isFinite(o) || !isFinite(h) || !isFinite(l) || !isFinite(c)) continue;
-    out.push({ t: isFinite(t) ? t : 0, o, h, l, c, v: isFinite(v) ? v : 0 });
-  }
-  return out;
-}
-
-// Horizontal plot geometry shared by renderCandles AND the crosshair
-// hit-testing — one source so hover→candle mapping can never drift from
-// what is actually drawn.
-const CC_GEOM = { W: 600, L: 6, R: 6 };
-
-// Hand-drawn candlestick SVG + right-hand price scale. Inputs are coerced
-// NUMBERS only — no exchange string ever reaches innerHTML here, so this is
-// XSS-safe by construction (the price-scale labels go through fmtNum).
-function renderCandles(svg, axisEl, timeEl, candles, dp) {
-  if (!svg) return;
-  if (!candles || !candles.length) {
-    svg.innerHTML = "";
-    if (axisEl) axisEl.innerHTML = "";
-    if (timeEl) timeEl.innerHTML = "";
-    svg.dataset.sig = ""; // reset so a later non-empty set always repaints
-    return;
-  }
-  // Dirty-check: at a 1-per-few-seconds poll the candles are usually identical
-  // between ticks (esp. 15m/1H). Tearing down + reparsing the whole SVG subtree
-  // each time is the hottest cost in the app; skip it when nothing changed. The
-  // signature keys on dp (precision), count, and the last candle's t/o/h/l/c —
-  // an interval/view switch changes the set (or uses a different <svg>), so it
-  // always repaints. (Never reached on the empty branch above.)
-  const lastC = candles[candles.length - 1];
-  const sig = `${dp}|${candles.length}|${lastC.t}|${lastC.o}|${lastC.h}|${lastC.l}|${lastC.c}`;
-  if (svg.dataset.sig === sig) return;
-  svg.dataset.sig = sig;
-  // SVG geometry (user-space units; preserveAspectRatio="none" stretches X/Y to
-  // the element box): W/H = viewBox size; L/R/T/B = inner padding; volH = bottom
-  // volume-strip height; gap = price↔volume separation. The price band is the
-  // vertical range [T, priceBottom]; the volume bars sit below it.
-  const { W, L, R } = CC_GEOM;
-  const H = 210, T = 10, B = 6, volH = 34, gap = 8;
-  const priceBottom = H - B - volH - gap;
-  let min = Infinity, max = -Infinity, maxV = 0;
-  candles.forEach((c) => {
-    if (c.l < min) min = c.l;
-    if (c.h > max) max = c.h;
-    if (c.v > maxV) maxV = c.v;
-  });
-  // 8% vertical headroom so wicks aren't flush to the edges; fall back to a tiny
-  // band for a (near-)flat series, then to 1 so the span is never 0.
-  const padR = (max - min) * 0.08 || Math.abs(max) * 0.001 || 1;
-  min -= padR; max += padR;
-  const span = (max - min) || 1;
-  if (!(maxV > 0)) maxV = 1;
-  // body = 62% of each candle's horizontal slot (leaves the inter-candle gap); ≥1.4px.
-  const n = candles.length, plotW = W - L - R, step = plotW / n, bodyW = Math.max(1.4, step * 0.62);
-  const y = (p) => T + (priceBottom - T) * (1 - (p - min) / span);
-  const parts = [];
-  for (let g = 1; g <= 3; g++) {
-    const gy = (T + (priceBottom - T) * g / 4).toFixed(1);
-    parts.push(`<line class="cs-grid" x1="0" y1="${gy}" x2="${W}" y2="${gy}"/>`);
-  }
-  candles.forEach((cd, i) => {
-    const xc = L + (i + 0.5) * step;
-    const cls = cd.c >= cd.o ? "cs-up" : "cs-down";
-    parts.push(`<line class="${cls}" x1="${xc.toFixed(1)}" y1="${y(cd.h).toFixed(1)}" x2="${xc.toFixed(1)}" y2="${y(cd.l).toFixed(1)}" stroke-width="1" vector-effect="non-scaling-stroke"/>`);
-    const yo = y(cd.o), yc = y(cd.c), top = Math.min(yo, yc), hgt = Math.max(1, Math.abs(yo - yc));
-    parts.push(`<rect class="${cls}" x="${(xc - bodyW / 2).toFixed(1)}" y="${top.toFixed(1)}" width="${bodyW.toFixed(1)}" height="${hgt.toFixed(1)}"/>`);
-    const bh = (cd.v / maxV) * volH;
-    parts.push(`<rect class="${cls}" x="${(xc - bodyW / 2).toFixed(1)}" y="${(H - B - bh).toFixed(1)}" width="${bodyW.toFixed(1)}" height="${bh.toFixed(1)}" fill-opacity="0.28"/>`);
-  });
-  const last = candles[candles.length - 1];
-  const lastCls = last.c >= last.o ? "cs-up" : "cs-down";
-  parts.push(`<line class="${lastCls}" x1="0" y1="${y(last.c).toFixed(1)}" x2="${W}" y2="${y(last.c).toFixed(1)}" stroke-width="1" stroke-dasharray="4 4" opacity="0.55" vector-effect="non-scaling-stroke"/>`);
-  svg.innerHTML = parts.join("");
-  if (axisEl) {
-    const a = [];
-    const levels = 5;
-    for (let k = 0; k < levels; k++) {
-      const f = k / (levels - 1);
-      const price = max - f * span;
-      const topPct = ((T + f * (priceBottom - T)) / H * 100).toFixed(2);
-      a.push(`<span class="cc-ax-lbl" style="top:${topPct}%">${fmtNum(price, dp)}</span>`);
-    }
-    const fLast = (max - last.c) / span;
-    const ltop = ((T + fLast * (priceBottom - T)) / H * 100).toFixed(2);
-    a.push(`<span class="cc-ax-last ${last.c >= last.o ? "pos" : "neg"}" style="top:${ltop}%">${fmtNum(last.c, dp)}</span>`);
-    axisEl.innerHTML = a.join("");
-  }
-  if (timeEl) {
-    // Time axis: a few HH:MM labels under the plot. Labels are HTML (not SVG text)
-    // so they stay crisp under the stretched viewBox; the row is inset by the
-    // price gutter (CSS) to align with the plot. Interior labels sit centred on
-    // their candle's x; the first/last are pinned to the row edges instead (so
-    // they can't clip past the plot), which reads as the visible time range.
-    const t = [], seen = {};
-    [0, Math.floor(n / 3), Math.floor((2 * n) / 3), n - 1].forEach((i) => {
-      if (i < 0 || i >= n || seen[i]) return;
-      seen[i] = 1;
-      let style;
-      if (i === 0) style = "left:0";
-      else if (i === n - 1) style = "right:0";
-      else style = `left:${(((L + (i + 0.5) * step) / W) * 100).toFixed(1)}%;transform:translateX(-50%)`;
-      t.push(`<span class="cc-t" style="${style}">${fmtClock(candles[i].t)}</span>`);
-    });
-    timeEl.innerHTML = t.join("");
-  }
-}
-
-// Static card shell (built once). suffix = "BTCUSDT"… for grid cards, "single"
-// for the single-view card. Labels are our own constants but still escaped.
-function chartCardHTML(sm, suffix) {
-  return (
-    `<div class="cc-head">` +
-      `<div class="cc-sym"><b>${esc(sm.label)}</b><span>${esc(sm.id)} · Perp</span></div>` +
-      `<div class="cc-px"><span class="cc-last mono" id="cc-last-${suffix}">—</span><span class="cc-chg mono" id="cc-chg-${suffix}">—</span></div>` +
-    `</div>` +
-    `<div class="cc-chart${suffix === "single" ? " lg" : ""}">` +
-      `<svg class="cs" id="cs-${suffix}" viewBox="0 0 600 210" preserveAspectRatio="none" role="img" aria-label="${esc(sm.label)} candlesticks"></svg>` +
-      `<div class="cc-axis" id="cax-${suffix}"></div>` +
-      `<div class="cc-cross" id="ccx-${suffix}" hidden></div>` +
-    `</div>` +
-    `<div class="cc-times" id="ctime-${suffix}"></div>` +
-    `<div class="cc-foot"><span id="cfoot-${suffix}">—</span><span class="muted" id="civ-${suffix}"></span></div>`
-  );
-}
-
-function buildChartDom() {
-  const ivSeg = document.getElementById("chart-iv");
-  if (ivSeg && !ivSeg.children.length) {
-    ivSeg.innerHTML = CHART_INTERVALS.map((iv) => {
-      const on = iv.code === chartState.interval;
-      return `<button type="button" class="seg-neutral${on ? " active" : ""}" data-iv="${esc(iv.code)}" aria-pressed="${on}">${esc(iv.label)}</button>`;
-    }).join("");
-  }
-  const symSeg = document.getElementById("chart-sym");
-  if (symSeg && !symSeg.children.length) {
-    symSeg.innerHTML = CHART_SYMBOLS.map((s) => {
-      const on = s.id === chartState.single;
-      return `<button type="button" class="seg-neutral${on ? " active" : ""}" data-sym="${esc(s.id)}" aria-pressed="${on}">${esc(s.label)}</button>`;
-    }).join("");
-  }
-  const grid = document.getElementById("charts-grid");
-  if (grid && !grid.children.length) {
-    // data-trade reuses the existing delegated click → loadSymbolIntoTicket wiring;
-    // role/tabindex/aria-label + the shared keydown handler make it keyboard-operable.
-    grid.innerHTML = CHART_SYMBOLS.map(
-      (s) => `<div class="cc-card clickable" data-trade="${esc(s.id)}" role="button" tabindex="0" title="Load ${esc(s.id)} into the order ticket" aria-label="Load ${esc(s.id)} into the order ticket">${chartCardHTML(s, s.id)}</div>`
-    ).join("");
-  }
-  const single = document.getElementById("charts-single");
-  if (single && !single.children.length) {
-    single.innerHTML = `<div class="cc-card">${chartCardHTML(chartSymById(chartState.single), "single")}</div>`;
-  }
-  // Crosshair wiring — once per card (the shells are built once).
-  if (grid && !grid.dataset.crossWired) {
-    grid.dataset.crossWired = "1";
-    CHART_SYMBOLS.forEach((s) => wireChartCrosshair(s.id, () => s.id));
-  }
-  if (single && !single.dataset.crossWired) {
-    single.dataset.crossWired = "1";
-    wireChartCrosshair("single", () => chartState.loadedSingle || chartState.single);
-  }
-}
-
-// Crosshair: hovering a chart shows a vertical hairline snapped to the candle
-// under the cursor and swaps the card footer to that candle's time + OHLC.
-// Display-only: reads the already-fetched arrays, never fetches or re-renders.
-function wireChartCrosshair(suffix, symIdFn) {
-  const svg = document.getElementById(`cs-${suffix}`);
-  const cross = document.getElementById(`ccx-${suffix}`);
-  const foot = document.getElementById(`cfoot-${suffix}`);
-  if (!svg || !cross || !foot) return;
-  const chartBox = svg.parentElement; // .cc-chart (position: relative)
-  const onMove = (e) => {
-    const symId = symIdFn();
-    const sm = chartSymById(symId);
-    const arr = chartState.data[symId];
-    const rect = svg.getBoundingClientRect();
-    if (!arr || !arr.length || rect.width <= 0) { cross.hidden = true; return; }
-    const frac = (e.clientX - rect.left) / rect.width;
-    if (frac < 0 || frac > 1) { cross.hidden = true; return; }
-    const n = arr.length;
-    const step = (CC_GEOM.W - CC_GEOM.L - CC_GEOM.R) / n;
-    let idx = Math.floor((frac * CC_GEOM.W - CC_GEOM.L) / step);
-    idx = Math.max(0, Math.min(n - 1, idx));
-    const c = arr[idx];
-    // Snap the hairline to the hovered candle's centre, in on-screen pixels.
-    const xc = CC_GEOM.L + (idx + 0.5) * step;
-    const boxRect = chartBox.getBoundingClientRect();
-    cross.style.left = ((rect.left - boxRect.left) + (xc / CC_GEOM.W) * rect.width).toFixed(1) + "px";
-    cross.hidden = false;
-    foot.dataset.hover = "1"; // freeze the periodic H/L repaint while inspecting
-    foot.textContent =
-      `${fmtClock(c.t)}  O ${fmtNum(c.o, sm.dp)}  H ${fmtNum(c.h, sm.dp)}  L ${fmtNum(c.l, sm.dp)}  C ${fmtNum(c.c, sm.dp)}`;
-  };
-  const onLeave = () => {
-    cross.hidden = true;
-    delete foot.dataset.hover;
-    updateChartHeader(chartSymById(symIdFn()), suffix); // restore the H/L line
-  };
-  chartBox.addEventListener("mousemove", onMove);
-  chartBox.addEventListener("mouseleave", onLeave);
-}
-
-function updateChartHeader(sm, suffix) {
-  const arr = chartState.data[sm.id];
-  if (!arr || !arr.length) {
-    // Never-loaded chart: after repeated failures, say so instead of leaving a
-    // silently blank card (the one known deploy pitfall — a US-region host is
-    // geo-blocked from the public kline API — previously had no on-screen cue).
-    const footEl = document.getElementById(`cfoot-${suffix}`);
-    if (footEl && (chartState.failures[sm.id] || 0) >= 2) {
-      footEl.textContent = "data unavailable — kline source unreachable (region-blocked?)";
-    }
-    return;
-  }
-  const last = arr[arr.length - 1], first = arr[0];
-  const chg = first.o ? (last.c / first.o - 1) * 100 : 0;
-  const lastEl = document.getElementById(`cc-last-${suffix}`);
-  if (lastEl) lastEl.textContent = fmtNum(last.c, sm.dp);
-  const chgEl = document.getElementById(`cc-chg-${suffix}`);
-  if (chgEl) {
-    chgEl.textContent = `${chg > 0 ? "▲ +" : chg < 0 ? "▼ " : ""}${chg.toFixed(2)}%`;
-    chgEl.className = "cc-chg mono " + (chg > 0 ? "pos" : chg < 0 ? "neg" : "flat");
-  }
-  let hi = -Infinity, lo = Infinity;
-  arr.forEach((c) => { if (c.h > hi) hi = c.h; if (c.l < lo) lo = c.l; });
-  const footEl = document.getElementById(`cfoot-${suffix}`);
-  // While the crosshair is inspecting a candle, its OHLC readout owns the
-  // footer — don't let the periodic repaint stomp it mid-hover.
-  if (footEl && footEl.dataset.hover !== "1") {
-    footEl.textContent = `H ${fmtNum(hi, sm.dp)}  L ${fmtNum(lo, sm.dp)}`;
-  }
-  const ivEl = document.getElementById(`civ-${suffix}`);
-  // Label from the interval the on-screen data was fetched with (not the freshly
-  // selected one) so the footer can never describe candles it doesn't show.
-  if (ivEl) ivEl.textContent = `${intervalLabel(chartState.loadedInterval)} · ${arr.length} candles`;
-}
-
-function renderCharts() {
-  const grid = document.getElementById("charts-grid");
-  const single = document.getElementById("charts-single");
-  const symSeg = document.getElementById("chart-sym");
-  if (chartState.view === "grid") {
-    if (grid) grid.hidden = false;
-    if (single) single.hidden = true;
-    if (symSeg) symSeg.hidden = true;
-    CHART_SYMBOLS.forEach((s) => {
-      renderCandles(document.getElementById(`cs-${s.id}`), document.getElementById(`cax-${s.id}`), document.getElementById(`ctime-${s.id}`), chartState.data[s.id], s.dp);
-      updateChartHeader(s, s.id);
-    });
-  } else {
-    if (grid) grid.hidden = true;
-    if (single) single.hidden = false;
-    if (symSeg) symSeg.hidden = false;
-    const s = chartSymById(chartState.single);
-    const head = single && single.querySelector(".cc-sym");
-    if (head) head.innerHTML = `<b>${esc(s.label)}</b><span>${esc(s.id)} · Perp</span>`;
-    renderCandles(document.getElementById("cs-single"), document.getElementById("cax-single"), document.getElementById("ctime-single"), chartState.data[s.id], s.dp);
-    updateChartHeader(s, "single");
-  }
-}
-
-async function fetchCharts() {
-  // Single-flight: if a batch is already running, record that the selection may
-  // have changed and let the in-flight batch trigger ONE more fetch when it ends,
-  // so a control click during a poll tick is never silently dropped.
-  if (chartState.fetching) { chartState.pending = true; return; }
-  // Snapshot the params for THIS batch so the URL, the rendered data, and the
-  // footer label are always mutually consistent even if a control changes mid-flight.
-  const iv = chartState.interval;
-  const view = chartState.view;
-  const syms = view === "grid" ? CHART_SYMBOLS.map((s) => s.id) : [chartState.single];
-  const limit = view === "grid" ? CHART_LIMIT.grid : CHART_LIMIT.single;
-  chartState.fetching = true;
-  try {
-    await Promise.all(
-      syms.map(async (id) => {
-        try {
-          const data = await api(
-            `/api/klines?symbol=${encodeURIComponent(id)}&interval=${encodeURIComponent(iv)}&limit=${limit}`
-          );
-          chartState.data[id] = parseKline(data);
-          delete chartState.failures[id];
-        } catch (e) {
-          // Keep the previous candles on a transient error — never blank the
-          // chart — but count the failure so a never-loaded card can say WHY
-          // it is empty (e.g. the US-region kline geo-block).
-          chartState.failures[id] = (chartState.failures[id] || 0) + 1;
-        }
-      })
-    );
-    chartState.loadedInterval = iv; // the on-screen candles now reflect `iv`
-    chartState.loadedView = view;   // ...and this view's candle count (grid 60 vs single 160)
-    chartState.loadedSingle = view === "single" ? syms[0] : chartState.loadedSingle;
-    renderCharts();
-  } finally {
-    chartState.fetching = false;
-    if (chartState.pending) { chartState.pending = false; fetchCharts(); }
-  }
-}
-
-function chartsVisible() {
-  const pane = document.querySelector('[data-pane="dashboard"]');
-  const panel = document.getElementById("charts-panel");
-  // A collapsed charts panel shows nothing — polling for it is pure waste.
-  const collapsed = panel && panel.classList.contains("collapsed");
-  return !!pane && !pane.hidden && !document.hidden && !collapsed;
-}
-// True when the on-screen candles already match the current interval + view, so
-// a start (tab switch / visibility flap) can reuse them instead of firing a fresh
-// kline burst against the region-constrained public proxy on every transition.
-function chartsDataFresh() {
-  // Must match the interval AND the view the candles were fetched at — grid caches
-  // 60 candles, single caches 160, so grid data is NOT fresh for single view (and
-  // a single-symbol switch invalidates too). Otherwise a visibility flap could
-  // paint the wrong-resolution series as "fresh".
-  if (chartState.loadedInterval !== chartState.interval) return false;
-  if (chartState.loadedView !== chartState.view) return false;
-  if (chartState.view === "single" && chartState.loadedSingle !== chartState.single) return false;
-  const syms = chartState.view === "grid" ? CHART_SYMBOLS.map((s) => s.id) : [chartState.single];
-  return syms.every((id) => Array.isArray(chartState.data[id]) && chartState.data[id].length);
-}
-function startChartPolling() {
-  stopChartPolling();
-  if (!chartsVisible()) return;
-  // Only burst an immediate fetch when the cache can't already paint the current
-  // view/interval; otherwise repaint from cache and let the interval refresh it.
-  if (chartsDataFresh()) renderCharts();
-  else fetchCharts();
-  // Cadence follows the selected candle interval (CHART_POLL_MS): the render
-  // dirty-check makes extra polls cheap to PAINT, but the request itself is
-  // pure waste when the candle can't have changed.
-  _chartTimer = setInterval(() => {
-    if (!chartsVisible()) { stopChartPolling(); return; }
-    fetchCharts();
-  }, CHART_POLL_MS[chartState.interval] || 2000);
-}
-function stopChartPolling() {
-  if (_chartTimer) { clearInterval(_chartTimer); _chartTimer = null; }
-}
-
-function wireCharts() {
-  const panel = document.getElementById("charts-panel");
-  if (!panel) return;
-  buildChartDom();
-  const repaintSeg = (seg, btn) =>
-    seg.querySelectorAll("button").forEach((x) => {
-      const on = x === btn;
-      x.classList.toggle("active", on);
-      x.setAttribute("aria-pressed", String(on));
-    });
-
-  const viewSeg = document.getElementById("chart-view");
-  if (viewSeg) viewSeg.addEventListener("click", (e) => {
-    const b = e.target.closest("button[data-view]");
-    if (!b) return;
-    chartState.view = b.getAttribute("data-view");
-    repaintSeg(viewSeg, b);
-    renderCharts();
-    fetchCharts(); // single view / different limit may need fresh data
-  });
-
-  const symSeg = document.getElementById("chart-sym");
-  if (symSeg) symSeg.addEventListener("click", (e) => {
-    const b = e.target.closest("button[data-sym]");
-    if (!b) return;
-    chartState.single = b.getAttribute("data-sym");
-    repaintSeg(symSeg, b);
-    renderCharts();
-    fetchCharts();
-  });
-
-  const ivSeg = document.getElementById("chart-iv");
-  if (ivSeg) ivSeg.addEventListener("click", (e) => {
-    const b = e.target.closest("button[data-iv]");
-    if (!b) return;
-    chartState.interval = b.getAttribute("data-iv");
-    repaintSeg(ivSeg, b);
-    // Restart (not just fetch): the poll timer must adopt the new interval's
-    // cadence (CHART_POLL_MS); startChartPolling also issues the fresh fetch.
-    startChartPolling();
-  });
-
-  // Fullscreen: the whole charts panel becomes a fixed overlay (Esc exits).
-  // Pure CSS-class toggle; polling/rendering are untouched and keep running.
-  const expandBtn = document.getElementById("chart-expand");
-  if (expandBtn) {
-    const setFull = (on) => {
-      panel.classList.toggle("chart-full", on);
-      expandBtn.setAttribute("aria-pressed", String(on));
-    };
-    expandBtn.addEventListener("click", () => setFull(!panel.classList.contains("chart-full")));
-    document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && panel.classList.contains("chart-full")) setFull(false);
-    });
-  }
-
-  // Pause polling when the browser tab is backgrounded; resume when visible.
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) stopChartPolling();
-    else startChartPolling();
-  });
-
-  startChartPolling();
-}
 
 // ===========================================================================
 // MARKET SCANNER  (the "Scan" tab)
@@ -6763,10 +6238,8 @@ const WS_SCHEMA_VERSION = 2;
 const WS_MAX = 20;
 // Allowlists for sanitizing stored/imported state (one-line consts so the
 // test harness can extract them alongside the functions).
-const WS_PANEL_IDS = ["risk", "positions", "orders", "charts", "token", "ticket", "book"];
-const WS_TABS = ["dashboard", "scanner", "markets", "history", "account", "tools"];
-const WS_CHART_VIEWS = ["grid", "single"];
-const WS_INTERVALS = ["1", "5", "15", "60"]; // keep in sync with CHART_INTERVALS codes
+const WS_PANEL_IDS = ["risk", "positions", "orders", "charts", "token", "ticket", "book", "rk-head", "rk-exposure", "rk-conc", "rk-liq", "rk-margin", "rk-positions", "rk-daily", "rk-timeline", "rk-history"];
+const WS_TABS = ["dashboard", "risk", "scanner", "markets", "history", "account", "tools"];
 const WS_SYMBOL_RE = /^[A-Z0-9]{1,20}$/;
 
 function wsId() {
@@ -6779,7 +6252,6 @@ function wsId() {
 // allowlists or additionally escaped at render time.
 function wsSanitizeState(raw) {
   const src = raw && typeof raw === "object" ? raw : {};
-  const chart = src.chart && typeof src.chart === "object" ? src.chart : {};
   const collapsed = {};
   if (src.collapsed && typeof src.collapsed === "object") {
     WS_PANEL_IDS.forEach((id) => { if (src.collapsed[id]) collapsed[id] = true; });
@@ -6787,18 +6259,16 @@ function wsSanitizeState(raw) {
   const order = Array.isArray(src.order)
     ? src.order.filter((id, i) => WS_PANEL_IDS.includes(id) && src.order.indexOf(id) === i)
     : [];
-  const single = String(chart.single || "").toUpperCase();
   const book = String(src.bookSymbol || "").toUpperCase();
   const watch = src.watch && typeof src.watch === "object" ? src.watch : {};
   return {
     order: order.length ? order : ["risk", "positions", "orders", "charts"],
     collapsed,
     density: src.density === "compact" ? "compact" : "comfortable",
-    chart: {
-      view: WS_CHART_VIEWS.includes(chart.view) ? chart.view : "grid",
-      interval: WS_INTERVALS.includes(String(chart.interval)) ? String(chart.interval) : "15",
-      single: WS_SYMBOL_RE.test(single) ? single : "BTCUSDT",
-    },
+    // Multi-chart workspace (layout/slots/links/zoom/fullscreen/track sizes).
+    // Sanitized by the chart module's own pure sanitizer; the second argument
+    // migrates the pre-multi-chart shape ({view,interval,single}) losslessly.
+    charts: mcSanitizeCharts(src.charts, src.chart),
     tab: WS_TABS.includes(src.tab) ? src.tab : "dashboard",
     bookSymbol: WS_SYMBOL_RE.test(book) ? book : "",
     // Watchlist VIEW the workspace remembers (which list is selected, plus its
@@ -6815,6 +6285,10 @@ function wsSanitizeState(raw) {
     // workspace only remembers how the tab was being viewed (§same contract
     // as `watch` above). Sanitized by the scanner's own pure sanitizer.
     scanner: scSanitizeViewState(src.scanner),
+    // Risk-tab VIEW (allocation chart type, table sort, history metric) —
+    // same contract; the alert-armed switch is account-level and lives in
+    // its own store, not the workspace.
+    risk: rkSanitizeViewState(src.risk),
   };
 }
 
@@ -6982,7 +6456,7 @@ function wsCaptureState() {
     st.collapsed[sec.dataset.wpanel] = sec.classList.contains("collapsed");
   });
   st.density = document.body.classList.contains("density-compact") ? "compact" : "comfortable";
-  st.chart = { view: chartState.view, interval: chartState.interval, single: chartState.single };
+  st.charts = mcCaptureState();
   const activeTab = document.querySelector("#tabs .tab.active");
   if (activeTab && activeTab.dataset.tab) st.tab = activeTab.dataset.tab;
   st.bookSymbol = state.activeSymbol || "";
@@ -6991,12 +6465,13 @@ function wsCaptureState() {
     filter: _wlView.filter, sort: _wlView.sort, dir: _wlView.dir,
   };
   st.scanner = scCaptureViewState();
+  st.risk = rkCaptureViewState();
   return wsSanitizeState(st);
 }
 
-// Apply a state to the live UI. Chart view/interval/symbol and the tab are
-// applied by CLICKING the existing controls (skipped when already active), so
-// no second code path exists for them; everything else is class/DOM order.
+// Apply a state to the live UI. The multi-chart module applies its own state
+// (mcApplyState — sanitize, rebuild, restart polling); the tab is applied by
+// CLICKING the existing control; everything else is class/DOM order.
 function wsApplyState(rawState, opts = {}) {
   const st = wsSanitizeState(rawState);
   const main = document.querySelector(".workspace-main");
@@ -7010,15 +6485,7 @@ function wsApplyState(rawState, opts = {}) {
   }
   Object.keys(_wsPanelCtl).forEach((id) => _wsPanelCtl[id].setCollapsed(!!st.collapsed[id]));
   document.body.classList.toggle("density-compact", st.density === "compact");
-  const clickIfInactive = (sel) => {
-    const b = document.querySelector(sel);
-    if (b && !b.classList.contains("active")) b.click();
-  };
-  clickIfInactive(`#chart-view button[data-view="${st.chart.view}"]`);
-  if (st.chart.view === "single") {
-    clickIfInactive(`#chart-sym button[data-sym="${CSS.escape(st.chart.single)}"]`);
-  }
-  clickIfInactive(`#chart-iv button[data-iv="${st.chart.interval}"]`);
+  mcApplyState(st.charts);
   const tabBtn = document.querySelector(`#tabs .tab[data-tab="${st.tab}"]`);
   if (tabBtn && !tabBtn.classList.contains("active")) tabBtn.click();
   if (st.bookSymbol && st.bookSymbol !== state.activeSymbol) setActiveSymbol(st.bookSymbol);
@@ -7040,6 +6507,8 @@ function wsApplyState(rawState, opts = {}) {
   }
   // Restore this workspace's scanner view (preset/sort/filters/cards/scroll).
   scApplyViewState(st.scanner);
+  // Restore this workspace's risk view (allocation/sort/history metric).
+  rkApplyViewState(st.risk);
   wsUpdateEmptyState();
   if (!opts.noAnim) {
     const pane = document.querySelector("main .pane:not([hidden])");
@@ -7302,10 +6771,7 @@ function wireWorkspaces() {
   }
 
   // ---- Auto-save hooks for the non-panel parts of a workspace ----
-  ["chart-view", "chart-iv", "chart-sym"].forEach((cid) => {
-    const el = document.getElementById(cid);
-    if (el) el.addEventListener("click", (e) => { if (e.target.closest("button")) wsAutoSave(); });
-  });
+  // (Chart mutations auto-save themselves via the chart module's mcAutoSave.)
   const tabs = document.getElementById("tabs");
   if (tabs) {
     tabs.addEventListener("click", () => wsAutoSave());
@@ -7518,8 +6984,47 @@ function wireCommandPalette() {
     document.querySelectorAll("#ccy-toggle button").forEach((b) => {
       acts.push({ label: `Display currency: ${b.dataset.ccy}`, hint: "display", run: () => b.click() });
     });
+    // Multi-chart actions — layout/display state only; none can reach a write.
+    const gotoDash = () => {
+      const pane = document.querySelector('[data-pane="dashboard"]');
+      const tab = document.querySelector('#tabs .tab[data-tab="dashboard"]');
+      if (pane && pane.hidden && tab) tab.click();
+    };
+    MC_LAYOUT_IDS.forEach((id, k) => {
+      if (mcState.layout !== id) {
+        acts.push({
+          label: `Chart layout: ${MC_LAYOUT_TITLES[id]}`, hint: `alt+${k + 1}`,
+          run: () => { gotoDash(); mcSetLayout(id); },
+        });
+      }
+    });
+    MC_LINK_KINDS.forEach((kind) => {
+      acts.push({
+        label: `Charts: ${kind} sync ${mcState.links[kind] ? "off" : "on"}`, hint: "link",
+        run: () => mcToggleLink(kind),
+      });
+    });
+    acts.push({ label: "Add chart", hint: "charts", run: () => { gotoDash(); mcAddChart(); } });
+    acts.push({ label: "Duplicate focused chart", hint: "charts", run: () => { gotoDash(); mcDuplicateChart(mcState.focus); } });
+    acts.push({
+      label: "Change chart symbol…", hint: "charts",
+      run: () => {
+        gotoDash();
+        setTimeout(() => {
+          const card = document.querySelector(`#mc-grid .mc-card[data-idx="${mcState.focus}"] [data-mc="sym"]`);
+          if (card) mcOpenPicker(mcState.focus, card);
+        }, 0);
+      },
+    });
+    acts.push({ label: "Fullscreen focused chart", hint: "F", run: () => { gotoDash(); mcToggleChartFullscreen(mcState.focus); } });
+    acts.push({ label: "Reset chart zoom (all)", hint: "R", run: mcResetZoomAll });
+    mcState.slots.forEach((s, i) => {
+      if (i !== mcState.focus) {
+        acts.push({ label: `Focus chart ${i + 1}: ${s.symbol} ${mcIvLabel(s.interval)}`, hint: "charts", run: () => { gotoDash(); mcSetFocus(i); } });
+      }
+    });
     const expand = document.getElementById("chart-expand");
-    if (expand) acts.push({ label: "Expand / collapse charts", hint: "esc exits", run: () => expand.click() });
+    if (expand) acts.push({ label: "Expand / collapse charts panel", hint: "esc exits", run: () => { gotoDash(); expand.click(); } });
     [["history-refresh", "Refresh journal"],
      ["account-refresh", "Refresh account"]].forEach(([id, label]) => {
       const b = document.getElementById(id);
@@ -7568,6 +7073,23 @@ function wireCommandPalette() {
       label: document.body.classList.contains("density-compact")
         ? "Table density: comfortable" : "Table density: compact",
       hint: "display", run: toggleDensity,
+    });
+    // Risk actions — display/notify-only; none can reach a write.
+    acts.push({
+      label: _rkArmed ? "Risk alerts: disarm" : "Risk alerts: arm", hint: "notify only",
+      run: () => { const b = document.getElementById("rk-alerts-toggle"); if (b) b.click(); },
+    });
+    RK_ALLOC_VIEWS.forEach((v) => {
+      if (_rkView.alloc !== v) {
+        acts.push({
+          label: `Risk allocation view: ${v}`, hint: "risk",
+          run: () => {
+            const tab = document.querySelector('#tabs .tab[data-tab="risk"]');
+            if (tab && !tab.classList.contains("active")) tab.click();
+            setTimeout(() => { const b = document.querySelector(`[data-rkalloc="${v}"]`); if (b) b.click(); }, 0);
+          },
+        });
+      }
     });
     acts.push({
       label: "Notifications", hint: "log",
@@ -7745,6 +7267,7 @@ document.addEventListener("keydown", (e) => {
   wireWatchlist(); // Watchlist & market monitor (loads _wlDoc BEFORE workspaces apply their saved view)
   wireScanner(); // Market scanner (loads _scDoc BEFORE workspaces apply their saved view)
   wireCharts(); // live candlestick charts (read-only; polls while dashboard visible)
+  wireRisk(); // risk command center (feeds off the shared dashboard snapshot)
   wireWorkspaces(); // multi-workspace system: load/migrate, apply active layout
   wireCommandPalette(); // Ctrl/Cmd+K — navigation & display actions only
   wireNotifCenter(); // session notification log (every toast, recoverable)

@@ -5,7 +5,12 @@
 import fs from "node:fs";
 import assert from "node:assert/strict";
 
-const src = fs.readFileSync(new URL("../app/static/app.js", import.meta.url), "utf8");
+// app.js + charts.js + risk.js share one global scope in the browser (plain
+// scripts); concatenating them here mirrors that, so cross-file references
+// (e.g. wsSanitizeState → mcSanitizeCharts / rkSanitizeViewState) extract.
+const src = fs.readFileSync(new URL("../app/static/charts.js", import.meta.url), "utf8") +
+  "\n" + fs.readFileSync(new URL("../app/static/risk.js", import.meta.url), "utf8") +
+  "\n" + fs.readFileSync(new URL("../app/static/app.js", import.meta.url), "utf8");
 
 function extractFn(name) {
   const start = src.search(new RegExp(`function ${name}\\s*\\(`));
@@ -96,17 +101,24 @@ function extractConst(name) {
   if (!m) throw new Error(`const ${name} not found in app.js`);
   return m[0];
 }
-const wsConsts = ["WS_SCHEMA_VERSION", "WS_MAX", "WS_PANEL_IDS", "WS_TABS",
-  "WS_CHART_VIEWS", "WS_INTERVALS", "WS_SYMBOL_RE",
+const wsConsts = ["WS_SCHEMA_VERSION", "WS_MAX", "WS_PANEL_IDS", "WS_TABS", "WS_SYMBOL_RE",
   // wsSanitizeState also references the watchlist view allowlists…
   "WL_FILTERS", "WL_SORTS",
-  // …and the scanner view sanitizer + its allowlists.
-  "SC_SYMBOL_RE", "SC_METRICS", "SC_SORTS", "SC_PRESETS", "SC_SECTION_IDS"].map(extractConst).join("\n");
-const wsFns = ["wsId", "scSanitizeViewState", "wsSanitizeState", "wsMakeWorkspace", "wsSanitizeWorkspace",
+  // …the scanner view sanitizer + its allowlists…
+  "SC_SYMBOL_RE", "SC_METRICS", "SC_SORTS", "SC_PRESETS", "SC_SECTION_IDS",
+  // …the multi-chart sanitizer's vocabulary (charts.js)…
+  "MC_LAYOUT_IDS", "MC_LAYOUT_SLOTS", "MC_LAYOUT_GRID", "MC_INTERVAL_CODES",
+  "MC_SYMBOL_RE", "MC_MIN_SPAN", "MC_MAX_SPAN", "MC_DEFAULT_SPAN",
+  "MC_LINK_KINDS", "MC_DEFAULT_SYMBOLS",
+  // …and the risk view sanitizer's allowlists (risk.js).
+  "RK_ALLOC_VIEWS", "RK_HIST_METRICS", "RK_SORTS"].map(extractConst).join("\n");
+const wsFns = ["wsId", "scSanitizeViewState", "mcSlotId", "mcNewSlot", "mcSanitizeCharts",
+  "rkSanitizeViewState",
+  "wsSanitizeState", "wsMakeWorkspace", "wsSanitizeWorkspace",
   "wsNewDoc", "wsMigrateFromV1", "wsParseDoc", "wsValidateImport",
   "wsCreate", "wsDuplicate", "wsRename", "wsDelete"].map(extractFn).join("\n");
 const WS = new Function(wsConsts + "\n" + wsFns +
-  "\nreturn { wsSanitizeState, wsNewDoc, wsMigrateFromV1, wsParseDoc, wsValidateImport, wsCreate, wsDuplicate, wsRename, wsDelete };")();
+  "\nreturn { wsSanitizeState, wsNewDoc, wsMigrateFromV1, wsParseDoc, wsValidateImport, wsCreate, wsDuplicate, wsRename, wsDelete, mcSanitizeCharts };")();
 
 // New document: one Default workspace, active, schema v2.
 let doc = WS.wsNewDoc();
@@ -169,6 +181,7 @@ assert.equal(rt.doc.workspaces.length, d2.workspaces.length);
 assert.equal(rt.doc.activeId, d2.activeId);
 
 // State sanitization: hostile/garbage values are coerced to safe defaults.
+// (`chart` is the LEGACY single-chart shape — it must still migrate.)
 const dirty = WS.wsSanitizeState({
   order: ["positions", "positions", "<script>", "charts"],
   collapsed: { charts: true, evil: true },
@@ -180,11 +193,18 @@ const dirty = WS.wsSanitizeState({
 assert.deepEqual(dirty.order, ["positions", "charts"], "unknown/dup panel ids dropped");
 assert.deepEqual(Object.keys(dirty.collapsed), ["charts"]);
 assert.equal(dirty.density, "comfortable");
-assert.equal(dirty.chart.view, "grid");
-assert.equal(dirty.chart.interval, "15");
-assert.equal(dirty.chart.single, "BTCUSDT");
+assert.equal(dirty.charts.layout, "3", "garbage legacy view falls back to the default grid");
+assert.equal(dirty.charts.slots.length, 3);
+assert.ok(dirty.charts.slots.every((s) => s.interval === "15"), "bad legacy interval → default");
 assert.equal(dirty.tab, "dashboard");
 assert.equal(dirty.bookSymbol, "");
+
+// Legacy single-view migration keeps the user's symbol + interval.
+const legacySingle = WS.wsSanitizeState({ chart: { view: "single", interval: "60", single: "solusdt" } });
+assert.equal(legacySingle.charts.layout, "1");
+assert.equal(legacySingle.charts.slots.length, 1);
+assert.equal(legacySingle.charts.slots[0].symbol, "SOLUSDT");
+assert.equal(legacySingle.charts.slots[0].interval, "60");
 
 // Import validation: accepts the export envelope + bare workspaces; rejects junk.
 assert.equal(WS.wsValidateImport(null), null);
@@ -197,6 +217,266 @@ assert.ok(imp && imp.name === "Research" && imp.state.tab === "history");
 assert.ok(imp.id.startsWith("ws_"), "import mints a FRESH id");
 const bare = WS.wsValidateImport({ name: "Bare", state: { density: "compact" } });
 assert.ok(bare && bare.state.density === "compact");
+
+// ---------------------------------------------------------------------------
+// Multi-chart core (charts.js) — mcSanitizeCharts is the trust boundary for
+// everything the chart grid renders and everything workspaces persist.
+// ---------------------------------------------------------------------------
+const MC = { mcSanitizeCharts: WS.mcSanitizeCharts };
+
+// Defaults: no input → the 3-chart focus layout with sane links.
+let mc = MC.mcSanitizeCharts(null);
+assert.equal(mc.layout, "3");
+assert.equal(mc.slots.length, 3);
+assert.deepEqual(mc.slots.map((s) => s.symbol), ["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+assert.deepEqual(mc.links, { symbol: false, interval: false, crosshair: true, zoom: false });
+assert.equal(mc.focus, 0);
+assert.equal(mc.fs, "");
+assert.equal(mc.panelFull, false);
+const ids = new Set(mc.slots.map((s) => s.id));
+assert.equal(ids.size, 3, "slot ids are unique");
+
+// Round-trip: a valid document survives unchanged in the fields that matter.
+mc.slots[1].symbol = "DOGEUSDT";
+mc.slots[1].interval = "240";
+mc.slots[1].span = 60;
+mc.links.symbol = true;
+mc.fs = mc.slots[1].id;
+mc.focus = 1;
+mc.tracks = { "3": { c: [1.5, 1], r: [1, 1] } };
+let rt2 = MC.mcSanitizeCharts(mc);
+assert.equal(rt2.slots[1].symbol, "DOGEUSDT");
+assert.equal(rt2.slots[1].interval, "240");
+assert.equal(rt2.slots[1].span, 60);
+assert.equal(rt2.slots[1].id, mc.slots[1].id, "ids are stable across round-trips");
+assert.equal(rt2.links.symbol, true);
+assert.equal(rt2.fs, mc.slots[1].id);
+assert.equal(rt2.focus, 1);
+assert.deepEqual(rt2.tracks["3"], { c: [1.5, 1], r: [1, 1] });
+
+// Hostile/garbage input: everything coerces to safe values.
+mc = MC.mcSanitizeCharts({
+  layout: "999",
+  slots: [
+    { symbol: "btc<img>", interval: "13", span: 1e9, id: "x".repeat(99) },
+    { symbol: "ethusdt", interval: "60", span: -5, linked: false },
+    "junk",
+  ],
+  links: { symbol: "yes", drawings: true },
+  focus: 42,
+  fs: "nonexistent",
+  panelFull: "sure",
+  tracks: { "4": { c: [0, 900], r: [1, 1] }, evil: { c: [1], r: [1] } },
+});
+assert.equal(mc.layout, "3", "unknown layout → default");
+assert.equal(mc.slots.length, 3, "layout capacity respected");
+assert.equal(mc.slots[0].symbol, "BTCUSDT", "invalid symbol → positional default");
+assert.equal(mc.slots[0].interval, "15", "invalid interval → default");
+assert.equal(mc.slots[0].span, 400, "span clamped to MC_MAX_SPAN");
+assert.ok(/^[A-Za-z0-9_-]{1,24}$/.test(mc.slots[0].id), "oversized id regenerated");
+assert.equal(mc.slots[1].symbol, "ETHUSDT");
+assert.equal(mc.slots[1].span, 20, "span clamped to MC_MIN_SPAN");
+assert.equal(mc.slots[1].linked, false);
+assert.equal(mc.slots[2].linked, true, "junk slot → defaults, linked by default");
+assert.equal(mc.links.symbol, true, "truthy link coerced to boolean");
+assert.ok(!("drawings" in mc.links), "unknown link kinds dropped");
+assert.equal(mc.focus, 0, "out-of-range focus reset");
+assert.equal(mc.fs, "", "fullscreen id must reference a real slot");
+assert.equal(mc.panelFull, true);
+assert.deepEqual(mc.tracks["4"], { c: [1, 1], r: [1, 1] },
+  "out-of-range track fractions fall back to equal tracks (valid axis kept)");
+assert.ok(!("evil" in mc.tracks), "unknown layout keys dropped");
+
+// Slot overflow: more slots than the layout holds are truncated, dup ids re-minted.
+mc = MC.mcSanitizeCharts({
+  layout: "2h",
+  slots: [{ id: "same", symbol: "AUSDT" }, { id: "same", symbol: "BUSDT" }, { symbol: "CUSDT" }],
+});
+assert.equal(mc.slots.length, 2);
+assert.notEqual(mc.slots[0].id, mc.slots[1].id, "duplicate slot ids regenerated");
+
+// Legacy migration (grid): three default charts at the saved interval.
+mc = MC.mcSanitizeCharts(null, { view: "grid", interval: "5", single: "BTCUSDT" });
+assert.equal(mc.layout, "3");
+assert.ok(mc.slots.every((s) => s.interval === "5"));
+
+// Legacy migration (single): one chart, the saved symbol.
+mc = MC.mcSanitizeCharts(null, { view: "single", interval: "1", single: "dogeusdt" });
+assert.equal(mc.layout, "1");
+assert.equal(mc.slots.length, 1);
+assert.equal(mc.slots[0].symbol, "DOGEUSDT");
+assert.equal(mc.slots[0].interval, "1");
+
+// ---------------------------------------------------------------------------
+// Risk core (risk.js) — the metrics/score/alert math behind the Risk tab.
+// Money-adjacent display logic: wrong numbers here misinform risk decisions,
+// so every derivation is pinned. DOM-free, extracted from source.
+// ---------------------------------------------------------------------------
+const rkConsts = ["RK_BANDS", "RK_BAND_LABELS", "RK_ALLOC_VIEWS", "RK_HIST_METRICS",
+  "RK_SORTS", "RK_ALERT_COOLDOWN_MS"].map(extractConst).join("\n");
+const rkFns = ["walletAccount", "rkNum", "rkComputeMetrics", "rkRiskScore",
+  "rkEvalAlerts", "rkDiffEvents", "rkSanitizeViewState"].map(extractFn).join("\n");
+const RK = new Function(rkConsts + "\n" + rkFns +
+  "\nreturn { rkComputeMetrics, rkRiskScore, rkEvalAlerts, rkDiffEvents, rkSanitizeViewState };")();
+const RK_ROUNDTRIP_BANDS = ["safe", "moderate", "high", "critical"];
+const RK_COOLDOWN = 15 * 60_000; // mirrors RK_ALERT_COOLDOWN_MS
+
+const balanceOf = (acct) => ({ result: { list: [acct] } });
+const snap = {
+  positions: [
+    { symbol: "BTCUSDT", side: "Buy", size: "0.5", positionValue: "50000", leverage: "10",
+      markPrice: "100000", liqPrice: "90000", unrealisedPnl: "1000", avgPrice: "98000" },
+    { symbol: "ETHUSDT", side: "Sell", size: "10", positionValue: "30000", leverage: "5",
+      markPrice: "3000", liqPrice: "3900", unrealisedPnl: "-500", avgPrice: "3050" },
+    { symbol: "SOLUSDT", side: "Buy", size: "100", positionValue: "20000", leverage: "4",
+      markPrice: "200", unrealisedPnl: "1000", positionIM: "5000" },
+    { symbol: "GHOST", side: "Buy", size: "0" }, // flat rows never count
+  ],
+  balance: balanceOf({
+    totalEquity: "100000", totalAvailableBalance: "80000", totalInitialMargin: "10000",
+    totalMaintenanceMargin: "2000", totalMarginBalance: "100000", totalPerpUPL: "1500",
+    accountMMRate: "0.02",
+  }),
+  errors: {},
+};
+let rm = RK.rkComputeMetrics(snap);
+assert.equal(rm.count, 3, "flat rows excluded");
+assert.equal(rm.exposure.gross, 100000);
+assert.equal(rm.exposure.net, 40000, "long 70k − short 30k");
+assert.equal(rm.exposure.long, 70000);
+assert.equal(rm.exposure.short, 30000);
+assert.ok(Math.abs(rm.exposure.longPct - 70) < 1e-9);
+// Concentration: shares 50/30/20 → HHI = (2500+900+400)/100 = 38.
+assert.equal(rm.concentration.largestSymbol, "BTCUSDT");
+assert.ok(Math.abs(rm.concentration.largestShare - 50) < 1e-9);
+assert.ok(Math.abs(rm.concentration.top3Share - 100) < 1e-9);
+assert.ok(Math.abs(rm.concentration.hhi - 38) < 1e-9);
+// Liquidation distances: BTC |100000−90000|/100000 = 10%; ETH |3000−3900|/3000 = 30%.
+assert.equal(rm.liq.nearest.symbol, "BTCUSDT");
+assert.ok(Math.abs(rm.liq.nearest.dist - 10) < 1e-9);
+assert.equal(rm.liq.farthest.symbol, "ETHUSDT");
+assert.equal(rm.liq.covered, 2, "SOL has no liq price → excluded, never invented");
+assert.ok(Math.abs(rm.liq.avg - 20) < 1e-9);
+// Margin: util = IM/marginBal = 10%; exchange MM rate wins for health.
+assert.ok(Math.abs(rm.margin.util - 10) < 1e-9);
+assert.ok(Math.abs(rm.margin.mmPct - 2) < 1e-9);
+// Portfolio leverage = gross/equity = 1.0x; UPL% of equity = 1.5%.
+assert.ok(Math.abs(rm.leverage.portfolio - 1) < 1e-9);
+assert.ok(Math.abs(rm.leverage.uplPctEquity - 1.5) < 1e-9);
+// Per-position: exchange positionIM is used verbatim; missing one is estimated.
+const solRow = rm.positions.find((p) => p.symbol === "SOLUSDT");
+assert.equal(solRow.im, 5000);
+assert.equal(solRow.imIsEstimate, false);
+const btcRow = rm.positions.find((p) => p.symbol === "BTCUSDT");
+assert.equal(btcRow.im, 5000, "estimated as value/leverage");
+assert.equal(btcRow.imIsEstimate, true);
+
+// Risk score: available factors only, weights renormalized.
+let score = RK.rkRiskScore(rm);
+assert.ok(score.score >= 0 && score.score <= 100);
+assert.ok(RK_ROUNDTRIP_BANDS.includes(score.band));
+assert.equal(score.factors.length, 5, "all five factors present");
+assert.ok(score.factors.every((f) => f.score == null || (f.score >= 0 && f.score <= 100)));
+
+// Flat book → 0 / Safe, with an explanation instead of fake precision.
+score = RK.rkRiskScore(RK.rkComputeMetrics({ positions: [], balance: snap.balance, errors: {} }));
+assert.equal(score.score, 0);
+assert.equal(score.band, "safe");
+assert.ok(score.note && /no open positions/i.test(score.note));
+
+// Missing balance: money factors drop out and the score renormalizes over
+// what is actually known (liq + concentration here) — never fabricated.
+const noBal = RK.rkComputeMetrics({ positions: snap.positions, balance: null, errors: {} });
+assert.equal(noBal.margin.util, null);
+assert.equal(noBal.leverage.portfolio, null);
+score = RK.rkRiskScore(noBal);
+const usable = score.factors.filter((f) => f.score != null).map((f) => f.key).sort();
+assert.deepEqual(usable, ["conc", "liq"], "only derivable factors count");
+// liq: 100−10×4 = 60 (w25) · conc: (50−30)×100/70 ≈ 28.6 (w15) → ≈ 48.
+assert.ok(Math.abs(score.score - Math.round((60 * 25 + (20 * 100 / 70) * 15) / 40)) <= 1);
+
+// Critical portfolio: high util + near liq + concentrated + levered + deep loss.
+const hot = RK.rkComputeMetrics({
+  positions: [{ symbol: "BTCUSDT", side: "Buy", size: "1", positionValue: "900000",
+    leverage: "25", markPrice: "100000", liqPrice: "97500", unrealisedPnl: "-9000" }],
+  balance: balanceOf({ totalEquity: "60000", totalAvailableBalance: "3000",
+    totalInitialMargin: "57000", totalMarginBalance: "60000", totalPerpUPL: "-9000" }),
+  errors: {},
+});
+score = RK.rkRiskScore(hot);
+assert.equal(score.band, "critical");
+assert.ok(score.score >= 75);
+
+// Alert engine: rising edge + hysteresis + cooldown (pure, custom def).
+const defs = [{ id: "t", level: "warn", dir: "gte", on: 70, off: 65,
+  value: (m) => m.v, msg: (v) => `v=${v}` }];
+let ast = { active: {}, lastFired: {} };
+let ar = RK.rkEvalAlerts({ v: 72 }, null, ast, 1000, defs);
+assert.equal(ar.fired.length, 1, "fires on the rising edge");
+ast = ar.state;
+ar = RK.rkEvalAlerts({ v: 80 }, null, ast, 2000, defs);
+assert.equal(ar.fired.length, 0, "no re-fire while active");
+ast = ar.state;
+ar = RK.rkEvalAlerts({ v: 66 }, null, ast, 3000, defs);
+assert.equal(ar.fired.length, 0);
+assert.ok(ar.state.active.t, "hysteresis: 66 ≥ off(65) stays active");
+ast = ar.state;
+ar = RK.rkEvalAlerts({ v: 60 }, null, ast, 4000, defs);
+assert.ok(!ar.state.active.t, "clears below off threshold");
+ast = ar.state;
+ar = RK.rkEvalAlerts({ v: 90 }, null, ast, 5000, defs);
+assert.equal(ar.fired.length, 0, "re-arm inside the cooldown stays silent");
+ast = ar.state;
+ar = RK.rkEvalAlerts({ v: 60 }, null, ast, 6000, defs);
+ast = ar.state;
+ar = RK.rkEvalAlerts({ v: 90 }, null, ast, 1000 + RK_COOLDOWN + 1, defs);
+assert.equal(ar.fired.length, 1, "fires again after the cooldown");
+assert.equal(ar.fired[0].msg, "v=90");
+// A null value (missing data) can never hold an alert active.
+ar = RK.rkEvalAlerts({ v: null }, null, { active: { t: true }, lastFired: {} }, 1, defs);
+assert.equal(ar.fired.length, 0);
+assert.ok(!ar.state.active.t);
+
+// Timeline diff: open/close/resize + margin band cross + score band change.
+const prevM = RK.rkComputeMetrics(snap);
+const nextSnap = JSON.parse(JSON.stringify(snap));
+nextSnap.positions = nextSnap.positions.filter((p) => p.symbol !== "ETHUSDT"); // closed
+nextSnap.positions[0].size = "1.0"; // BTC increased
+nextSnap.positions.push({ symbol: "XRPUSDT", side: "Buy", size: "1000", positionValue: "5000" });
+nextSnap.balance = balanceOf({ ...snap.balance.result.list[0], totalInitialMargin: "72000" });
+const nextM = RK.rkComputeMetrics(nextSnap);
+const evs = RK.rkDiffEvents(prevM, nextM,
+  { band: "safe", label: "Safe", score: 10 }, { band: "high", label: "High", score: 60 });
+const msgs = evs.map((e) => e.msg).join(" | ");
+assert.ok(/Position closed: ETHUSDT/.test(msgs));
+assert.ok(/Position increased: BTCUSDT/.test(msgs));
+assert.ok(/Position opened: XRPUSDT/.test(msgs));
+assert.ok(/utilization rose above 70%/.test(msgs));
+assert.ok(/Risk score → High/.test(msgs));
+
+// Liquidation band-cross direction: getting CLOSER is the danger message.
+const mkLiq = (dist) => RK.rkComputeMetrics({
+  positions: [{ symbol: "BTCUSDT", side: "Buy", size: "1", positionValue: "1000",
+    markPrice: "100", liqPrice: String(100 - dist) }],
+  balance: snap.balance, errors: {},
+});
+let liqEvs = RK.rkDiffEvents(mkLiq(12), mkLiq(8));
+assert.ok(liqEvs.some((e) => /closer than 10%/.test(e.msg) && e.level === "warn"),
+  "12% → 8% must warn about closing in on liquidation");
+liqEvs = RK.rkDiffEvents(mkLiq(8), mkLiq(12));
+assert.ok(liqEvs.some((e) => /beyond 10% away/.test(e.msg) && e.level === "pos"),
+  "8% → 12% is the safe direction");
+// Partial snapshots never diff (a failed read must not read as "all closed").
+assert.deepEqual(RK.rkDiffEvents(prevM, RK.rkComputeMetrics({ positions: [], balance: null, errors: { positions: "boom" } })), []);
+
+// View-state sanitize: garbage → defaults; valid values survive.
+let rv = RK.rkSanitizeViewState({ alloc: "pie3d", sort: "evil", dir: "up", hist: "vibes" });
+assert.deepEqual(rv, { alloc: "donut", sort: "value", dir: "desc", hist: "score" });
+rv = RK.rkSanitizeViewState({ alloc: "map", sort: "liq", dir: "asc", hist: "util" });
+assert.deepEqual(rv, { alloc: "map", sort: "liq", dir: "asc", hist: "util" });
+// …and it rides the workspace state end-to-end.
+const wsWithRisk = WS.wsSanitizeState({ risk: { alloc: "bars", sort: "lev", dir: "asc", hist: "equity" } });
+assert.deepEqual(wsWithRisk.risk, { alloc: "bars", sort: "lev", dir: "asc", hist: "equity" });
 
 // ---------------------------------------------------------------------------
 // Watchlist document operations — the PURE core of the Watchlist & Market

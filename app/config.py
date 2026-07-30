@@ -130,13 +130,13 @@ class Settings:
         self.MARKET_DATA_BASE_URL: str = os.environ.get(
             "MARKET_DATA_BASE_URL", "https://api.bybit.com"
         ).rstrip("/")
-        # Whitelist of symbols the chart endpoint may serve. The proxy refuses
-        # anything not on this list, so it can never be used to fetch arbitrary
-        # symbols/markets (defence-in-depth against an open relay). NOTE: the
-        # frontend keeps a matching display list (CHART_SYMBOLS in app.js, with
-        # per-symbol label/decimals) — keep the two in sync. A symbol added here
-        # but not there simply won't render; one removed here is rejected and its
-        # chart stays empty (handled gracefully, never a hard error).
+        # Static allowlist of chart symbols that are ALWAYS servable, even when
+        # the scanner is disabled or still warming up. When the scanner is
+        # running, the kline proxy additionally accepts any symbol the scanner
+        # has observed in the venue's live ticker universe — a bounded,
+        # venue-real set — so every real market charts without env changes
+        # while the proxy still can never relay an arbitrary string
+        # (defence-in-depth against an open relay; see app/market_data.py).
         self.CHART_SYMBOLS: list[str] = _csv_env(
             "CHART_SYMBOLS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
         )

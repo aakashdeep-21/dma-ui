@@ -23,8 +23,53 @@ All credentials live in environment variables.
   reduce-only, live order-book ladder with click-to-fill, instrument spec strip.
 - ✂️ **Partial close**: close 25 / 50 / 75 / 100% of a position — the server
   re-derives the live size and floors the slice to the instrument's lot step.
-- 🕯️ **Live candlestick charts** (public Bybit klines via a whitelisted,
-  unsigned proxy — see the region note below).
+- 🕯️ **Multi-chart workspace**: TradingView-style chart grid on the dashboard —
+  eight layouts (1 / 2 side-by-side / 2 stacked / focus+2 / 2×2 / 3×2 / 4×2 /
+  3×3, `⌥1–8`), each chart with its **own symbol, interval (1m–1D), zoom and
+  pan** (wheel zooms, drag pans history, double-click resets). Symbol search
+  covers the whole live universe (recents + watchlist + all markets); charts
+  can be **linked** (symbol / interval / crosshair / zoom sync, opt-out per
+  chart), swapped by drag, resized at the seams, duplicated, screenshotted to
+  PNG, and taken fullscreen per chart or per panel. Everything (layout, slots,
+  links, track sizes, fullscreen) persists **per workspace**. Data stays
+  shared: N charts on one market cost one poll (public Bybit klines via an
+  unsigned, server-validated proxy — see the region note below), and cadence
+  follows the candle interval.
+- 🛡️ **Risk command center** (the *Risk* tab): a portfolio risk dashboard fed
+  by the SAME live snapshot the tables render (zero extra polling). Weighted
+  0–100 **risk score** with an explained factor breakdown (margin utilization,
+  liquidation proximity, portfolio leverage, concentration, unrealized loss —
+  weights renormalize over the factors actually available, nothing is ever
+  fabricated), KPI strip (equity, available/used margin, realized today,
+  portfolio leverage, account MM rate), exposure & allocation (donut / bars /
+  PnL-heat map), concentration meters (largest / top-3 / HHI), per-position
+  liquidation-distance heat bars, margin utilization meter with 70/90% alert
+  ticks, a sortable position-risk table (exchange `positionIM` used verbatim,
+  estimates marked "~"), daily realized stats + fees/funding from the history
+  mirror, session drawdown/equity tracking, a risk-event timeline, and
+  session-local history sparklines. **Risk alerts** (margin ≥70/90%, liq <10/5%,
+  score critical, concentration, large loss, high leverage) fire as toasts +
+  notification-center entries with hysteresis and a 15-min cooldown — armable/
+  disarmable, and **never** able to place, modify or cancel an order. Every
+  figure is labeled exchange-actual vs derived vs session-local; view choices
+  persist per workspace.
+- 🔎 **Market Scanner** (the *Scan* tab): a live intelligence dashboard over the
+  whole tradable universe. A background sampler polls the full ticker list —
+  **one** read-only request per `SCANNER_SAMPLE_INTERVAL` (default 10 s) no
+  matter how many tabs are open — and keeps a rolling in-memory history so the
+  UI can show 5m/15m/1h changes, realized volatility, volume acceleration and
+  funding drift *honestly* (a metric renders as "—" until its window has warmed
+  up or if the venue doesn't supply it; nothing is fabricated). Includes
+  overview cards (top movers/losers, volume, volatility, funding, recently
+  active, watchlist movers, recent alerts — collapsible & drag-to-rearrange), a
+  virtualized sortable screener with fuzzy search, numeric filters, built-in
+  presets (momentum, breakouts, mean-reversion, high volume, caps, …), a saved
+  **custom-scan rule builder** (AND/OR conditions over any metric), and
+  **scanner alerts** (enters top-N movers, volume doubles, volatility / 15m
+  move / funding thresholds) that notify via toasts + the notification center —
+  alerts and every other scanner control are display-only and can never place,
+  modify or cancel an order. Sorting, filters, preset, card layout, selection
+  and scroll position are remembered **per workspace**.
 - 🗄️ **History tab backed by MongoDB**: a background sync mirrors executions and
   closed PnL into Mongo every minute (cursor-free, time-windowed); the UI reads
   only the mirror, with range presets / custom dates / overall, an equity curve,
@@ -58,8 +103,14 @@ app/
   db.py            MongoDB access layer (history mirror)
   history_sync.py  background sync: exchange history -> MongoDB (every minute)
   notifier.py      Telegram execution alerts + operational alerts (opt-in)
-  market_data.py   public kline proxy for the charts (unsigned, whitelisted)
-  static/          login.html, index.html, app.js, styles.css
+  scanner.py       market-scanner engine: shared ticker sampler + rolling
+                   history + metric providers (serves /api/scanner from memory)
+  market_data.py   public kline proxy for the charts (unsigned; static
+                   allowlist + scanner-observed live universe)
+  static/          login.html, index.html, app.js, charts.js, risk.js,
+                   styles.css (charts.js = multi-chart workspace, risk.js =
+                   risk command center; both feed off shared data, no extra
+                   polling)
 tests/             pytest suite (+ tests/test_snap.mjs money-math regression)
 requirements.txt / requirements-dev.txt
 Procfile / railway.json   start command for Railway
@@ -84,7 +135,8 @@ Procfile / railway.json   start command for Railway
    - optional: `DMA_BASE_URL`, `CATEGORY`, `SETTLE_COIN`, `ACCOUNT_TYPE`,
      `POLL_INTERVAL`, `INR_RATE`, `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`,
      `SYNC_INTERVAL_SECONDS`, `SYNC_BACKFILL_DAYS`, `TRUSTED_PROXY_HOPS`,
-     `CHART_SYMBOLS` — every variable is documented in `.env.example`
+     `CHART_SYMBOLS`, `SCANNER_SAMPLE_INTERVAL`, `SCANNER_ENABLED` — every
+     variable is documented in `.env.example`
 4. Railway gives the service a public URL. Open it → log in.
 
 > `$PORT` is provided by Railway automatically; the start command already
@@ -99,7 +151,10 @@ Procfile / railway.json   start command for Railway
 `GET /healthz` returns whether all required env vars are configured, plus
 `historySyncAgeSeconds` per history collection — seconds since each Mongo
 mirror last completed a sync (normally under ~2× `SYNC_INTERVAL_SECONDS`; a
-climbing value means the sync is wedged and the History tab is going stale).
+climbing value means the sync is wedged and the History tab is going stale) —
+and `scannerAgeSeconds` (seconds since the market scanner's last ticker
+sample; normally ≈ `SCANNER_SAMPLE_INTERVAL`, null before the first sample or
+when the scanner is disabled).
 
 ### Running the tests
 
