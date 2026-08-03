@@ -41,6 +41,11 @@ JOURNAL = "Journal"
 JOURNAL_META = "Journal-Meta"
 _META_ID = "meta"
 
+# AI coach conversations (natural-language Q&A history). Small docs: title,
+# pinned flag, capped message list. Insights/briefings are NOT stored here —
+# they are cached in-process and regenerate from the data.
+AI_CONVERSATIONS = "AI-Conversations"
+
 _client: AsyncMongoClient | None = None
 _ca_temp_path: str | None = None
 
@@ -119,6 +124,10 @@ def _journal_meta():
     return get_client()[settings.MONGO_DB_NAME][JOURNAL_META]
 
 
+def _ai_convs():
+    return get_client()[settings.MONGO_DB_NAME][AI_CONVERSATIONS]
+
+
 async def ping() -> None:
     """Round-trip the server; raises if Mongo is unreachable/misconfigured."""
     await get_client().admin.command("ping")
@@ -142,6 +151,10 @@ async def ensure_indexes() -> None:
     # review-queue filter. (Journal-Meta is a singleton — _id is enough.)
     await _journal().create_indexes(models + [
         IndexModel([("reviewStatus", ASCENDING)], name="reviewStatus"),
+    ])
+    # Conversation list is served pinned-first, most-recently-touched first.
+    await _ai_convs().create_indexes([
+        IndexModel([("pinned", DESCENDING), ("updatedAtMs", DESCENDING)], name="pinned_updated"),
     ])
 
 
@@ -270,3 +283,51 @@ async def journal_meta_get() -> dict | None:
 
 async def journal_meta_set(doc: dict) -> None:
     await _journal_meta().replace_one({"_id": _META_ID}, doc, upsert=True)
+
+
+# --------------------------------------------------------------------------
+# AI conversations — same thin-seam philosophy (validation lives in the
+# service layer; tests monkeypatch these against an in-memory store).
+# --------------------------------------------------------------------------
+async def ai_conv_list(limit: int = 100) -> list[dict]:
+    """Conversation METADATA only (messages projected out — a list read must
+    stay small no matter how long the chats grew), pinned first then newest."""
+    cursor = (
+        _ai_convs()
+        .find({}, projection={"messages": 0})
+        .sort([("pinned", DESCENDING), ("updatedAtMs", DESCENDING)])
+        .limit(limit)
+    )
+    return await cursor.to_list(length=limit)
+
+
+async def ai_conv_get(conv_id: str) -> dict | None:
+    return await _ai_convs().find_one({"_id": conv_id})
+
+
+async def ai_conv_create(doc: dict) -> None:
+    await _ai_convs().insert_one(doc)
+
+
+async def ai_conv_update(conv_id: str, fields: dict) -> bool:
+    result = await _ai_convs().update_one({"_id": conv_id}, {"$set": fields})
+    return result.matched_count > 0
+
+
+async def ai_conv_append(conv_id: str, messages: list[dict], updated_ms: int,
+                         max_messages: int = 200) -> bool:
+    """Append exchange messages, keeping only the newest `max_messages` so a
+    conversation document can never grow unbounded."""
+    result = await _ai_convs().update_one(
+        {"_id": conv_id},
+        {
+            "$push": {"messages": {"$each": messages, "$slice": -max_messages}},
+            "$set": {"updatedAtMs": updated_ms},
+        },
+    )
+    return result.matched_count > 0
+
+
+async def ai_conv_delete(conv_id: str) -> bool:
+    result = await _ai_convs().delete_one({"_id": conv_id})
+    return result.deleted_count > 0

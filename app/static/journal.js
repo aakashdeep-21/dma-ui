@@ -350,6 +350,8 @@ function jnListShape(full) {
   const lessons = e.lessons || "";
   delete e.notes;
   delete e.lessons;
+  e.hasAiReview = !!e.aiReview;
+  delete e.aiReview;
   e.notesExcerpt = jnExcerptText(notes);
   e.lessonsExcerpt = jnExcerptText(lessons);
   e.noteWords = jnWordCount(notes);
@@ -1000,10 +1002,22 @@ function jnEditorHtml(trade, full) {
 
   const timeline = jnTimelineHtml(trade, fills, full);
 
+  // Server-generated AI review (written by /api/ai/trade-review only).
+  const aiReview = full && full.aiReview && full.aiReview.text
+    ? `<div class="jn-aireview"><h3>AI review` +
+      (full.aiReview.live === false ? ` <span class="muted">(rule-based)</span>` : "") +
+      `</h3><div class="jn-md">${jnMarkdown(full.aiReview.text)}</div>` +
+      `<span class="muted">Generated ${esc(fmtTime(full.aiReview.generatedAtMs))} · analyzes past behavior only — never trade advice</span></div>`
+    : "";
+  const aiBtn = canEdit && typeof aiReviewTrade === "function"
+    ? `<button class="btn-ghost sm" data-jnact="aireview" id="jn-aireview-btn" title="Generate an AI review of this trade (read-only analysis, stored with the entry)">${full && full.aiReview ? "↻ AI review" : "AI review"}</button>`
+    : "";
+
   return `<div class="jn-card-cols">` +
-    `<div class="jn-facts"><h3>Trade</h3>${facts}<h3>Timeline</h3>${timeline}</div>` +
+    `<div class="jn-facts"><h3>Trade</h3>${facts}<h3>Timeline</h3>${timeline}${aiReview}</div>` +
     `<div class="jn-form${canEdit ? "" : " jn-ro"}">` +
     `<div class="jn-form-head"><h3>Review</h3><span id="jn-savestate" class="jn-savestate muted"></span>` +
+    aiBtn +
     (canEdit && full ? `<button class="btn-ghost sm" data-jnact="delentry" title="Delete this journal entry (the trade itself is exchange history and stays)">Delete entry</button>` : "") +
     `</div>` +
     jnStatusSegHtml(e, canEdit) +
@@ -1473,6 +1487,28 @@ async function jnNewStrategy() {
   return name;
 }
 
+// Ask the AI layer (ai.js) to review the open trade; the server persists the
+// review onto the journal entry, so it renders in this card from then on.
+async function jnRequestAiReview() {
+  const trade = jnCurrentTrade();
+  if (!trade || typeof aiReviewTrade !== "function") return;
+  const btn = document.getElementById("jn-aireview-btn");
+  const origLabel = btn ? btn.textContent : "AI review";
+  if (btn) { btn.disabled = true; btn.textContent = "Reviewing…"; }
+  try {
+    const result = await aiReviewTrade(trade.id);
+    const full = jnEntryOrBlank(_jnFullEntry[trade.id]);
+    full.aiReview = {
+      text: result.text, generatedAtMs: result.generatedAtMs, live: result.live,
+    };
+    _jnFullEntry[trade.id] = full;
+    jnMountEditor(trade.id);
+  } catch (e) {
+    toast("AI review failed: " + (e && e.message ? e.message : "error"), "neg");
+    if (btn) { btn.disabled = false; btn.textContent = origLabel; }
+  }
+}
+
 async function jnDeleteEntry() {
   const trade = jnCurrentTrade();
   if (!trade || !_jnFullEntry[trade.id]) return;
@@ -1755,6 +1791,7 @@ function wireJournal() {
       else if (a === "cal-next") { _jnView.calMonth = jnMonthShift(_jnView.calMonth, 1); jnViewChanged({ collapse: false }); }
       else if (a === "cal-today") { _jnView.calMonth = ""; jnViewChanged({ collapse: false }); }
       else if (a === "delentry") jnDeleteEntry();
+      else if (a === "aireview") jnRequestAiReview();
       else if (a === "write" || a === "preview") {
         const trade = jnCurrentTrade();
         if (trade) {

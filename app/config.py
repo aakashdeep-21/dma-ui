@@ -195,6 +195,29 @@ class Settings:
         self.SYNC_INTERVAL_SECONDS: float = max(10.0, _float_env("SYNC_INTERVAL_SECONDS", 60.0))
         self.SYNC_BACKFILL_DAYS: int = max(1, _int_env("SYNC_BACKFILL_DAYS", 730))
 
+        # --- AI intelligence layer (READ-ONLY analysis; optional) ---
+        # Which LLM provider backs the AI coach: mock (default — deterministic
+        # rule-based analysis, no key, no network), claude, openai, local
+        # (any OpenAI-compatible endpoint, e.g. Ollama/vLLM via AI_BASE_URL),
+        # or gemini. The rest of the app never knows which one is active; the
+        # AI layer is read-only by construction (it can never reach a trade
+        # write) and only ever sends the sanitized serializations built in
+        # app/ai_context.py — never credentials, secrets or cookies.
+        self.AI_PROVIDER: str = os.environ.get("AI_PROVIDER", "mock").strip().lower()
+        self.AI_API_KEY: str = os.environ.get("AI_API_KEY", "")
+        # Model id for the chosen provider ("" = the provider's default).
+        self.AI_MODEL: str = os.environ.get("AI_MODEL", "").strip()
+        # Override the provider's API base URL (required for provider=local).
+        self.AI_BASE_URL: str = os.environ.get("AI_BASE_URL", "").rstrip("/")
+        self.AI_MAX_TOKENS: int = max(256, _int_env("AI_MAX_TOKENS", 2048))
+        self.AI_TIMEOUT_S: float = max(10.0, _float_env("AI_TIMEOUT_S", 120.0))
+        # Cost guardrail: LLM-invoking endpoints are capped at this many calls
+        # per minute across the whole process (429 above it).
+        self.AI_CALLS_PER_MIN: int = max(1, _int_env("AI_CALLS_PER_MIN", 6))
+        # How long a generated briefing/session review stays cached when the
+        # underlying data has not changed (seconds).
+        self.AI_CACHE_TTL_S: float = max(0.0, _float_env("AI_CACHE_TTL_S", 600.0))
+
     def missing_required(self) -> list[str]:
         """Return the names of required vars that are not set."""
         required = {

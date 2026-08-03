@@ -5,13 +5,14 @@
 import fs from "node:fs";
 import assert from "node:assert/strict";
 
-// app.js + charts.js + risk.js + journal.js share one global scope in the
-// browser (plain scripts); concatenating them here mirrors that, so cross-file
-// references (e.g. wsSanitizeState → mcSanitizeCharts / rkSanitizeViewState /
-// jnSanitizeViewState) extract.
+// app.js + charts.js + risk.js + journal.js + ai.js share one global scope in
+// the browser (plain scripts); concatenating them here mirrors that, so
+// cross-file references (e.g. wsSanitizeState → mcSanitizeCharts /
+// rkSanitizeViewState / jnSanitizeViewState / aiSanitizeViewState) extract.
 const src = fs.readFileSync(new URL("../app/static/charts.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/risk.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/journal.js", import.meta.url), "utf8") +
+  "\n" + fs.readFileSync(new URL("../app/static/ai.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/app.js", import.meta.url), "utf8");
 
 function extractFn(name) {
@@ -114,11 +115,13 @@ const wsConsts = ["WS_SCHEMA_VERSION", "WS_MAX", "WS_PANEL_IDS", "WS_TABS", "WS_
   "MC_LINK_KINDS", "MC_DEFAULT_SYMBOLS",
   // …the risk view sanitizer's allowlists (risk.js)…
   "RK_ALLOC_VIEWS", "RK_HIST_METRICS", "RK_SORTS",
-  // …and the journal view sanitizer's allowlists (journal.js).
+  // …the journal view sanitizer's allowlists (journal.js)…
   "JN_VIEWS", "JN_RANGES", "JN_RESULTS", "JN_SIDES", "JN_STATUS_FILTERS",
-  "JN_SORTS", "JN_DATE_RE", "JN_MONTH_RE"].map(extractConst).join("\n");
+  "JN_SORTS", "JN_DATE_RE", "JN_MONTH_RE",
+  // …and the AI coach view sanitizer's allowlists (ai.js).
+  "AI_VIEWS", "AI_RANGES", "AI_PERIODS"].map(extractConst).join("\n");
 const wsFns = ["wsId", "scSanitizeViewState", "mcSlotId", "mcNewSlot", "mcSanitizeCharts",
-  "rkSanitizeViewState", "jnSanitizeViewState",
+  "rkSanitizeViewState", "jnSanitizeViewState", "aiSanitizeViewState",
   "wsSanitizeState", "wsMakeWorkspace", "wsSanitizeWorkspace",
   "wsNewDoc", "wsMigrateFromV1", "wsParseDoc", "wsValidateImport",
   "wsCreate", "wsDuplicate", "wsRename", "wsDelete"].map(extractFn).join("\n");
@@ -1039,4 +1042,40 @@ assert.equal(SC.scFuzzyScore("BTCUSDT", ""), 0);
   assert.ok(html.includes("<blockquote>"));
 }
 
-console.log("snapToStep + projectedPnl + workspace-core + watchlist-core + scanner-core + journal-core regression tests passed");
+// ---------------------------------------------------------------------------
+// AI coach core (ai.js) — the pure layer: view-state sanitizer (the workspace
+// trust boundary) and the SSE protocol parser the streaming answers ride on.
+// ---------------------------------------------------------------------------
+{
+  const aiConsts = ["AI_VIEWS", "AI_RANGES", "AI_PERIODS"].map(extractConst).join("\n");
+  const aiFns = ["aiSanitizeViewState", "aiSseParse"].map(extractFn).join("\n");
+  const AI = new Function(aiConsts + "\n" + aiFns +
+    "\nreturn { aiSanitizeViewState, aiSseParse };")();
+
+  // Sanitizer: hostile/garbage state coerces to safe defaults.
+  const dirty = AI.aiSanitizeViewState({
+    view: "sudo", range: 30, period: "year", convSearch: 42, extra: "dropped",
+  });
+  assert.deepEqual(dirty, { view: "briefing", range: "30", period: "day", convSearch: "" });
+  const ok = AI.aiSanitizeViewState({ view: "patterns", range: "90", period: "week", convSearch: "x".repeat(100) });
+  assert.equal(ok.view, "patterns");
+  assert.equal(ok.range, "90");
+  assert.equal(ok.convSearch.length, 60);
+
+  // SSE parser: complete events extracted, partial frames kept as remainder.
+  const chunk1 = 'data: {"type":"start","conversationId":"abc"}\n\n' +
+    'data: {"type":"delta","text":"Hel"}\n\ndata: {"type":"del';
+  const p1 = AI.aiSseParse(chunk1);
+  assert.equal(p1.events.length, 2);
+  assert.equal(p1.events[0].type, "start");
+  assert.equal(p1.events[1].text, "Hel");
+  assert.equal(p1.rest, 'data: {"type":"del');
+  const p2 = AI.aiSseParse(p1.rest + 'ta","text":"lo"}\n\ndata: {"type":"done"}\n\n');
+  assert.deepEqual(p2.events.map((e) => e.type), ["delta", "done"]);
+  assert.equal(p2.rest, "");
+  // Garbled frames are skipped, never thrown.
+  const p3 = AI.aiSseParse("data: {not json}\n\ndata: {\"type\":\"done\"}\n\n");
+  assert.deepEqual(p3.events.map((e) => e.type), ["done"]);
+}
+
+console.log("snapToStep + projectedPnl + workspace-core + watchlist-core + scanner-core + journal-core + ai-core regression tests passed");

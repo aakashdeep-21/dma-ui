@@ -30,7 +30,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from bson.errors import BSONError
 from pathlib import Path
@@ -38,7 +38,20 @@ from pymongo.errors import PyMongoError
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import Response as StarletteResponse
 
-from . import auth, db, dma_client, history_sync, journal, market_data, notifier, scanner, signer
+from . import (
+    ai_context,
+    ai_providers,
+    ai_service,
+    auth,
+    db,
+    dma_client,
+    history_sync,
+    journal,
+    market_data,
+    notifier,
+    scanner,
+    signer,
+)
 from .config import settings
 
 def _configure_logging() -> None:
@@ -123,6 +136,7 @@ async def lifespan(app: FastAPI):
         await dma_client.aclose()
         await market_data.aclose()
         await notifier.aclose()
+        await ai_providers.aclose()
         await db.aclose()
 
 
@@ -1030,6 +1044,241 @@ async def api_journal_relabel(payload: dict = Body(...), user: dict = Depends(re
         raise HTTPException(status_code=400, detail=str(exc))
     modified = await _journal_or_503(db.journal_relabel(field, old, new))
     return {"modified": modified}
+
+
+# --------------------------------------------------------------------------
+# AI intelligence layer — READ-ONLY analysis of the trader's own history.
+#
+# Nothing under /api/ai can reach an exchange write: generations read the
+# MongoDB mirrors (plus, best-effort, the same read-only position/balance
+# endpoints the dashboard uses) and write only to the AI-Conversations
+# collection and the journal's server-owned `aiReview` field. Deterministic
+# insights (/api/ai/insights) involve no LLM at all and are open to any
+# logged-in user; LLM-invoking endpoints are admin-only (they spend provider
+# tokens) and budget-capped per minute. Provider identity is never exposed —
+# responses carry capabilities (live/streaming), not a vendor name.
+# --------------------------------------------------------------------------
+_AI_CONV_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _require_conv_id(conv_id: str) -> str:
+    if not _AI_CONV_ID_RE.match(str(conv_id or "")):
+        raise HTTPException(status_code=400, detail="invalid conversation id")
+    return conv_id
+
+
+async def _run_ai(coro):
+    """Uniform error mapping for AI operations: budget -> 429, provider ->
+    sanitized 502, Mongo -> the same soft 503 as every other history read."""
+    try:
+        return await coro
+    except ai_service.AIBusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except ai_providers.AIProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except (PyMongoError, BSONError, OSError):
+        logger.exception("ai operation failed: mongo unavailable")
+        raise HTTPException(status_code=503, detail="history database unavailable")
+
+
+@app.get("/api/ai/status")
+async def api_ai_status(user: dict = Depends(current_user)):
+    return ai_service.status()
+
+
+@app.get("/api/ai/templates")
+async def api_ai_templates(user: dict = Depends(current_user)):
+    return {"templates": list(ai_service.TEMPLATES)}
+
+
+@app.get("/api/ai/insights")
+async def api_ai_insights(
+    startTime: str | None = None,
+    endTime: str | None = None,
+    tzOffsetMin: int | None = None,
+    user: dict = Depends(current_user),
+):
+    """Deterministic performance insights + pattern detection. No LLM in the
+    loop — every number is computed server-side from the history mirror, so
+    this endpoint is instant, free, and available to both roles. tzOffsetMin
+    (browser minutes east of UTC) makes day/session buckets follow the
+    TRADER's clock, not the deploy's."""
+    rng = _parse_range(startTime, endTime)
+    now_ms = int(time.time() * 1000)
+    start_ms, end_ms = rng if rng else (now_ms - 30 * ai_service.DAY_MS, now_ms)
+    tz = ai_service._clamp_tz(tzOffsetMin)
+    trades = await _run_ai(ai_service.load_trades(start_ms, end_ms))
+    return {
+        "stats": ai_context.overall_stats(trades),
+        "findings": ai_context.findings(trades, tz),
+        "byWeekday": ai_context.by_weekday(trades, tz),
+        "byHour": ai_context.by_hour_bucket(trades, tz),
+        "bySymbol": ai_context.by_symbol(trades),
+        "byStrategy": ai_context.by_strategy(trades),
+        "byTag": ai_context.by_tag(trades),
+        "byMistake": ai_context.by_mistake(trades),
+        "calibration": ai_context.confidence_calibration(trades),
+        "streaks": ai_context.streaks(trades),
+        "drawdown": ai_context.drawdown(trades),
+        "behaviorChange": ai_context.behavior_change(trades),
+        "overtrading": ai_context.overtrading_bursts(trades),
+        "revenge": ai_context.revenge_trades(trades),
+        "nowMs": now_ms,
+    }
+
+
+@app.post("/api/ai/briefing")
+async def api_ai_briefing(payload: dict = Body(default={}), user: dict = Depends(require_admin)):
+    try:
+        range_days = int((payload or {}).get("rangeDays", 7))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="rangeDays must be an integer")
+    return await _run_ai(ai_service.briefing(range_days, (payload or {}).get("tzOffsetMin")))
+
+
+@app.post("/api/ai/trade-review")
+async def api_ai_trade_review(payload: dict = Body(...), user: dict = Depends(require_admin)):
+    trade_id = payload.get("tradeId")
+    if not journal.valid_entry_id(trade_id):
+        raise HTTPException(status_code=400, detail="invalid trade id")
+    try:
+        return await _run_ai(ai_service.trade_review(trade_id))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/ai/session-review")
+async def api_ai_session_review(payload: dict = Body(...), user: dict = Depends(require_admin)):
+    period = payload.get("period")
+    at_ms = payload.get("atMs")
+    if at_ms is not None:
+        try:
+            at_ms = int(at_ms)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="atMs must be epoch milliseconds")
+    try:
+        return await _run_ai(ai_service.session_review(
+            str(period or ""), at_ms, payload.get("tzOffsetMin")))
+    except (ValueError, OverflowError, OSError) as exc:
+        # OverflowError/OSError: datetime.fromtimestamp on an absurd atMs —
+        # a caller error, never a 500.
+        raise HTTPException(status_code=400, detail=str(exc) or "invalid atMs")
+
+
+@app.post("/api/ai/query")
+async def api_ai_query(payload: dict = Body(...), user: dict = Depends(require_admin)):
+    """Natural-language question over the trader's own history, streamed as
+    SSE. The answer is grounded in a server-built evidence pack; the exchange
+    is persisted to the conversation only after the stream completes."""
+    conv_id = payload.get("conversationId")
+    if conv_id is not None:
+        _require_conv_id(conv_id)
+    try:
+        prep = await _run_ai(ai_service.prepare_query(
+            payload.get("question"), conv_id, payload.get("tzOffsetMin")))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    provider = ai_providers.get_provider()
+
+    def _event(obj: dict) -> str:
+        return "data: " + json.dumps(obj, allow_nan=False) + "\n\n"
+
+    async def event_stream():
+        yield _event({
+            "type": "start",
+            "conversationId": prep["conversationId"],
+            "evidence": prep["evidence"],
+        })
+        parts: list[str] = []
+        try:
+            async for delta in provider.stream(prep["system"], prep["messages"]):
+                parts.append(delta)
+                yield _event({"type": "delta", "text": delta})
+        except ai_providers.AIProviderError as exc:
+            yield _event({"type": "error", "error": str(exc)})
+            return
+        except Exception:
+            logger.exception("ai query stream failed")
+            yield _event({"type": "error", "error": "AI request failed"})
+            return
+        answer = "".join(parts)
+        try:
+            await ai_service.record_exchange(prep, answer)
+        except Exception:
+            # The answer already streamed; a persistence blip must not
+            # retroactively fail it. The conversation just misses this turn.
+            logger.exception("ai conversation persist failed")
+        yield _event({
+            "type": "done",
+            "conversationId": prep["conversationId"],
+            "generatedAtMs": int(time.time() * 1000),
+            "live": provider.live,
+        })
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            # `identity` opts out of GZipMiddleware (it skips responses that
+            # already declare an encoding) so deltas are never buffered.
+            "Cache-Control": "no-cache, no-transform",
+            "Content-Encoding": "identity",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _conv_meta(doc: dict) -> dict:
+    return {
+        "id": doc.get("_id"),
+        "title": doc.get("title") or "Untitled",
+        "pinned": bool(doc.get("pinned")),
+        "createdAtMs": doc.get("createdAtMs"),
+        "updatedAtMs": doc.get("updatedAtMs"),
+    }
+
+
+@app.get("/api/ai/conversations")
+async def api_ai_conversations(user: dict = Depends(current_user)):
+    docs = await _run_ai(db.ai_conv_list())
+    return {"conversations": [_conv_meta(d) for d in docs]}
+
+
+@app.get("/api/ai/conversations/{conv_id}")
+async def api_ai_conversation(conv_id: str, user: dict = Depends(current_user)):
+    doc = await _run_ai(db.ai_conv_get(_require_conv_id(conv_id)))
+    if doc is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return {**_conv_meta(doc), "messages": doc.get("messages") or []}
+
+
+@app.patch("/api/ai/conversations/{conv_id}")
+async def api_ai_conversation_update(
+    conv_id: str, payload: dict = Body(...), user: dict = Depends(require_admin)
+):
+    fields: dict = {}
+    if "title" in payload:
+        title = str(payload.get("title") or "").strip()
+        if not title or len(title) > 80:
+            raise HTTPException(status_code=400, detail="title must be 1-80 characters")
+        fields["title"] = title
+    if "pinned" in payload:
+        fields["pinned"] = bool(payload.get("pinned"))
+    if not fields:
+        raise HTTPException(status_code=400, detail="nothing to update (title/pinned)")
+    fields["updatedAtMs"] = int(time.time() * 1000)
+    ok = await _run_ai(db.ai_conv_update(_require_conv_id(conv_id), fields))
+    if not ok:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return {"ok": True}
+
+
+@app.delete("/api/ai/conversations/{conv_id}")
+async def api_ai_conversation_delete(conv_id: str, user: dict = Depends(require_admin)):
+    deleted = await _run_ai(db.ai_conv_delete(_require_conv_id(conv_id)))
+    return {"deleted": deleted}
 
 
 # --------------------------------------------------------------------------

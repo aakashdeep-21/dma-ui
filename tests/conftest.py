@@ -77,6 +77,7 @@ def fake_db(monkeypatch):
     store: dict[str, dict[str, dict]] = {
         db_mod.TRADES: {}, db_mod.CLOSED_PNL: {},
         db_mod.JOURNAL: {}, db_mod.JOURNAL_META: {},
+        db_mod.AI_CONVERSATIONS: {},
     }
 
     async def latest_ts_ms(kind):
@@ -155,9 +156,49 @@ def fake_db(monkeypatch):
     async def journal_meta_set(doc):
         store[db_mod.JOURNAL_META]["meta"] = dict(doc)
 
+    # --- AI conversation helpers (same in-memory semantics) ---
+    def _conv_sorted(docs):
+        return sorted(docs, key=lambda d: (not d.get("pinned"), -(d.get("updatedAtMs") or 0)))
+
+    async def ai_conv_list(limit=100):
+        metas = [{k: v for k, v in d.items() if k != "messages"}
+                 for d in store[db_mod.AI_CONVERSATIONS].values()]
+        return _conv_sorted(metas)[:limit]
+
+    async def ai_conv_get(conv_id):
+        doc = store[db_mod.AI_CONVERSATIONS].get(conv_id)
+        return json.loads(json.dumps(doc)) if doc else None
+
+    async def ai_conv_create(doc):
+        store[db_mod.AI_CONVERSATIONS][doc["_id"]] = dict(doc)
+
+    async def ai_conv_update(conv_id, fields):
+        doc = store[db_mod.AI_CONVERSATIONS].get(conv_id)
+        if doc is None:
+            return False
+        doc.update(fields)
+        return True
+
+    async def ai_conv_append(conv_id, messages, updated_ms, max_messages=200):
+        doc = store[db_mod.AI_CONVERSATIONS].get(conv_id)
+        if doc is None:
+            return False
+        doc["messages"] = (doc.get("messages", []) + list(messages))[-max_messages:]
+        doc["updatedAtMs"] = updated_ms
+        return True
+
+    async def ai_conv_delete(conv_id):
+        return store[db_mod.AI_CONVERSATIONS].pop(conv_id, None) is not None
+
     monkeypatch.setattr(db_mod, "latest_ts_ms", latest_ts_ms)
     monkeypatch.setattr(db_mod, "bulk_upsert", bulk_upsert)
     monkeypatch.setattr(db_mod, "query_history", query_history)
+    monkeypatch.setattr(db_mod, "ai_conv_list", ai_conv_list)
+    monkeypatch.setattr(db_mod, "ai_conv_get", ai_conv_get)
+    monkeypatch.setattr(db_mod, "ai_conv_create", ai_conv_create)
+    monkeypatch.setattr(db_mod, "ai_conv_update", ai_conv_update)
+    monkeypatch.setattr(db_mod, "ai_conv_append", ai_conv_append)
+    monkeypatch.setattr(db_mod, "ai_conv_delete", ai_conv_delete)
     monkeypatch.setattr(db_mod, "journal_query", journal_query)
     monkeypatch.setattr(db_mod, "journal_get", journal_get)
     monkeypatch.setattr(db_mod, "journal_upsert", journal_upsert)

@@ -2587,6 +2587,7 @@ function wireTabs() {
     // The "history" pane is the Trading Journal (journal.js) — the pane id is
     // kept for workspace-state continuity with saved layouts.
     if (name === "history") onJournalActive();
+    if (name === "ai") onAIActive();
     if (name === "account") onAccountActive();
     // Risk tab: refresh the daily history context while visible (the live
     // metrics themselves ride the shared WS snapshot, no extra polling).
@@ -6073,7 +6074,7 @@ const WS_MAX = 20;
 // Allowlists for sanitizing stored/imported state (one-line consts so the
 // test harness can extract them alongside the functions).
 const WS_PANEL_IDS = ["risk", "positions", "orders", "charts", "token", "ticket", "book", "rk-head", "rk-exposure", "rk-conc", "rk-liq", "rk-margin", "rk-positions", "rk-daily", "rk-timeline", "rk-history"];
-const WS_TABS = ["dashboard", "risk", "scanner", "markets", "history", "account", "tools"];
+const WS_TABS = ["dashboard", "risk", "scanner", "markets", "history", "ai", "account", "tools"];
 const WS_SYMBOL_RE = /^[A-Z0-9]{1,20}$/;
 
 function wsId() {
@@ -6127,6 +6128,9 @@ function wsSanitizeState(raw) {
     // same contract; the entries/catalogs themselves live in MongoDB, the
     // workspace only remembers how the journal was being looked at.
     journal: jnSanitizeViewState(src.journal),
+    // AI coach VIEW (sub-view, analysis range, review period, conv search) —
+    // same contract; conversations/insights live server-side.
+    ai: aiSanitizeViewState(src.ai),
   };
 }
 
@@ -6305,6 +6309,7 @@ function wsCaptureState() {
   st.scanner = scCaptureViewState();
   st.risk = rkCaptureViewState();
   st.journal = jnCaptureViewState();
+  st.ai = aiCaptureViewState();
   return wsSanitizeState(st);
 }
 
@@ -6350,6 +6355,8 @@ function wsApplyState(rawState, opts = {}) {
   rkApplyViewState(st.risk);
   // Restore this workspace's journal view (sub-view/range/filters/sort).
   jnApplyViewState(st.journal);
+  // Restore this workspace's AI coach view (sub-view/range/period).
+  aiApplyViewState(st.ai);
   wsUpdateEmptyState();
   if (!opts.noAnim) {
     const pane = document.querySelector("main .pane:not([hidden])");
@@ -6887,6 +6894,21 @@ function wireCommandPalette() {
     acts.push({ label: "Journal: jump to today", hint: "calendar", run: () => { gotoJournal(); jnGotoDay(jnDayKey(Date.now())); } });
     const jl = document.getElementById("jn-labels");
     if (jl && !jl.hidden) acts.push({ label: "Journal: manage labels", hint: "tags", run: () => { gotoJournal(); setTimeout(jnOpenLabels, 0); } });
+    // AI coach — read-only analysis; generation is admin-gated server-side too.
+    const gotoAI = () => {
+      const pane = document.querySelector('[data-pane="ai"]');
+      const tab = document.querySelector('#tabs .tab[data-tab="ai"]');
+      if (pane && pane.hidden && tab) tab.click();
+    };
+    AI_VIEWS.forEach((v) => {
+      if (_aiView.view !== v) {
+        acts.push({ label: `Coach: ${AI_VIEW_LABELS[v]}`, hint: "ai", run: () => { gotoAI(); aiSwitchView(v); } });
+      }
+    });
+    if (state.role === "admin") {
+      acts.push({ label: "Coach: generate briefing", hint: "ai", run: () => { gotoAI(); aiSwitchView("briefing"); setTimeout(aiGenerateBriefing, 0); } });
+      acts.push({ label: "Coach: ask about my trading", hint: "ai", run: () => { gotoAI(); aiSwitchView("ask"); setTimeout(() => { const t = document.getElementById("ai-question"); if (t) t.focus(); }, 50); } });
+    }
     // Watchlist actions — display/navigation only; none can reach a write.
     const gotoWatch = () => {
       const pane = document.querySelector('[data-pane="markets"]');
@@ -7126,6 +7148,7 @@ document.addEventListener("keydown", (e) => {
   wireCharts(); // live candlestick charts (read-only; polls while dashboard visible)
   wireRisk(); // risk command center (feeds off the shared dashboard snapshot)
   wireJournal(); // trading journal (loads on tab entry; BEFORE workspaces apply their saved view)
+  wireAI(); // AI coach (read-only intelligence layer; loads on tab entry)
   wireWorkspaces(); // multi-workspace system: load/migrate, apply active layout
   wireCommandPalette(); // Ctrl/Cmd+K — navigation & display actions only
   wireNotifCenter(); // session notification log (every toast, recoverable)

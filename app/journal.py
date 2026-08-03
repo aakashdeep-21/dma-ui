@@ -208,9 +208,13 @@ def shape_entry(doc: dict, *, full: bool) -> dict:
     if full:
         out["notes"] = notes
         out["lessons"] = lessons
+        # Server-written AI review (never client-writable: it is not in the
+        # PUT allowlist — only /api/ai/trade-review can set it).
+        out["aiReview"] = doc.get("aiReview")
     else:
         out["notesExcerpt"] = _excerpt(notes)
         out["lessonsExcerpt"] = _excerpt(lessons)
+        out["hasAiReview"] = bool(doc.get("aiReview"))
     return out
 
 

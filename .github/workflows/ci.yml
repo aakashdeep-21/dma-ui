@@ -26,5 +26,6 @@ jobs:
         run: |
           node --check app/static/app.js
           node --check app/static/journal.js
+          node --check app/static/ai.js
           node --check app/static/login.js
           node tests/test_snap.mjs

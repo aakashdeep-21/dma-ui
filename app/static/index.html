@@ -41,6 +41,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
           <span>Journal</span>
         </button>
+        <button class="tab" data-tab="ai" role="tab" id="tab-ai" aria-controls="panel-ai" aria-selected="false" tabindex="-1">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.9 4.9L18.8 9.8l-4.9 1.9L12 16.6l-1.9-4.9L5.2 9.8l4.9-1.9L12 3z"/><path d="M19 14.6l.9 2.3 2.3.9-2.3.9-.9 2.3-.9-2.3-2.3-.9 2.3-.9.9-2.3z"/></svg>
+          <span>Coach</span>
+        </button>
         <button class="tab admin-only" data-tab="account" role="tab" id="tab-account" aria-controls="panel-account" aria-selected="false" tabindex="-1">
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
           <span>Account</span>
@@ -646,6 +650,30 @@
           </section>
         </div>
 
+        <!-- ============ AI COACH (read-only intelligence layer) ============ -->
+        <div class="pane" data-pane="ai" id="panel-ai" role="tabpanel" aria-labelledby="tab-ai" hidden>
+          <section class="panel ai-panel">
+            <div class="panel-head ai-head">
+              <h2>AI Coach</h2>
+              <span id="ai-status-badge"></span>
+              <div class="panel-head-actions">
+                <div class="segment ai-viewseg" id="ai-views" role="group" aria-label="AI view">
+                  <button class="seg-neutral active" data-aiview="briefing" aria-pressed="true">Briefing</button>
+                  <button class="seg-neutral" data-aiview="ask" aria-pressed="false">Ask</button>
+                  <button class="seg-neutral" data-aiview="reviews" aria-pressed="false">Reviews</button>
+                  <button class="seg-neutral" data-aiview="patterns" aria-pressed="false">Patterns</button>
+                </div>
+                <select id="ai-range" aria-label="Analysis range">
+                  <option value="7">Last week</option>
+                  <option value="30" selected>Last month</option>
+                  <option value="90">Last quarter</option>
+                </select>
+              </div>
+            </div>
+            <div id="ai-content" class="ai-content"><p class="muted" style="padding:14px">Open this tab to load the AI coach…</p></div>
+          </section>
+        </div>
+
         <!-- ============ ACCOUNT (admin) ============ -->
         <div class="pane admin-only" data-pane="account" id="panel-account" role="tabpanel" aria-labelledby="tab-account" hidden>
           <section class="panel">
@@ -924,11 +952,12 @@
   </div>
 
   <!-- Module scripts first (charts.js = multi-chart, risk.js = risk system,
-       journal.js = trading journal); app.js boots them and feeds risk.js
-       every live snapshot. -->
+       journal.js = trading journal, ai.js = AI coach); app.js boots them and
+       feeds risk.js every live snapshot. -->
   <script src="/static/charts.js"></script>
   <script src="/static/risk.js"></script>
   <script src="/static/journal.js"></script>
+  <script src="/static/ai.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
