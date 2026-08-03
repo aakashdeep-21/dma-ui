@@ -2247,6 +2247,114 @@ body.density-compact .sc-row { height: 29px; font-size: 12px; }
   .ai-thread { max-height: none; }
 }
 
+/* ---------- 17m. Execution workspace (Trade tab, ex-) ---------- */
+/* Trading ladder: extends the existing .book-row contract (data-px +
+   .clickable stay untouched for the click/keyboard handlers) with a
+   cumulative column + depth bars. */
+.ex-ladder-tools select {
+  background: rgba(0,0,0,0.35); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); font-size: 10.5px; padding: 3.5px 18px 3.5px 6px;
+}
+.ex-ladder { display: flex; flex-direction: column; font-family: var(--mono); font-size: 11px; }
+.ex-ladder .book-row {
+  position: relative; display: grid; grid-template-columns: 1fr 1fr 1fr;
+  gap: 6px; padding: 2.5px 8px; line-height: 1.35; cursor: pointer;
+  border: none; border-radius: 0; overflow: hidden;
+}
+.ex-ladder .book-row:hover { outline: 1px solid var(--accent-2); outline-offset: -1px; z-index: 1; }
+.ex-ladder .book-row .cum { text-align: left; color: var(--muted); }
+.ex-ladder .book-row .sz { text-align: right; color: var(--text-2); }
+.ex-ladder .book-row .px { text-align: right; font-weight: 700; }
+.ex-ladder .ask .px { color: var(--neg); }
+.ex-ladder .bid .px { color: var(--pos); }
+.ex-ladder .book-row .depth, .ex-ladder .book-row .cumbar {
+  position: absolute; top: 0; bottom: 0; right: 0; pointer-events: none;
+}
+.ex-ladder .ask .depth { background: rgba(255,77,103,0.16); }
+.ex-ladder .bid .depth { background: rgba(0,201,141,0.14); }
+.ex-ladder .ask .cumbar { background: rgba(255,77,103,0.06); }
+.ex-ladder .bid .cumbar { background: rgba(0,201,141,0.055); }
+.ex-ladder .book-row.ex-entry::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--accent-2);
+}
+.ex-spread {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 5px 8px; margin: 2px 0; border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border); background: rgba(0,0,0,0.3);
+  font-size: 10.5px;
+}
+.ex-spread .mid { font-weight: 800; font-size: 12px; }
+.ex-spread .sp { color: var(--muted); text-align: right; }
+.ex-spread .sp b { font-weight: 700; }
+.ex-book-total {
+  position: relative; display: flex; justify-content: space-between; gap: 8px;
+  margin-top: 4px; padding: 4px 8px; font-size: 10px; font-family: var(--mono);
+  border: 1px solid var(--border-soft); border-radius: 6px; overflow: hidden;
+  color: var(--text-2);
+}
+.ex-book-total .ex-bidbar {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  background: rgba(0,201,141,0.12);
+  border-right: 1px solid rgba(0,201,141,0.5);
+}
+.ex-book-total span:not(.ex-bidbar) { position: relative; }
+
+/* Ticket preview strip (estimates) */
+.ex-preview {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  font-size: 10.5px; color: var(--text-2); padding: 6px 8px;
+  border: 1px dashed var(--border); border-radius: var(--radius-sm);
+  background: rgba(0,0,0,0.2);
+}
+.ex-preview b { font-family: var(--mono); }
+.ex-prev-tag {
+  font-size: 8.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--warn); border: 1px solid rgba(245,184,61,0.45); border-radius: 8px; padding: 1px 6px;
+}
+.ex-dot { color: var(--muted); }
+.ex-rr { display: inline-block; width: 44px; height: 7px; border-radius: 4px; overflow: hidden;
+  background: rgba(255,77,103,0.35); vertical-align: middle; margin-left: 3px; }
+.ex-rr i { display: block; height: 100%; background: var(--pos); }
+
+/* Quick actions */
+.ex-quick { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.ex-qa-context { font-size: 11px; font-family: var(--mono); }
+.ex-qa-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.ex-qa-row button { padding: 6px 4px; font-size: 10.5px; }
+.ex-qa-buyb { color: var(--pos); border-color: rgba(0,201,141,0.4); }
+.ex-qa-sellb { color: var(--neg); border-color: rgba(255,77,103,0.4); }
+.ex-qa-note { font-size: 10px; margin: 0; line-height: 1.45; }
+
+/* Execution panel (stats tiles + recent fills) */
+.ex-exec-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.ex-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+.ex-tile {
+  background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.004)), rgba(0,0,0,0.25);
+  border: 1px solid var(--border-soft); border-radius: 10px; padding: 8px 10px;
+}
+.ex-tile .k { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); }
+.ex-tile .v { font-size: 13px; font-weight: 700; font-family: var(--mono); margin-top: 2px; }
+.ex-fills table { font-size: 11px; }
+.ex-fills .table-wrap { max-height: 260px; overflow-y: auto; }
+.ex-note { font-size: 10px; margin: 0; }
+
+/* Orders toolbar */
+.ex-ord-tools input {
+  width: 150px; font-size: 11px; color: var(--text); background: rgba(0,0,0,0.35);
+  border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 4.5px 8px;
+}
+.ex-ord-tools input:focus { border-color: var(--accent-2); outline: none; box-shadow: 0 0 0 3px rgba(143,151,255,0.15); }
+.ex-ord-tools select {
+  background: rgba(0,0,0,0.35); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); font-size: 11px; padding: 4px 18px 4px 7px;
+}
+
+@media (max-width: 760px) {
+  .ex-qa-row { grid-template-columns: repeat(2, 1fr); }
+  .ex-ord-tools input { width: 110px; }
+}
+
 /* ---------- 18. Stale-feed dimming [contract] ---------- */
 .stale-data #positions-body, .stale-data #orders-body,
 .stale-data .topbar-stats { opacity: 0.55; transition: opacity 0.3s ease; }

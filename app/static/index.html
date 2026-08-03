@@ -204,6 +204,14 @@
               <section class="panel" data-wpanel="orders">
                 <div class="panel-head">
                   <h2>Open Orders</h2>
+                  <div class="panel-head-actions ex-ord-tools">
+                    <input id="ex-ord-search" placeholder="Filter orders…" aria-label="Filter open orders" />
+                    <select id="ex-ord-side" aria-label="Filter orders by side">
+                      <option value="all">Both sides</option>
+                      <option value="Buy">Buy</option>
+                      <option value="Sell">Sell</option>
+                    </select>
+                  </div>
                   <button id="cancel-all-btn" class="btn-danger admin-only">Cancel all</button>
                 </div>
                 <div class="table-wrap">
@@ -225,6 +233,19 @@
                     </tbody>
                   </table>
                 </div>
+              </section>
+
+              <!-- Execution statistics + recent fills (from the history
+                   mirror's day window, shared with the risk tab's fetch). -->
+              <section class="panel" data-wpanel="exec">
+                <div class="panel-head">
+                  <h2>Execution</h2>
+                  <span class="muted">today · from the history mirror</span>
+                  <div class="panel-head-actions">
+                    <button id="ex-exec-refresh" class="btn-ghost sm">Refresh</button>
+                  </div>
+                </div>
+                <div id="ex-exec-body" class="ex-exec-body"><p class="muted center" style="padding:14px">Today's executions load with the Trade tab.</p></div>
               </section>
 
               <!-- Multi-chart workspace (read-only public market data).
@@ -274,7 +295,31 @@
                 </div>
               </section>
 
-              <section class="panel ticket-panel">
+              <!-- Quick actions: prep buttons + shortcuts into the SAME
+                   confirmed flows the tables use (close buttons carry
+                   data-close and preselect a portion in the typed-confirm
+                   dialog; nothing here can bypass a ceremony). -->
+              <section class="panel quick-panel" data-wpanel="quick">
+                <div class="panel-head"><h2>Quick Actions</h2></div>
+                <div class="ex-quick" id="ex-quick">
+                  <div class="ex-qa-context muted" id="ex-qa-context">Pick a symbol in the ticket</div>
+                  <div class="ex-qa-row">
+                    <button id="ex-qa-buy" class="btn-ghost sm ex-qa-buyb" title="Prepare a Buy market order in the ticket (nothing is sent)">Buy mkt</button>
+                    <button id="ex-qa-sell" class="btn-ghost sm ex-qa-sellb" title="Prepare a Sell market order in the ticket (nothing is sent)">Sell mkt</button>
+                    <button id="ex-qa-be" class="btn-ghost sm" disabled title="Open the TP/SL dialog with the break-even preset one click away">SL → BE</button>
+                    <button id="ex-qa-cancelall" class="btn-ghost sm" disabled title="Cancel all open orders (typed confirmation)">Cancel all</button>
+                  </div>
+                  <div class="ex-qa-row">
+                    <button class="btn-danger sm" data-ex-close-pct="25" disabled>Close 25%</button>
+                    <button class="btn-danger sm" data-ex-close-pct="50" disabled>Close 50%</button>
+                    <button class="btn-danger sm" data-ex-close-pct="75" disabled>Close 75%</button>
+                    <button class="btn-danger sm" data-ex-close-pct="100" disabled title="Flatten: close the entire position">Flatten</button>
+                  </div>
+                  <p class="muted ex-qa-note">Every close opens the typed-confirm dialog with the chosen portion preselected. Reverse is not offered — the venue has no atomic reverse, and two racing orders is not "safely supported".</p>
+                </div>
+              </section>
+
+              <section class="panel ticket-panel" data-wpanel="ticket">
                 <div class="panel-head"><h2>Place Order</h2><span class="muted ticket-unit">prices &amp; amounts in USDT</span></div>
                 <form id="order-form" class="form-grid">
                   <label>Symbol
@@ -362,6 +407,7 @@
                     </div>
                   </details>
                   <div id="order-pnl-preview" class="pnl-preview"></div>
+                  <div id="ex-preview" class="ex-preview" role="status" aria-live="polite" hidden></div>
                   <button type="submit" class="btn-primary btn-submit">Submit order</button>
                 </form>
                 <div id="order-result" class="result-msg" role="status" aria-live="polite"></div>
@@ -369,11 +415,29 @@
 
               <section class="panel book-panel" data-wpanel="book">
                 <div class="panel-head">
-                  <h2>Order Book</h2>
+                  <h2>Depth</h2>
                   <span class="panel-head-meta">
                     <span class="muted" id="book-symbol">—</span>
                     <span class="muted book-unit" id="book-unit">USDT</span>
                   </span>
+                  <div class="panel-head-actions ex-ladder-tools">
+                    <select id="ex-group" aria-label="Price grouping (multiples of the tick size)" title="Group ladder levels (× tick size)">
+                      <option value="1" selected>×1</option>
+                      <option value="2">×2</option>
+                      <option value="5">×5</option>
+                      <option value="10">×10</option>
+                      <option value="25">×25</option>
+                      <option value="50">×50</option>
+                    </select>
+                    <select id="ex-rows" aria-label="Ladder rows per side">
+                      <option value="8">8</option>
+                      <option value="12" selected>12</option>
+                      <option value="16">16</option>
+                      <option value="24">24</option>
+                    </select>
+                    <button id="ex-follow" class="btn-ghost sm active" aria-pressed="true">Follow</button>
+                    <button id="ex-center" class="btn-ghost sm" title="Repaint from the freshest depth now">Center</button>
+                  </div>
                 </div>
                 <div id="book-widget" class="book-widget"><p class="muted book-empty">Pick a symbol to load depth.</p></div>
               </section>
@@ -958,6 +1022,7 @@
   <script src="/static/risk.js"></script>
   <script src="/static/journal.js"></script>
   <script src="/static/ai.js"></script>
+  <script src="/static/exec.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

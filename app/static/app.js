@@ -544,7 +544,10 @@ function typedConfirm(message, opts = {}) {
     setConfirmMessage(message);
 
     // Optional portion buttons (percent values are our own constants, not data).
-    let percent = 100;
+    // opts.defaultPercent only changes which choice starts highlighted — the
+    // typed "confirm" ceremony is identical either way.
+    let percent = Array.isArray(opts.percents) && opts.percents.includes(opts.defaultPercent)
+      ? opts.defaultPercent : 100;
     const paintChoices = () => {
       choices.querySelectorAll("button[data-pct]").forEach((b) => {
         const on = Number(b.dataset.pct) === percent;
@@ -566,7 +569,7 @@ function typedConfirm(message, opts = {}) {
         choices.innerHTML =
           `<div class="choices-btns" role="group" aria-label="Portion to apply">` +
           opts.percents
-            .map((p) => `<button type="button" data-pct="${Number(p)}" aria-pressed="${Number(p) === 100}">${Number(p) === 100 ? "Full" : Number(p) + "%"}</button>`)
+            .map((p) => `<button type="button" data-pct="${Number(p)}" aria-pressed="${Number(p) === percent}">${Number(p) === 100 ? "Full" : Number(p) + "%"}</button>`)
             .join("") +
           `</div><div class="choices-hint muted"></div>`;
         choices.addEventListener("click", onChoice);
@@ -849,6 +852,9 @@ function renderPositions(positions) {
         ["Position idx", p.positionIdx],
         ["Opened", fmtTime(p.createdTime)],
         ["Updated", fmtTime(p.updatedTime)],
+        // Execution-workspace insights (fee-inclusive BE, ROE, holding time,
+        // today's funding/fees from the mirror); empty when exec.js is absent.
+        ...(typeof exPositionExtras === "function" ? exPositionExtras(p) : []),
       ]);
 
       return `<tr class="exp-row${expanded ? " expanded" : ""}${(p.side || "").toLowerCase() === "buy" ? " side-buy" : " side-sell"}" data-pkey="${esc(key)}" role="button" tabindex="0" aria-expanded="${expanded}">
@@ -884,22 +890,34 @@ function renderOrders(orders) {
   // live wipe-everything button never sits on an empty panel. (Null for viewers.)
   const cancelAllBtn = document.getElementById("cancel-all-btn");
   if (cancelAllBtn) cancelAllBtn.hidden = !rows.length;
-  if (!rows.length) {
-    const hint = state.role === "admin"
-      ? `<div class="empty-hint">Place an order from the ticket to see it here.</div>`
-      : "";
-    setTbodyHTML(body, `<tr><td colspan="99" class="muted center empty-cell">No open orders${hint}</td></tr>`);
+  // Execution-workspace toolbar filter (search/side) narrows the view only —
+  // cancel-all above is deliberately keyed on the UNfiltered set.
+  const filtered = typeof exApplyOrderFilters === "function" ? exApplyOrderFilters(rows) : rows;
+  if (!filtered.length) {
+    const hint = rows.length
+      ? `<div class="empty-hint">${rows.length} open order${rows.length === 1 ? "" : "s"} hidden by the filter above.</div>`
+      : state.role === "admin"
+        ? `<div class="empty-hint">Place an order from the ticket to see it here.</div>`
+        : "";
+    setTbodyHTML(body, `<tr><td colspan="99" class="muted center empty-cell">${rows.length ? "No orders match" : "No open orders"}${hint}</td></tr>`);
     updateSortIndicators();
     return;
   }
   const isAdmin = state.role === "admin";
-  const sorted = applySort(rows, state.sortOrders);
+  const sorted = applySort(filtered, state.sortOrders);
   const html = sorted
     .map((o) => {
       const key = o.orderId || `${o.symbol}/${o.orderLinkId || ""}`;
       const expanded = state.expandedOrders.has(key);
       const actions = isAdmin
         ? `<td class="row-actions">
+            <button class="btn-ghost sm" data-dup='${esc(JSON.stringify({
+              symbol: o.symbol,
+              side: o.side,
+              orderType: o.orderType,
+              qty: o.qty,
+              price: o.price,
+            }))}' title="Duplicate: copy this order's parameters into the ticket (nothing is placed until you submit)">⧉</button>
             <button class="btn-ghost sm" data-amend='${esc(JSON.stringify({
               symbol: o.symbol,
               orderId: o.orderId,
@@ -940,6 +958,9 @@ function renderOrders(orders) {
         ["Leaves qty", o.leavesQty, true],
         ["Created", fmtTime(o.createdTime)],
         ["Updated", fmtTime(o.updatedTime)],
+        // Execution-workspace lifecycle (created → fills → status) from the
+        // executions mirror; empty when exec.js isn't loaded.
+        ...(typeof exOrderExtras === "function" ? exOrderExtras(o) : []),
       ]);
 
       return `<tr class="exp-row${expanded ? " expanded" : ""}${(o.side || "").toLowerCase() === "buy" ? " side-buy" : " side-sell"}" data-okey="${esc(key)}" role="button" tabindex="0" aria-expanded="${expanded}">
@@ -962,7 +983,9 @@ function renderOrders(orders) {
     ? `<tr><td colspan="99" class="muted center">Showing 50 open orders (the feed's cap) — more may be open on the exchange.</td></tr>`
     : "";
   setTbodyHTML(body, html + capNote);
-  const liveKeys = new Set(sorted.map((o) => o.orderId || `${o.symbol}/${o.orderLinkId || ""}`));
+  // Prune expansion state against ALL live orders (not the filtered view), so
+  // clearing a filter restores previously expanded rows.
+  const liveKeys = new Set(rows.map((o) => o.orderId || `${o.symbol}/${o.orderLinkId || ""}`));
   state.expandedOrders.forEach((k) => { if (!liveKeys.has(k)) state.expandedOrders.delete(k); });
   updateSortIndicators();
 }
@@ -1005,6 +1028,9 @@ function renderDashboard(d) {
   // surfaces (the compact dashboard panel + the Risk tab) all feed off this
   // one snapshot — no extra requests.
   rkIngest(d);
+  // Execution workspace (exec.js): quick-actions context, ladder markers and
+  // the ticket preview all ride the same snapshot.
+  exIngest();
 }
 
 // In-app fill/close awareness: announce position open/close/size changes by
@@ -1107,6 +1133,10 @@ document.addEventListener("click", async (e) => {
         lines.push(["Unrealised PnL to realise", `${fmtSigned(pos.unrealisedPnl)} ${settleCoin()}`]);
       }
       const liveQty = Number(payload.qty);
+      // Quick-action buttons preselect a portion (data-close-pct); the same
+      // typed-confirm ceremony still gates the write — only the default
+      // highlighted choice changes.
+      const presetPct = Number(closeBtn.getAttribute("data-close-pct"));
       const ok = await typedConfirm({
         head: `Close ${payload.symbol}`,
         lines,
@@ -1116,6 +1146,7 @@ document.addEventListener("click", async (e) => {
         // server re-derives the size from the exchange and floors the slice to
         // the lot step — the figure here is a preview, never the payload qty.
         percents: [25, 50, 75, 100],
+        defaultPercent: [25, 50, 75, 100].includes(presetPct) ? presetPct : undefined,
         hint: (pct) =>
           pct === 100
             ? "Closes the entire position."
@@ -1139,6 +1170,15 @@ document.addEventListener("click", async (e) => {
         closeBtn.disabled = false;
       }
     });
+    return;
+  }
+
+  const dupBtn = e.target.closest("[data-dup]");
+  if (dupBtn) {
+    // Duplicate = prefill the ticket only. No write happens here, so no
+    // confirmation — submission still goes through the full ceremony.
+    const payload = parseRowData(dupBtn, "data-dup");
+    if (payload) prefillTicketFromOrder(payload);
     return;
   }
 
@@ -2588,6 +2628,8 @@ function wireTabs() {
     // kept for workspace-state continuity with saved layouts.
     if (name === "history") onJournalActive();
     if (name === "ai") onAIActive();
+    // Execution panel refreshes its day window only while the Trade tab shows.
+    if (name === "dashboard") onExecActive();
     if (name === "account") onAccountActive();
     // Risk tab: refresh the daily history context while visible (the live
     // metrics themselves ride the shared WS snapshot, no extra polling).
@@ -3902,7 +3944,12 @@ function setActiveSymbol(sym) {
     state.activeSymbol = symbol;
     const lbl = document.getElementById("book-symbol");
     if (lbl) lbl.textContent = symbol;
+    // The ladder needs the instrument's tick size for decimals/grouping —
+    // a workspace-restored symbol never passes through the ticket's own
+    // spec fetch, so fetch it here (cache-first, so this is usually free).
+    if (!state.specs[symbol]) fetchInstrumentSpec(symbol);
     loadBook();
+    if (typeof exPaintQuickActions === "function") exPaintQuickActions();
     wsAutoSave(); // the book symbol is part of the active workspace
   }
   startBookPolling();
@@ -3925,10 +3972,20 @@ function stopBookPolling() { if (_bookTimer) { clearInterval(_bookTimer); _bookT
 async function loadBook() {
   const el = document.getElementById("book-widget");
   if (!el || !state.activeSymbol) return;
+  const requestedFor = state.activeSymbol; // supersede guard for racing loads
   try {
-    const data = await api(`/api/orderbook?symbol=${encodeURIComponent(state.activeSymbol)}`);
-    el.innerHTML = renderBookLadder(data, { clickable: true, depth: 8 });
+    // Deeper snapshot for the execution ladder (grouping needs raw levels);
+    // one read either way. exec.js renders the professional ladder when
+    // loaded; the legacy renderer stays as the fallback.
+    const data = await api(`/api/orderbook?symbol=${encodeURIComponent(requestedFor)}&limit=200`);
+    if (requestedFor !== state.activeSymbol) return; // a newer symbol owns the widget
+    if (typeof exRenderLadder === "function") {
+      exRenderLadder(data);
+    } else {
+      el.innerHTML = renderBookLadder(data, { clickable: true, depth: 8 });
+    }
   } catch (e) {
+    if (requestedFor !== state.activeSymbol) return;
     el.innerHTML = `<p class="muted book-empty">Order book unavailable: ${esc(e.message)}</p>`;
   }
 }
@@ -4301,6 +4358,9 @@ function rerenderForCurrency() {
   if (state.lastDashboard) renderDashboard(state.lastDashboard);
   if (_marketsData) renderMarkets();
   if (_scData) scRerender();
+  // Execution panel (fees/volume tiles honor the lens; the rail ladder stays
+  // USDT per the write-surface contract).
+  exRerenderCurrency();
   // Re-render the journal from its cached payloads — a currency flip is a pure
   // display change and must not refetch (an "Overall" read is ~10k rows/mirror).
   jnRerenderCurrency();
@@ -6073,7 +6133,7 @@ const WS_SCHEMA_VERSION = 2;
 const WS_MAX = 20;
 // Allowlists for sanitizing stored/imported state (one-line consts so the
 // test harness can extract them alongside the functions).
-const WS_PANEL_IDS = ["risk", "positions", "orders", "charts", "token", "ticket", "book", "rk-head", "rk-exposure", "rk-conc", "rk-liq", "rk-margin", "rk-positions", "rk-daily", "rk-timeline", "rk-history"];
+const WS_PANEL_IDS = ["risk", "positions", "orders", "charts", "exec", "token", "quick", "ticket", "book", "rk-head", "rk-exposure", "rk-conc", "rk-liq", "rk-margin", "rk-positions", "rk-daily", "rk-timeline", "rk-history"];
 const WS_TABS = ["dashboard", "risk", "scanner", "markets", "history", "ai", "account", "tools"];
 const WS_SYMBOL_RE = /^[A-Z0-9]{1,20}$/;
 
@@ -6131,6 +6191,8 @@ function wsSanitizeState(raw) {
     // AI coach VIEW (sub-view, analysis range, review period, conv search) —
     // same contract; conversations/insights live server-side.
     ai: aiSanitizeViewState(src.ai),
+    // Execution-workspace VIEW (ladder grouping/rows/follow + orders filter).
+    exec: exSanitizeViewState(src.exec),
   };
 }
 
@@ -6310,6 +6372,7 @@ function wsCaptureState() {
   st.risk = rkCaptureViewState();
   st.journal = jnCaptureViewState();
   st.ai = aiCaptureViewState();
+  st.exec = exCaptureViewState();
   return wsSanitizeState(st);
 }
 
@@ -6357,6 +6420,8 @@ function wsApplyState(rawState, opts = {}) {
   jnApplyViewState(st.journal);
   // Restore this workspace's AI coach view (sub-view/range/period).
   aiApplyViewState(st.ai);
+  // Restore this workspace's execution view (ladder settings/order filters).
+  exApplyViewState(st.exec);
   wsUpdateEmptyState();
   if (!opts.noAnim) {
     const pane = document.querySelector("main .pane:not([hidden])");
@@ -6909,6 +6974,13 @@ function wireCommandPalette() {
       acts.push({ label: "Coach: generate briefing", hint: "ai", run: () => { gotoAI(); aiSwitchView("briefing"); setTimeout(aiGenerateBriefing, 0); } });
       acts.push({ label: "Coach: ask about my trading", hint: "ai", run: () => { gotoAI(); aiSwitchView("ask"); setTimeout(() => { const t = document.getElementById("ai-question"); if (t) t.focus(); }, 50); } });
     }
+    // Execution ladder — display/navigation only (writes stay behind the
+    // ticket/table ceremonies; the palette can never reach one).
+    const exCenterBtn = document.getElementById("ex-center");
+    if (exCenterBtn) acts.push({ label: "Ladder: center on market", hint: "L", run: () => { gotoDash(); exCenterBtn.click(); } });
+    const exFollowBtn = document.getElementById("ex-follow");
+    if (exFollowBtn) acts.push({ label: "Ladder: toggle follow / freeze", hint: "depth", run: () => { gotoDash(); exFollowBtn.click(); } });
+    acts.push({ label: "Focus ladder", hint: "L", run: () => { gotoDash(); setTimeout(() => { const r = document.querySelector("#book-widget .book-row.clickable"); if (r) r.focus(); }, 0); } });
     // Watchlist actions — display/navigation only; none can reach a write.
     const gotoWatch = () => {
       const pane = document.querySelector('[data-pane="markets"]');
@@ -7093,6 +7165,22 @@ document.addEventListener("keydown", (e) => {
     if (s) { try { s.focus(); } catch (err) {} }
     return;
   }
+  // "L" / "O" / "P": focus the ladder / first order row / first position row
+  // on the Trade tab. Pure navigation — activation still runs the existing
+  // Enter/Space handlers (and any write still runs the full ceremony).
+  if (key === "l" || key === "o" || key === "p") {
+    const dashPane = document.querySelector('[data-pane="dashboard"]');
+    if (dashPane && !dashPane.hidden) {
+      const target = key === "l"
+        ? document.querySelector("#book-widget .book-row.clickable")
+        : document.querySelector(key === "o" ? "#orders-body tr.exp-row" : "#positions-body tr.exp-row");
+      if (target) {
+        e.preventDefault();
+        try { target.focus(); target.scrollIntoView({ block: "nearest" }); } catch (err) {}
+        return;
+      }
+    }
+  }
   if (e.key !== "/" && key !== "b" && key !== "s") return;
   const form = document.getElementById("order-form");
   if (!form) return;
@@ -7149,6 +7237,7 @@ document.addEventListener("keydown", (e) => {
   wireRisk(); // risk command center (feeds off the shared dashboard snapshot)
   wireJournal(); // trading journal (loads on tab entry; BEFORE workspaces apply their saved view)
   wireAI(); // AI coach (read-only intelligence layer; loads on tab entry)
+  wireExec(); // execution workspace (ladder/previews/quick actions on the Trade tab)
   wireWorkspaces(); // multi-workspace system: load/migrate, apply active layout
   wireCommandPalette(); // Ctrl/Cmd+K — navigation & display actions only
   wireNotifCenter(); // session notification log (every toast, recoverable)
@@ -7164,6 +7253,11 @@ document.addEventListener("keydown", (e) => {
   } catch (e) {}
   connectWS();
   startConnWatchdog(); // escalate the pill to "stale" if frames stop arriving
+  // The dashboard is the HTML-default active tab, so wireTabs' activation
+  // hook never fires for it at boot — arm the execution panel's day-window
+  // refresh here (it self-cancels the moment the pane hides).
+  const dashPane = document.querySelector('[data-pane="dashboard"]');
+  if (dashPane && !dashPane.hidden) onExecActive();
   syncHeaderHeight();
   // Throttle to one measurement per frame so a resize drag doesn't thrash layout.
   let _rhTick = false;

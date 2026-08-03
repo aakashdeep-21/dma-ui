@@ -425,23 +425,28 @@ function rkIngest(d) {
 // ===========================================================================
 
 async function rkFetchDaily() {
-  if (_rkDailyFetching) return;
-  _rkDailyFetching = true;
-  try {
-    const [closed, exec] = await Promise.allSettled([
-      api("/api/closed-pnl?days=1"),
-      api("/api/executions?days=1"),
-    ]);
-    _rkDaily = {
-      closed: closed.status === "fulfilled" ? listOf(closed.value) : null,
-      exec: exec.status === "fulfilled" ? listOf(exec.value) : null,
-      error: closed.status === "rejected" && exec.status === "rejected",
-      at: Date.now(),
-    };
-  } finally {
-    _rkDailyFetching = false;
-  }
-  if (rkPaneVisible()) rkRenderPane();
+  // Single-flight that RETURNS the in-flight promise, so a concurrent caller
+  // (the execution workspace shares this day window) awaiting rkFetchDaily()
+  // resumes with fresh data instead of racing ahead with the stale copy.
+  if (_rkDailyFetching) return _rkDailyFetching;
+  _rkDailyFetching = (async () => {
+    try {
+      const [closed, exec] = await Promise.allSettled([
+        api("/api/closed-pnl?days=1"),
+        api("/api/executions?days=1"),
+      ]);
+      _rkDaily = {
+        closed: closed.status === "fulfilled" ? listOf(closed.value) : null,
+        exec: exec.status === "fulfilled" ? listOf(exec.value) : null,
+        error: closed.status === "rejected" && exec.status === "rejected",
+        at: Date.now(),
+      };
+    } finally {
+      _rkDailyFetching = false;
+    }
+    if (rkPaneVisible()) rkRenderPane();
+  })();
+  return _rkDailyFetching;
 }
 
 // Aggregate today's (local midnight) realized results from the mirror rows.

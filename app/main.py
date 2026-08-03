@@ -898,8 +898,19 @@ async def api_scanner(user: dict = Depends(current_user)):
 
 
 @app.get("/api/orderbook")
-async def api_orderbook(symbol: str, user: dict = Depends(current_user)):
-    return await dma_client.get_orderbook(_require_symbol(symbol))
+async def api_orderbook(symbol: str, limit: str | None = None, user: dict = Depends(current_user)):
+    """Depth snapshot for the trading ladder. `limit` (1..200, default =
+    upstream default) is validated here so a garbage value never reaches the
+    signed upstream; deeper books cost the same one read."""
+    depth = None
+    if limit not in (None, ""):
+        try:
+            depth = int(limit)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="limit must be an integer")
+        if not 1 <= depth <= 200:
+            raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+    return await dma_client.get_orderbook(_require_symbol(symbol), depth)
 
 
 @app.get("/api/klines")

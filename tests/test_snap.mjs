@@ -13,6 +13,7 @@ const src = fs.readFileSync(new URL("../app/static/charts.js", import.meta.url),
   "\n" + fs.readFileSync(new URL("../app/static/risk.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/journal.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/ai.js", import.meta.url), "utf8") +
+  "\n" + fs.readFileSync(new URL("../app/static/exec.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/app.js", import.meta.url), "utf8");
 
 function extractFn(name) {
@@ -118,10 +119,12 @@ const wsConsts = ["WS_SCHEMA_VERSION", "WS_MAX", "WS_PANEL_IDS", "WS_TABS", "WS_
   // …the journal view sanitizer's allowlists (journal.js)…
   "JN_VIEWS", "JN_RANGES", "JN_RESULTS", "JN_SIDES", "JN_STATUS_FILTERS",
   "JN_SORTS", "JN_DATE_RE", "JN_MONTH_RE",
-  // …and the AI coach view sanitizer's allowlists (ai.js).
-  "AI_VIEWS", "AI_RANGES", "AI_PERIODS"].map(extractConst).join("\n");
+  // …the AI coach view sanitizer's allowlists (ai.js)…
+  "AI_VIEWS", "AI_RANGES", "AI_PERIODS",
+  // …and the execution-workspace sanitizer's allowlists (exec.js).
+  "EX_GROUPINGS", "EX_ROWS_OPTIONS", "EX_ORDER_SORTS", "EX_ORDER_SIDES"].map(extractConst).join("\n");
 const wsFns = ["wsId", "scSanitizeViewState", "mcSlotId", "mcNewSlot", "mcSanitizeCharts",
-  "rkSanitizeViewState", "jnSanitizeViewState", "aiSanitizeViewState",
+  "rkSanitizeViewState", "jnSanitizeViewState", "aiSanitizeViewState", "exSanitizeViewState",
   "wsSanitizeState", "wsMakeWorkspace", "wsSanitizeWorkspace",
   "wsNewDoc", "wsMigrateFromV1", "wsParseDoc", "wsValidateImport",
   "wsCreate", "wsDuplicate", "wsRename", "wsDelete"].map(extractFn).join("\n");
@@ -1078,4 +1081,142 @@ assert.equal(SC.scFuzzyScore("BTCUSDT", ""), 0);
   assert.deepEqual(p3.events.map((e) => e.type), ["done"]);
 }
 
-console.log("snapToStep + projectedPnl + workspace-core + watchlist-core + scanner-core + journal-core + ai-core regression tests passed");
+// ---------------------------------------------------------------------------
+// Execution-workspace core (exec.js) — ladder building, order lifecycle,
+// execution stats, break-even and preview math. This is money-adjacent
+// display math: a wrong ladder bucket or preview number misleads a live
+// trader, so every formula gets a known-answer test.
+// ---------------------------------------------------------------------------
+{
+  const exConsts = ["EX_GROUPINGS", "EX_ROWS_OPTIONS", "EX_ORDER_SORTS", "EX_ORDER_SIDES",
+    "EX_STATUS_LABELS"].map(extractConst).join("\n");
+  const exFns = ["exSanitizeViewState", "exBucket", "exBuildLadder", "exOrderTimeline",
+    "exExecStats", "exBreakEven", "exTicketPreview", "exPositionInsights"]
+    .map(extractFn).join("\n");
+  const EX = new Function(exConsts + "\n" + exFns +
+    "\nreturn { exSanitizeViewState, exBucket, exBuildLadder, exOrderTimeline, " +
+    "exExecStats, exBreakEven, exTicketPreview, exPositionInsights };")();
+
+  // Sanitizer: hostile state coerces to safe defaults.
+  const dirty = EX.exSanitizeViewState({ grouping: "3", rows: 99, follow: "no",
+    orders: { side: "Both", search: 42, sort: "evil", dir: "up" } });
+  assert.deepEqual(dirty, { grouping: "1", rows: "12", follow: true,
+    orders: { side: "all", search: "", sort: "time", dir: "desc" } });
+  assert.equal(EX.exSanitizeViewState({ follow: false }).follow, false);
+
+  // Bucketing: bids floor, asks ceil — grouped levels never cross the spread.
+  assert.equal(EX.exBucket(100.07, 0.05, true), 100.05);
+  assert.equal(EX.exBucket(100.07, 0.05, false), 100.1);
+  assert.equal(EX.exBucket(100.05, 0.05, true), 100.05, "exact boundary stays put");
+  assert.equal(EX.exBucket(100.05, 0.05, false), 100.05);
+
+  // Ladder: cumulative sums, display ordering, spread, bar scales.
+  const book = { result: {
+    b: [["100.0", "2"], ["99.9", "3"], ["99.8", "5"]],
+    a: [["100.1", "1"], ["100.2", "4"], ["100.3", "2"]],
+  } };
+  const ladder = EX.exBuildLadder(book, { tick: 0.1, grouping: "1", rows: 3, last: 100.05, mark: 100.02 });
+  assert.equal(ladder.bestBid, 100.0);
+  assert.equal(ladder.bestAsk, 100.1);
+  assert.ok(Math.abs(ladder.spread - 0.1) < 1e-9);
+  assert.deepEqual(ladder.bids.map((r) => r.cum), [2, 5, 10], "cumulative from best outward");
+  assert.deepEqual(ladder.asks.map((r) => r.price), [100.3, 100.2, 100.1], "asks render worst→best");
+  assert.equal(ladder.asks[2].cum, 1, "best ask is the last displayed ask row");
+  assert.equal(ladder.totalBid, 10);
+  assert.equal(ladder.totalAsk, 7);
+  const grouped = EX.exBuildLadder(book, { tick: 0.1, grouping: "2", rows: 5 });
+  assert.deepEqual(grouped.bids.map((r) => [r.price, r.size]), [[100, 2], [99.8, 8]],
+    "grouping merges bid levels downward");
+  assert.deepEqual(grouped.asks.slice().reverse().map((r) => [r.price, r.size]),
+    [[100.2, 5], [100.4, 2]], "grouping merges ask levels upward");
+  // Garbage levels are dropped, never NaN rows.
+  const dirtyLadder = EX.exBuildLadder({ result: { b: [["x", "1"], ["100", "0"]], a: null } }, {});
+  assert.equal(dirtyLadder.bids.length + dirtyLadder.asks.length, 0);
+
+  // Order lifecycle: created → fills (matched by orderId, funding excluded) →
+  // terminal status; fill progress from the venue's own counters.
+  const order = { orderId: "o1", createdTime: "1000", updatedTime: "5000",
+    orderStatus: "PartiallyFilled", qty: "10", cumExecQty: "4" };
+  const fills = [
+    { orderId: "o1", execTime: "2000", execQty: "1", execPrice: "100", isMaker: "true" },
+    { orderId: "o1", execTime: "3000", execQty: "3", execPrice: "101" },
+    { orderId: "o2", execTime: "2500", execQty: "9", execPrice: "50" },
+    { orderId: "o1", execTime: "2600", execQty: "0.1", execPrice: "0", execType: "Funding" },
+  ];
+  const tl = EX.exOrderTimeline(order, fills);
+  assert.deepEqual(tl.events.map((e) => e.kind), ["created", "fill", "fill", "status"]);
+  assert.equal(tl.events[1].maker, true);
+  assert.equal(tl.progress.pct, 40);
+
+  // Execution stats: maker %, volume, fees, weighted entry/exit.
+  const stats = EX.exExecStats(
+    [
+      { orderId: "a", execQty: "1", execPrice: "100", execValue: "100", execFee: "0.05", isMaker: true },
+      { orderId: "a", execQty: "1", execPrice: "102", execValue: "102", execFee: "0.06" },
+      { orderId: "b", execQty: "2", execPrice: "50", execValue: "100", execFee: "0.04" },
+      { execQty: "5", execPrice: "1", execType: "Funding", execFee: "0.9" },
+    ],
+    [
+      { qty: "2", avgEntryPrice: "100", avgExitPrice: "110", closedPnl: "20" },
+      { qty: "2", avgEntryPrice: "200", avgExitPrice: "190", closedPnl: "-20" },
+    ]);
+  assert.equal(stats.fills, 3);
+  assert.equal(stats.orders, 2);
+  assert.equal(stats.makerPct, 33.3);
+  assert.ok(Math.abs(stats.volume - 302) < 1e-9);
+  assert.ok(Math.abs(stats.fees - 0.15) < 1e-9, "funding fee excluded from trade fees");
+  assert.equal(stats.avgFillPrice, 75.5); // (100+102+100)/4 qty
+  assert.equal(stats.avgEntry, 150);
+  assert.equal(stats.avgExit, 150);
+  assert.equal(stats.closeWinPct, 50);
+
+  // Break-even: taker both ways; long above entry, short below.
+  const beLong = EX.exBreakEven(100, "Buy", 0.00035);
+  assert.ok(beLong > 100 && Math.abs(beLong - 100 * 1.00035 / 0.99965) < 1e-6);
+  const beShort = EX.exBreakEven(100, "Sell", 0.00035);
+  assert.ok(beShort < 100);
+  assert.equal(EX.exBreakEven("junk", "Buy", 0.0003), null);
+
+  // Ticket preview: margin, fee, leverage-only liq bound, post-trade position,
+  // bracket R:R.
+  const prev = EX.exTicketPreview({
+    side: "Buy", qty: 2, price: 100, leverage: 10, feeRate: 0.00035,
+    tp: 110, sl: 95, positionQty: 1, positionSide: "Sell",
+  });
+  assert.equal(prev.notional, 200);
+  assert.equal(prev.margin, 20);
+  assert.ok(Math.abs(prev.fee - 0.07) < 1e-9);
+  assert.equal(prev.liqEstimate, 90, "long liq bound = price × (1 − 1/lev)");
+  assert.deepEqual(prev.position, {
+    beforeQty: -1, afterQty: 1, afterSide: "long", reduces: true, flips: true,
+  });
+  assert.equal(prev.projectedProfit, 20);
+  assert.equal(prev.projectedLoss, 10);
+  assert.equal(prev.riskReward, 2);
+  assert.equal(EX.exTicketPreview({ side: "Buy", qty: 0, price: 100 }), null);
+
+  // Position insights: ROE on the exchange's own IM; holding time; BE.
+  const ins = EX.exPositionInsights(
+    { avgPrice: "100", size: "3", side: "Buy", unrealisedPnl: "15",
+      positionIM: "30", createdTime: "1000" },
+    { feeRate: 0.00035, nowMs: 61000, fundingPaid: "0.5", feesPaid: "0.2" });
+  assert.equal(ins.roePct, 50);
+  assert.equal(ins.holdingMs, 60000);
+  assert.equal(ins.notional, 300);
+  assert.ok(ins.breakEven > 100);
+
+  // Performance guard: a deep book rebuild must stay interactive.
+  const big = { result: { b: [], a: [] } };
+  for (let i = 0; i < 500; i++) {
+    big.result.b.push([String(50000 - i * 0.5), String((i % 9) + 1)]);
+    big.result.a.push([String(50000.5 + i * 0.5), String((i % 7) + 1)]);
+  }
+  const t0 = Date.now();
+  for (let k = 0; k < 200; k++) {
+    EX.exBuildLadder(big, { tick: 0.5, grouping: "5", rows: 24, last: 50000, mark: 50000 });
+  }
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 1000, `200 rebuilds of a 1000-level book took ${elapsed}ms (must stay ≪ 16ms each)`);
+}
+
+console.log("snapToStep + projectedPnl + workspace-core + watchlist-core + scanner-core + journal-core + ai-core + exec-core regression tests passed");
