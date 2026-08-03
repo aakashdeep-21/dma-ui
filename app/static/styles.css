@@ -660,8 +660,15 @@ details.ticket-adv > .adv-body { display: flex; flex-direction: column; gap: 12p
   box-shadow: 0 0 8px var(--accent-glow);
 }
 
+/* Fullscreen surfaces inset PAST the side rail [contract]. They cannot simply
+   cover it: `.content` is `position: relative; z-index: 2`, so it forms a
+   stacking context — every descendant's z-index (820 here) is scoped inside
+   it, and the whole subtree paints at 2, below the rail's 100. Raising these
+   values does nothing; clearing the rail's width is the fix (and keeps the
+   rail usable while a chart is maximized). Do not revert to a bare `inset`. */
 #charts-panel.chart-full {
-  position: fixed; inset: 12px; z-index: 800; overflow: auto;
+  position: fixed; inset: 12px 12px 12px calc(var(--side-w) + 12px);
+  z-index: 800; overflow: auto;
   display: flex; flex-direction: column;
   box-shadow: var(--shadow-pop), 0 0 60px -20px var(--accent-glow);
   border-color: var(--border);
@@ -700,7 +707,8 @@ details.ticket-adv > .adv-body { display: flex; flex-direction: column; gap: 12p
 /* Per-chart fullscreen: the card floats over everything; the grid keeps its
    place underneath (Esc / F returns). */
 .mc-card.mc-full {
-  position: fixed; inset: 12px; z-index: 820;
+  /* Left inset clears the side rail — see the #charts-panel.chart-full note. */
+  position: fixed; inset: 12px 12px 12px calc(var(--side-w) + 12px); z-index: 820;
   box-shadow: var(--shadow-pop), 0 0 60px -20px var(--accent-glow);
   border-color: var(--border);
   background: var(--surface);
@@ -2474,8 +2482,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   td.row-actions .btn-ghost.sm, td.row-actions .btn-danger.sm { min-height: 44px; padding: 0 14px; }
   .row-actions { gap: 10px; }
   .sizing-btns button { min-height: 40px; }
-  /* Small screens: fullscreen chart hugs the viewport; toolbars stay tappable. */
-  #charts-panel.chart-full, .mc-card.mc-full { inset: 6px; }
+  /* Small screens: fullscreen chart hugs the viewport; toolbars stay tappable.
+     The rail is a 60px BOTTOM bar here (not a left rail), so the bottom inset
+     is what has to clear it — same stacking-context reason as on desktop. */
+  #charts-panel.chart-full, .mc-card.mc-full { inset: 6px 6px 66px 6px; }
   .mc-grid { padding: 10px; gap: 8px; }
   .mc-tbtn { width: 28px; height: 28px; }
   .mc-more { display: inline-flex; } /* no hover on touch — tools always visible */
