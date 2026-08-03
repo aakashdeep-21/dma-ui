@@ -1188,9 +1188,9 @@ function jnRenderCalendar() {
   const s = jnStats(monthTrades);
   const head =
     `<div class="jn-cal-nav">` +
-    `<button class="btn-ghost sm" data-jnact="cal-prev" aria-label="Previous month">←</button>` +
+    `<button class="btn-ghost sm" data-jnact="cal-prev" title="Previous month" aria-label="Previous month">←</button>` +
     `<h3>${esc(jnMonthTitle(cal))}</h3>` +
-    `<button class="btn-ghost sm" data-jnact="cal-next" aria-label="Next month">→</button>` +
+    `<button class="btn-ghost sm" data-jnact="cal-next" title="Next month" aria-label="Next month">→</button>` +
     `<button class="btn-ghost sm" data-jnact="cal-today">Today</button>` +
     `<span class="muted">${s.count} trades · <span class="mono ${pnlClass(s.total)} priv">${fmtMoneySigned(s.total)}</span> · ${s.count ? Math.round(s.winRate) : 0}% win</span>` +
     `</div>`;

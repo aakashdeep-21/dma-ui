@@ -2363,6 +2363,24 @@ body.density-compact .sc-row { height: 29px; font-size: 12px; }
   .ex-ord-tools input { width: 110px; }
 }
 
+/* ---------- 17n. Icon-button tooltips [contract] ----------
+   Positioned by wireTooltips() (app.js), which moves the control's `title`
+   into `data-tip` so the native tooltip never double-draws. Above every other
+   layer (modals 1000, toasts 2000) and never interactive. */
+.tipbox {
+  position: fixed; left: 0; top: 0; z-index: 3000; pointer-events: none;
+  max-width: 240px; padding: 5px 9px;
+  font-size: 11px; font-weight: 600; line-height: 1.35; color: var(--text);
+  background: var(--raised); border: 1px solid var(--border);
+  border-radius: 7px; box-shadow: var(--shadow-pop);
+  opacity: 0; transform: translateY(2px);
+  transition: opacity 0.11s ease, transform 0.11s ease;
+}
+.tipbox.on { opacity: 1; transform: none; }
+@media (prefers-reduced-motion: reduce) {
+  .tipbox { transition: none; transform: none; }
+}
+
 /* ---------- 18. Stale-feed dimming [contract] ---------- */
 .stale-data #positions-body, .stale-data #orders-body,
 .stale-data .topbar-stats { opacity: 0.55; transition: opacity 0.3s ease; }

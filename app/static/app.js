@@ -569,7 +569,7 @@ function typedConfirm(message, opts = {}) {
         choices.innerHTML =
           `<div class="choices-btns" role="group" aria-label="Portion to apply">` +
           opts.percents
-            .map((p) => `<button type="button" data-pct="${Number(p)}" aria-pressed="${Number(p) === percent}">${Number(p) === 100 ? "Full" : Number(p) + "%"}</button>`)
+            .map((p) => `<button type="button" data-pct="${Number(p)}" title="${esc(Number(p) === 100 ? "Apply to the whole position" : "Apply to " + Number(p) + "% of the position")}" aria-pressed="${Number(p) === percent}">${Number(p) === 100 ? "Full" : Number(p) + "%"}</button>`)
             .join("") +
           `</div><div class="choices-hint muted"></div>`;
         choices.addEventListener("click", onChoice);
@@ -3335,7 +3335,7 @@ function wlRenderAlertExisting() {
   box.innerHTML = mine.length
     ? `<div class="ae-title">Active alerts</div>` + mine.map((a) =>
         `<div class="ae-row${a.triggered ? " done" : ""}"><span>${esc(wlAlertLabel(a))}${a.triggered ? " · fired" : ""}</span>` +
-        `<button type="button" class="ws-act" data-alid="${esc(a.id)}" aria-label="Remove alert">✕</button></div>`
+        `<button type="button" class="ws-act" data-alid="${esc(a.id)}" title="Remove alert" aria-label="Remove alert">✕</button></div>`
       ).join("")
     : `<div class="ae-empty muted">No alerts on ${esc(_wlAlertSym || "")} yet.</div>`;
 }
@@ -5343,9 +5343,9 @@ function scBuildCard(id) {
   card.dataset.scsec = id;
   const fundingSeg = id === "funding"
     ? `<div class="segment sc-fmode" role="group" aria-label="Funding view">` +
-      `<button type="button" data-fmode="pos" class="seg-neutral active" aria-pressed="true">+</button>` +
-      `<button type="button" data-fmode="neg" class="seg-neutral" aria-pressed="false">−</button>` +
-      `<button type="button" data-fmode="delta" class="seg-neutral" aria-pressed="false">Δ1h</button></div>`
+      `<button type="button" data-fmode="pos" class="seg-neutral active" title="Highest funding" aria-label="Highest positive funding" aria-pressed="true">+</button>` +
+      `<button type="button" data-fmode="neg" class="seg-neutral" title="Lowest funding" aria-label="Most negative funding" aria-pressed="false">−</button>` +
+      `<button type="button" data-fmode="delta" class="seg-neutral" title="Biggest 1h change" aria-label="Biggest funding change in the last hour" aria-pressed="false">Δ1h</button></div>`
     : "";
   card.innerHTML =
     `<div class="sc-card-head">` +
@@ -5631,7 +5631,7 @@ function scRenderAlertExisting() {
   box.innerHTML = rel.length
     ? `<div class="ae-title">Active alerts</div>` + rel.map((a) =>
         `<div class="ae-row"><span>${esc(scAlertLabel(a))}</span>` +
-        `<button class="btn-ghost sm" data-alid="${esc(a.id)}" aria-label="Delete alert">✕</button></div>`).join("")
+        `<button class="btn-ghost sm" data-alid="${esc(a.id)}" title="Delete alert" aria-label="Delete alert">✕</button></div>`).join("")
     : `<div class="ae-empty muted">No scanner alerts yet. Alerts notify only — they never place or modify an order.</div>`;
 }
 function scAlertSyncInputs() {
@@ -5726,7 +5726,7 @@ function scScanRuleRow(rule) {
     SC_OPS.map((o) => `<option value="${o}"${o === r.op ? " selected" : ""}>${esc(SC_OP_LABELS[o])}</option>`).join("") +
     `</select>` +
     `<input class="sc-rule-value" type="text" inputmode="decimal" autocomplete="off" placeholder="value" value="${r.value === "" ? "" : esc(String(r.value))}" aria-label="Value" />` +
-    `<button class="icon-btn sc-rule-del" type="button" aria-label="Remove condition">✕</button></div>`;
+    `<button class="icon-btn sc-rule-del" type="button" title="Remove condition" aria-label="Remove condition">✕</button></div>`;
 }
 function scScanCollect() {
   const rules = [];
@@ -7218,6 +7218,109 @@ document.addEventListener("keydown", (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Icon-button tooltips — instant, styled hover labels.
+//
+// Icon-only controls (chart toolbar, row actions, ladder tools, quick actions)
+// carry a `title`, but the native tooltip waits ~1s, renders unstyled, and is
+// easy to miss on a dense trading surface. This engine shows the SAME text
+// immediately in a styled bubble.
+//
+// Contract: on first hover the `title` is MOVED to `data-tip` so the browser
+// stops drawing its own tooltip (no double bubble) — and, when the control has
+// no `aria-label`, the text is promoted to one so screen readers keep it. One
+// delegated listener covers every current and future button, including the
+// dashboard's constantly re-rendered rows, with zero per-render work.
+//
+// Scope is deliberately `button` elements only: row/ladder targets are
+// `[role="button"]` divs whose titles are long hints, and popping a bubble on
+// every ladder row hover would fight the trader, not help them.
+// ---------------------------------------------------------------------------
+let _tipEl = null;
+let _tipFor = null;
+
+function tipText(el) {
+  if (!el) return "";
+  const native = el.getAttribute("title");
+  if (native) {
+    el.setAttribute("data-tip", native);
+    el.removeAttribute("title"); // suppress the duplicate native tooltip
+    if (!el.getAttribute("aria-label")) el.setAttribute("aria-label", native);
+  }
+  return el.getAttribute("data-tip") || "";
+}
+
+function hideTip() {
+  _tipFor = null;
+  if (_tipEl) _tipEl.classList.remove("on");
+}
+
+function showTip(el) {
+  const text = tipText(el);
+  if (!text) return;
+  if (!_tipEl) {
+    _tipEl = document.createElement("div");
+    _tipEl.className = "tipbox";
+    _tipEl.setAttribute("aria-hidden", "true"); // the control's own label serves AT
+    document.body.appendChild(_tipEl);
+  }
+  _tipFor = el;
+  _tipEl.textContent = text;
+  // Measure with the bubble laid out but invisible, then place it.
+  _tipEl.style.left = "0px";
+  _tipEl.style.top = "0px";
+  _tipEl.classList.add("on");
+  const r = el.getBoundingClientRect();
+  const t = _tipEl.getBoundingClientRect();
+  const gap = 7;
+  let top = r.top - t.height - gap;
+  if (top < 4) top = r.bottom + gap; // no room above → flip below
+  let left = r.left + r.width / 2 - t.width / 2;
+  left = Math.max(6, Math.min(left, window.innerWidth - t.width - 6));
+  _tipEl.style.left = Math.round(left) + "px";
+  _tipEl.style.top = Math.round(top) + "px";
+}
+
+function wireTooltips() {
+  const target = (e) => e.target && e.target.closest
+    ? e.target.closest("button[title], button[data-tip]") : null;
+
+  document.addEventListener("pointerover", (e) => {
+    if (e.pointerType === "touch") return; // touch has no hover; taps just act
+    const el = target(e);
+    if (!el || el === _tipFor) return; // already showing for this control
+    showTip(el);
+  });
+  // Hiding is driven by pointermove rather than pointerout: pointerout also
+  // fires when crossing INTO a child (the icon svg), which would flicker the
+  // bubble, and it never fires at all when a re-render removes the hovered
+  // button from under the cursor (the dashboard rebuilds rows every few
+  // seconds) — an `isConnected` check catches that too. The handler only does
+  // work while a tip is actually up.
+  document.addEventListener("pointermove", (e) => {
+    if (!_tipFor) return;
+    if (!_tipFor.isConnected || !_tipFor.contains(e.target)) hideTip();
+  });
+  document.addEventListener("pointerleave", hideTip); // cursor left the window
+  // A press acts on the control — the label has served its purpose.
+  document.addEventListener("pointerdown", hideTip, true);
+  // Keyboard parity: only for keyboard-visible focus, so clicking a button
+  // doesn't leave a bubble hanging over the UI.
+  document.addEventListener("focusin", (e) => {
+    const el = target(e);
+    if (!el) return;
+    try { if (!el.matches(":focus-visible")) return; } catch (err) { return; }
+    showTip(el);
+  });
+  document.addEventListener("focusout", (e) => {
+    if (target(e) === _tipFor) hideTip();
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideTip(); });
+  // Any layout shift invalidates the anchor position.
+  window.addEventListener("scroll", hideTip, true);
+  window.addEventListener("resize", hideTip);
+}
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 (async function init() {
@@ -7242,6 +7345,7 @@ document.addEventListener("keydown", (e) => {
   wireCommandPalette(); // Ctrl/Cmd+K — navigation & display actions only
   wireNotifCenter(); // session notification log (every toast, recoverable)
   wireKeysHelp(); // "?" shortcut reference
+  wireTooltips(); // instant hover labels on icon-only buttons
   wirePrivacyToggle(); // restore saved privacy state BEFORE the first render (no flash)
   wireCurrencyToggle(); // restore saved currency BEFORE the first render
   renderLoading(); // skeleton rows until the first snapshot lands

@@ -639,7 +639,7 @@ function mcCardHTML(i, slot) {
       `<span class="mc-px mono" data-mc="px">—</span>` +
       `<span class="mc-chg mono flat" data-mc="chg"></span>` +
       `<span class="mc-flex"></span>` +
-      `<button type="button" class="mc-tbtn mc-link${slot.linked ? " on" : ""}" data-mc="link" title="Include in linking (symbol / interval / crosshair / zoom sync)" aria-pressed="${slot.linked}">${MC_ICONS.link}</button>` +
+      `<button type="button" class="mc-tbtn mc-link${slot.linked ? " on" : ""}" data-mc="link" title="Link chart" aria-label="Include this chart in linking (symbol / interval / crosshair / zoom sync)" aria-pressed="${slot.linked}">${MC_ICONS.link}</button>` +
       `<span class="mc-more">` +
         `<button type="button" class="mc-tbtn" data-mc="refresh" title="Refresh data" aria-label="Refresh chart">${MC_ICONS.refresh}</button>` +
         `<button type="button" class="mc-tbtn" data-mc="shot" title="Save chart as PNG" aria-label="Save chart image">${MC_ICONS.camera}</button>` +
