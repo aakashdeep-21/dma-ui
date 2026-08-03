@@ -74,7 +74,10 @@ def fake_db(monkeypatch):
     Reproduces the real filter / newest-first sort / limit / projection
     semantics so the sync and read paths are exercised without a server.
     Returns the backing store: {kind: {_id: full stored doc}}."""
-    store: dict[str, dict[str, dict]] = {db_mod.TRADES: {}, db_mod.CLOSED_PNL: {}}
+    store: dict[str, dict[str, dict]] = {
+        db_mod.TRADES: {}, db_mod.CLOSED_PNL: {},
+        db_mod.JOURNAL: {}, db_mod.JOURNAL_META: {},
+    }
 
     async def latest_ts_ms(kind):
         docs = store[kind].values()
@@ -102,9 +105,66 @@ def fake_db(monkeypatch):
             for d in rows[:limit]
         ]
 
+    # --- journal helpers (same in-memory semantics as the Mongo layer) ---
+    async def journal_query(*, symbol, start_ms, end_ms, limit):
+        rows = [
+            d for d in store[db_mod.JOURNAL].values()
+            if start_ms <= d["tsMs"] <= end_ms and (not symbol or d.get("symbol") == symbol)
+        ]
+        rows.sort(key=lambda d: d["tsMs"], reverse=True)
+        return [dict(d) for d in rows[:limit]]
+
+    async def journal_get(entry_id):
+        doc = store[db_mod.JOURNAL].get(entry_id)
+        return dict(doc) if doc else None
+
+    async def journal_upsert(entry_id, fields, *, insert_fields):
+        doc = store[db_mod.JOURNAL].get(entry_id)
+        if doc is None:
+            doc = {"_id": entry_id, **insert_fields}
+            store[db_mod.JOURNAL][entry_id] = doc
+        doc.update(fields)
+        return dict(doc)
+
+    async def journal_delete(entry_id):
+        return store[db_mod.JOURNAL].pop(entry_id, None) is not None
+
+    async def journal_relabel(field, old, new):
+        modified = 0
+        for doc in store[db_mod.JOURNAL].values():
+            if field in ("tags", "mistakes"):
+                labels = doc.get(field) or []
+                if old in labels:
+                    kept = [x for x in labels if x != old]
+                    if new and new not in kept:
+                        kept.append(new)
+                    doc[field] = kept
+                    modified += 1
+            elif doc.get(field) == old:
+                if new:
+                    doc[field] = new
+                else:
+                    doc.pop(field, None)
+                modified += 1
+        return modified
+
+    async def journal_meta_get():
+        doc = store[db_mod.JOURNAL_META].get("meta")
+        return dict(doc) if doc else None
+
+    async def journal_meta_set(doc):
+        store[db_mod.JOURNAL_META]["meta"] = dict(doc)
+
     monkeypatch.setattr(db_mod, "latest_ts_ms", latest_ts_ms)
     monkeypatch.setattr(db_mod, "bulk_upsert", bulk_upsert)
     monkeypatch.setattr(db_mod, "query_history", query_history)
+    monkeypatch.setattr(db_mod, "journal_query", journal_query)
+    monkeypatch.setattr(db_mod, "journal_get", journal_get)
+    monkeypatch.setattr(db_mod, "journal_upsert", journal_upsert)
+    monkeypatch.setattr(db_mod, "journal_delete", journal_delete)
+    monkeypatch.setattr(db_mod, "journal_relabel", journal_relabel)
+    monkeypatch.setattr(db_mod, "journal_meta_get", journal_meta_get)
+    monkeypatch.setattr(db_mod, "journal_meta_set", journal_meta_set)
     return store
 
 

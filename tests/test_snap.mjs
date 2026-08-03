@@ -5,11 +5,13 @@
 import fs from "node:fs";
 import assert from "node:assert/strict";
 
-// app.js + charts.js + risk.js share one global scope in the browser (plain
-// scripts); concatenating them here mirrors that, so cross-file references
-// (e.g. wsSanitizeState → mcSanitizeCharts / rkSanitizeViewState) extract.
+// app.js + charts.js + risk.js + journal.js share one global scope in the
+// browser (plain scripts); concatenating them here mirrors that, so cross-file
+// references (e.g. wsSanitizeState → mcSanitizeCharts / rkSanitizeViewState /
+// jnSanitizeViewState) extract.
 const src = fs.readFileSync(new URL("../app/static/charts.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/risk.js", import.meta.url), "utf8") +
+  "\n" + fs.readFileSync(new URL("../app/static/journal.js", import.meta.url), "utf8") +
   "\n" + fs.readFileSync(new URL("../app/static/app.js", import.meta.url), "utf8");
 
 function extractFn(name) {
@@ -110,10 +112,13 @@ const wsConsts = ["WS_SCHEMA_VERSION", "WS_MAX", "WS_PANEL_IDS", "WS_TABS", "WS_
   "MC_LAYOUT_IDS", "MC_LAYOUT_SLOTS", "MC_LAYOUT_GRID", "MC_INTERVAL_CODES",
   "MC_SYMBOL_RE", "MC_MIN_SPAN", "MC_MAX_SPAN", "MC_DEFAULT_SPAN",
   "MC_LINK_KINDS", "MC_DEFAULT_SYMBOLS",
-  // …and the risk view sanitizer's allowlists (risk.js).
-  "RK_ALLOC_VIEWS", "RK_HIST_METRICS", "RK_SORTS"].map(extractConst).join("\n");
+  // …the risk view sanitizer's allowlists (risk.js)…
+  "RK_ALLOC_VIEWS", "RK_HIST_METRICS", "RK_SORTS",
+  // …and the journal view sanitizer's allowlists (journal.js).
+  "JN_VIEWS", "JN_RANGES", "JN_RESULTS", "JN_SIDES", "JN_STATUS_FILTERS",
+  "JN_SORTS", "JN_DATE_RE", "JN_MONTH_RE"].map(extractConst).join("\n");
 const wsFns = ["wsId", "scSanitizeViewState", "mcSlotId", "mcNewSlot", "mcSanitizeCharts",
-  "rkSanitizeViewState",
+  "rkSanitizeViewState", "jnSanitizeViewState",
   "wsSanitizeState", "wsMakeWorkspace", "wsSanitizeWorkspace",
   "wsNewDoc", "wsMigrateFromV1", "wsParseDoc", "wsValidateImport",
   "wsCreate", "wsDuplicate", "wsRename", "wsDelete"].map(extractFn).join("\n");
@@ -914,4 +919,124 @@ assert.equal(SC.scFuzzyScore("BTCUSDT", ""), 0);
   assert.ok(elapsed < 2000, `10 full pipeline passes over 2000 symbols took ${elapsed}ms (must stay interactive)`);
 }
 
-console.log("snapToStep + projectedPnl + workspace-core + watchlist-core + scanner-core regression tests passed");
+// ---------------------------------------------------------------------------
+// Journal core (journal.js) — the pure layer between exchange records and the
+// review UI: identity, join, filters, queue semantics, stats, calendar,
+// markdown safety. All DOM-free by the module's own contract.
+// ---------------------------------------------------------------------------
+{
+  const jnConsts = ["JN_STATUSES", "JN_STATUS_LABELS", "JN_ID_RE", "JN_EXCERPT", "JN_PAGE"]
+    .map(extractConst).join("\n");
+  const jnFns = ["esc", "jnSanitizeViewState", "jnTradeId", "jnJoin", "jnDirection",
+    "jnEffectiveStatus", "jnInQueue", "jnMatchesSearch", "jnFilterTrades", "jnSortTrades",
+    "jnDayKey", "jnGroupDays", "jnMonthShift", "jnCalendarModel", "jnStats", "jnBreakdown",
+    "jnScoreBuckets", "jnWordCount", "jnExcerptText", "jnListShape", "jnMarkdown"]
+    .map(extractFn).join("\n");
+  const JN = new Function(wsConsts + "\n" + jnConsts + "\n" + jnFns +
+    "\nreturn { jnSanitizeViewState, jnTradeId, jnJoin, jnDirection, jnInQueue, jnFilterTrades, " +
+    "jnSortTrades, jnDayKey, jnGroupDays, jnMonthShift, jnCalendarModel, jnStats, jnBreakdown, " +
+    "jnScoreBuckets, jnWordCount, jnExcerptText, jnListShape, jnMarkdown };")();
+
+  // Identity: the Closed-PnL natural id, charset-enforced like the backend.
+  const row = (o) => ({ orderId: "ord1", updatedTime: "1700000000000", createdTime: "1699990000000",
+    symbol: "BTCUSDT", side: "Sell", closedPnl: "25.5", qty: "1", avgEntryPrice: "100",
+    avgExitPrice: "125", leverage: "10", ...o });
+  assert.equal(JN.jnTradeId(row()), "ord1:1700000000000");
+  assert.equal(JN.jnTradeId({ orderId: "", updatedTime: "1" }), null);
+  assert.equal(JN.jnTradeId({ orderId: "a b", updatedTime: "1" }), null, "id charset enforced");
+
+  // Join + direction (a Sell CLOSE means the position was long).
+  const entries = [{ id: "ord1:1700000000000", tags: ["Breakout"], mistakes: ["Late Entry"],
+    reviewStatus: "reviewed", hasNotes: true, noteWords: 5, notesExcerpt: "clean breakout",
+    rating: 4, confidence: 3, strategy: "Momentum" }];
+  const trades = JN.jnJoin(
+    [row(), row({ orderId: "ord2", updatedTime: "1700000100000", side: "Buy", closedPnl: "-10" })],
+    entries);
+  assert.equal(trades.length, 2);
+  assert.equal(JN.jnDirection(trades[0]), "long");
+  assert.equal(JN.jnDirection(trades[1]), "short");
+  assert.ok(trades[0].entry && trades[1].entry === null, "entries attach by id only");
+  assert.equal(trades[0].durMs, 10000000, "hold time from createdTime→updatedTime");
+
+  // Review-queue semantics: reviewed leaves the queue, unjournaled stays.
+  assert.equal(JN.jnInQueue(trades[0]), false);
+  assert.equal(JN.jnInQueue(trades[1]), true);
+
+  // Filters combine as AND; search spans symbol/strategy/tags/notes.
+  const V = (o) => JN.jnSanitizeViewState(o);
+  assert.deepEqual(JN.jnFilterTrades(trades, V({ result: "win", tags: ["Breakout"] })).map((t) => t.id),
+    ["ord1:1700000000000"]);
+  assert.equal(JN.jnFilterTrades(trades, V({ search: "momentum breakout" })).length, 1);
+  assert.equal(JN.jnFilterTrades(trades, V({ search: "zzz" })).length, 0);
+  assert.equal(JN.jnFilterTrades(trades, V({ status: "queue" }))[0].id, "ord2:1700000100000");
+  assert.equal(JN.jnFilterTrades(trades, V({ status: "noted" })).length, 1);
+  assert.equal(JN.jnFilterTrades(trades, V({ mistake: "Late Entry" })).length, 1);
+  assert.equal(JN.jnFilterTrades(trades, V({ confMin: 4 })).length, 0, "confidence 3 < min 4");
+  assert.equal(JN.jnFilterTrades(trades, V({ side: "short" })).length, 1);
+  assert.equal(JN.jnSortTrades(trades, "pnl", "desc")[0].pnl, 25.5);
+
+  // Sanitizer: hostile/garbage view state coerces to safe defaults.
+  const dirty = JN.jnSanitizeViewState({ view: "hack", range: "999", from: "20250101",
+    search: 42, tags: ["ok", 7, "x".repeat(200)], confMin: 9, sort: "evil", dir: "up",
+    status: "root", calMonth: "junk" });
+  assert.equal(dirty.view, "overview");
+  assert.equal(dirty.range, "30");
+  assert.equal(dirty.from, "");
+  assert.equal(dirty.search, "");
+  assert.deepEqual(dirty.tags.map((t) => t.length <= 60), [true, true]);
+  assert.equal(dirty.confMin, 0);
+  assert.equal(dirty.sort, "time");
+  assert.equal(dirty.dir, "desc");
+  assert.equal(dirty.status, "all");
+  assert.equal(dirty.calMonth, "");
+
+  // Stats: totals, queue, profit factor, journaled coverage.
+  const s = JN.jnStats(trades);
+  assert.equal(s.count, 2);
+  assert.equal(s.wins, 1);
+  assert.ok(Math.abs(s.total - 15.5) < 1e-9);
+  assert.ok(Math.abs(s.profitFactor - 2.55) < 1e-9);
+  assert.equal(s.journaled, 1);
+  assert.equal(s.queue, 1);
+  assert.equal(s.avgRating, 4);
+
+  // Day grouping + calendar (timezone-agnostic: keys derived via jnDayKey).
+  const days = JN.jnGroupDays(JN.jnSortTrades(trades, "time", "desc"));
+  assert.equal(days.length, 1, "trades 100s apart share a local day");
+  assert.equal(days[0].trades.length, 2);
+  const key = JN.jnDayKey(1700000000000);
+  const cal = JN.jnCalendarModel(trades, key.slice(0, 7));
+  assert.ok(cal.weeks.every((w) => w.length === 7), "Monday-first full weeks");
+  const cell = cal.weeks.flat().find((c) => c.key === key);
+  assert.ok(cell && cell.count === 2);
+  assert.ok(Math.abs(cell.pnl - 15.5) < 1e-9);
+  assert.equal(cell.noted, 1);
+  assert.equal(JN.jnMonthShift("2026-01", -1), "2025-12");
+  assert.equal(JN.jnMonthShift("2026-12", 1), "2027-01");
+
+  // Breakdown + score buckets (the insights layer).
+  assert.deepEqual(JN.jnBreakdown(trades, (t) => (t.entry && t.entry.tags) || []),
+    [{ label: "Breakout", count: 1, wins: 1, pnl: 25.5 }]);
+  assert.equal(JN.jnScoreBuckets(trades, "confidence")[2].count, 1, "confidence 3 → bucket 3");
+
+  // Notes helpers: word count, excerpting, list-shape mirror of the server.
+  assert.equal(JN.jnWordCount("one  two\nthree"), 3);
+  assert.equal(JN.jnWordCount(""), 0);
+  const long = "word ".repeat(100).trim();
+  assert.ok(JN.jnExcerptText(long).endsWith("…") && JN.jnExcerptText(long).length <= 241);
+  const shaped = JN.jnListShape({ id: "x", notes: long, lessons: "", tags: [] });
+  assert.equal(shaped.notes, undefined, "list shape must never carry full text");
+  assert.equal(shaped.noteWords, 100);
+  assert.equal(shaped.hasNotes, true);
+  assert.equal(shaped.hasLessons, false);
+
+  // Markdown-lite: escape-first — injected tags can never survive.
+  const html = JN.jnMarkdown("# Head\n- item **bold**\n> quote\n<script>alert(1)</script>");
+  assert.ok(!html.includes("<script>"), "raw tags are escaped, never rendered");
+  assert.ok(html.includes("&lt;script&gt;alert(1)&lt;/script&gt;"));
+  assert.ok(html.includes("<h4"));
+  assert.ok(html.includes("<li>item <strong>bold</strong></li>"));
+  assert.ok(html.includes("<blockquote>"));
+}
+
+console.log("snapToStep + projectedPnl + workspace-core + watchlist-core + scanner-core + journal-core regression tests passed");

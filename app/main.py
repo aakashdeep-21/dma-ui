@@ -38,7 +38,7 @@ from pymongo.errors import PyMongoError
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import Response as StarletteResponse
 
-from . import auth, db, dma_client, history_sync, market_data, notifier, scanner, signer
+from . import auth, db, dma_client, history_sync, journal, market_data, notifier, scanner, signer
 from .config import settings
 
 def _configure_logging() -> None:
@@ -900,6 +900,136 @@ async def api_klines(
     with the symbol/interval validated against a server-side whitelist. Requires
     a logged-in session like every other read endpoint."""
     return await market_data.get_kline(symbol, interval, limit)
+
+
+# --------------------------------------------------------------------------
+# Trading Journal API — native MongoDB-backed endpoints (no exchange proxying).
+#
+# Entries annotate completed trades (keyed by the Closed-PnL record's natural
+# id, `orderId:updatedTime`) with notes / strategy / tags / mistakes / scores /
+# review status; catalogs (Journal-Meta) hold the user's tag/strategy/mistake
+# definitions. Reads are open to any logged-in user like every other read.
+# Writes require the ADMIN role but deliberately NOT the trade token: journal
+# writes move no money and touch no exchange state, and demanding the trade
+# ceremony on every autosaved keystroke would push users into disabling it.
+# CSRF is still covered without the custom-header check — the session cookie
+# is SameSite=Lax, so a cross-site POST/PUT never carries it. Like the history
+# reads, a Mongo outage degrades these to 503 while trading keeps working.
+# --------------------------------------------------------------------------
+_JOURNAL_READ_MAX = 10_000  # matches the history read ceiling
+
+
+async def _journal_or_503(coro):
+    try:
+        return await coro
+    except (PyMongoError, BSONError, OSError):
+        logger.exception("journal operation failed: mongo unavailable")
+        raise HTTPException(status_code=503, detail="journal database unavailable")
+
+
+def _require_entry_id(entry_id: str) -> str:
+    if not journal.valid_entry_id(entry_id):
+        raise HTTPException(status_code=400, detail="invalid journal entry id")
+    return entry_id
+
+
+@app.get("/api/journal/entries")
+async def api_journal_entries(
+    symbol: str | None = None,
+    startTime: str | None = None,
+    endTime: str | None = None,
+    user: dict = Depends(current_user),
+):
+    """Journal entries whose trade closed in [startTime, endTime] (both epoch
+    ms; omitted = all time, mirroring the History tab's 'Overall'). List reads
+    carry note EXCERPTS + word counts, never full text — a thousands-of-trades
+    window stays a small payload and full notes load only on card expand."""
+    rng = _parse_range(startTime, endTime)
+    start_ms, end_ms = rng if rng else (0, int(time.time() * 1000))
+    rows = await _journal_or_503(db.journal_query(
+        symbol=_norm_symbol_opt(symbol), start_ms=start_ms, end_ms=end_ms,
+        limit=_JOURNAL_READ_MAX,
+    ))
+    return {
+        "entries": [journal.shape_entry(d, full=False) for d in rows],
+        "truncated": len(rows) >= _JOURNAL_READ_MAX,
+        "nowMs": int(time.time() * 1000),
+    }
+
+
+@app.get("/api/journal/entry/{entry_id}")
+async def api_journal_entry(entry_id: str, user: dict = Depends(current_user)):
+    doc = await _journal_or_503(db.journal_get(_require_entry_id(entry_id)))
+    return {"entry": journal.shape_entry(doc, full=True) if doc else None}
+
+
+@app.put("/api/journal/entry/{entry_id}")
+async def api_journal_entry_put(
+    entry_id: str, payload: dict = Body(...), user: dict = Depends(require_admin)
+):
+    """Partial upsert (the autosave path): only allowlisted, validated fields
+    are ever $set. The payload must also carry the trade's symbol + close-time
+    tsMs — stamped ONCE via $setOnInsert as the entry's denormalized join/index
+    keys, then immutable, so an entry can never drift from its trade."""
+    _require_entry_id(entry_id)
+    try:
+        fields = journal.clean_entry_fields(payload)
+    except journal.JournalValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not fields:
+        raise HTTPException(status_code=400, detail="no journal fields in payload")
+    sym = _require_symbol(payload.get("symbol"))
+    try:
+        ts_ms = int(payload.get("tsMs"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="tsMs must be the trade's close time in epoch ms")
+    now_ms = int(time.time() * 1000)
+    if not 0 < ts_ms <= now_ms + 86_400_000:
+        raise HTTPException(status_code=400, detail="tsMs is out of range")
+    fields["updatedAtMs"] = now_ms
+    doc = await _journal_or_503(db.journal_upsert(
+        entry_id, fields, insert_fields=journal.insert_fields(sym, ts_ms),
+    ))
+    return {"entry": journal.shape_entry(doc, full=True)}
+
+
+@app.delete("/api/journal/entry/{entry_id}")
+async def api_journal_entry_delete(entry_id: str, user: dict = Depends(require_admin)):
+    deleted = await _journal_or_503(db.journal_delete(_require_entry_id(entry_id)))
+    return {"deleted": deleted}
+
+
+@app.get("/api/journal/meta")
+async def api_journal_meta(user: dict = Depends(current_user)):
+    doc = await _journal_or_503(db.journal_meta_get())
+    if doc is None:
+        # Starter catalogs so the pickers are useful before the first save;
+        # isDefault tells the client these are suggestions, not stored state.
+        return {"meta": journal.default_meta(), "isDefault": True}
+    return {"meta": doc, "isDefault": False}
+
+
+@app.put("/api/journal/meta")
+async def api_journal_meta_put(payload: dict = Body(...), user: dict = Depends(require_admin)):
+    try:
+        doc = journal.clean_meta(payload)
+    except journal.JournalValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    await _journal_or_503(db.journal_meta_set(dict(doc)))
+    return {"meta": doc, "isDefault": False}
+
+
+@app.post("/api/journal/meta/rename")
+async def api_journal_relabel(payload: dict = Body(...), user: dict = Depends(require_admin)):
+    """Rename (or remove, with to=null/"") one tag / strategy / mistake label
+    across every entry. The catalog itself is the client's to update via PUT
+    /api/journal/meta — this endpoint only rewrites the entries."""
+    try:
+        field, old, new = journal.clean_relabel(payload)
+    except journal.JournalValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    modified = await _journal_or_503(db.journal_relabel(field, old, new))
+    return {"modified": modified}
 
 
 # --------------------------------------------------------------------------

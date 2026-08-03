@@ -20,7 +20,7 @@ import os
 import tempfile
 from urllib.parse import parse_qs
 
-from pymongo import ASCENDING, DESCENDING, AsyncMongoClient, IndexModel, UpdateOne
+from pymongo import ASCENDING, DESCENDING, AsyncMongoClient, IndexModel, ReturnDocument, UpdateOne
 
 from .config import settings
 
@@ -31,6 +31,15 @@ from .config import settings
 TRADES = "Trades"
 CLOSED_PNL = "Closed-PnL"
 _KINDS = (TRADES, CLOSED_PNL)
+
+# Trading-journal annotations. One doc per completed trade, keyed by the SAME
+# natural identity the Closed-PnL mirror uses (`orderId:updatedTime`), so an
+# entry references its trade without duplicating any exchange data — the two
+# are joined client-side. JOURNAL_META is a singleton doc holding the user's
+# tag / strategy / mistake catalogs (names + colors).
+JOURNAL = "Journal"
+JOURNAL_META = "Journal-Meta"
+_META_ID = "meta"
 
 _client: AsyncMongoClient | None = None
 _ca_temp_path: str | None = None
@@ -102,6 +111,14 @@ def collection(kind: str):
     return get_client()[settings.MONGO_DB_NAME][kind]
 
 
+def _journal():
+    return get_client()[settings.MONGO_DB_NAME][JOURNAL]
+
+
+def _journal_meta():
+    return get_client()[settings.MONGO_DB_NAME][JOURNAL_META]
+
+
 async def ping() -> None:
     """Round-trip the server; raises if Mongo is unreachable/misconfigured."""
     await get_client().admin.command("ping")
@@ -121,6 +138,11 @@ async def ensure_indexes() -> None:
     ]
     for kind in _KINDS:
         await collection(kind).create_indexes(models)
+    # Journal entries share the range/symbol read shapes; reviewStatus feeds the
+    # review-queue filter. (Journal-Meta is a singleton — _id is enough.)
+    await _journal().create_indexes(models + [
+        IndexModel([("reviewStatus", ASCENDING)], name="reviewStatus"),
+    ])
 
 
 async def aclose() -> None:
@@ -185,3 +207,66 @@ async def query_history(
         .limit(limit)
     )
     return await cursor.to_list(length=limit)
+
+
+# --------------------------------------------------------------------------
+# Trading journal — entries + catalogs. Same thin-seam philosophy as the
+# history helpers above: validation and shaping live in main.py; the tests
+# monkeypatch these functions to run the journal API against an in-memory
+# store. Docs keep `_id` in query results (unlike query_history) because the
+# id IS the join key the frontend matches against its closed-PnL rows.
+# --------------------------------------------------------------------------
+async def journal_query(*, symbol: str | None, start_ms: int, end_ms: int, limit: int) -> list[dict]:
+    """Newest-first journal entries whose trade closed in [start_ms, end_ms]."""
+    filt: dict = {"tsMs": {"$gte": start_ms, "$lte": end_ms}}
+    if symbol:
+        filt["symbol"] = symbol
+    cursor = _journal().find(filt).sort("tsMs", DESCENDING).limit(limit)
+    return await cursor.to_list(length=limit)
+
+
+async def journal_get(entry_id: str) -> dict | None:
+    return await _journal().find_one({"_id": entry_id})
+
+
+async def journal_upsert(entry_id: str, fields: dict, *, insert_fields: dict) -> dict:
+    """Partial update (autosave-friendly): $set only the caller's validated
+    fields, stamping insert-only fields (createdAt, the denormalized
+    symbol/tsMs join keys) on first write. Returns the doc AFTER the update."""
+    return await _journal().find_one_and_update(
+        {"_id": entry_id},
+        {"$set": fields, "$setOnInsert": insert_fields},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def journal_delete(entry_id: str) -> bool:
+    result = await _journal().delete_one({"_id": entry_id})
+    return result.deleted_count > 0
+
+
+async def journal_relabel(field: str, old: str, new: str | None) -> int:
+    """Rename (or, with new=None, remove) a label across every entry.
+    `field` is one of "tags" / "mistakes" (array-valued) or "strategy"
+    (scalar). Two-step for arrays ($addToSet then $pull) so a doc already
+    carrying BOTH labels never ends up with a duplicate. Returns the number
+    of entries that carried the old label."""
+    if field in ("tags", "mistakes"):
+        if new:
+            await _journal().update_many({field: old}, {"$addToSet": {field: new}})
+        result = await _journal().update_many({field: old}, {"$pull": {field: old}})
+        return result.modified_count
+    if field == "strategy":
+        update = {"$set": {field: new}} if new else {"$unset": {field: ""}}
+        result = await _journal().update_many({field: old}, update)
+        return result.modified_count
+    raise ValueError(f"unknown journal label field: {field!r}")
+
+
+async def journal_meta_get() -> dict | None:
+    return await _journal_meta().find_one({"_id": _META_ID}, projection={"_id": 0})
+
+
+async def journal_meta_set(doc: dict) -> None:
+    await _journal_meta().replace_one({"_id": _META_ID}, doc, upsert=True)

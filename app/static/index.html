@@ -561,32 +561,88 @@
           </section>
         </div>
 
-        <!-- ============ HISTORY / JOURNAL ============ -->
+        <!-- ============ TRADING JOURNAL (data-pane "history" for workspace continuity) ============ -->
         <div class="pane" data-pane="history" id="panel-history" role="tabpanel" aria-labelledby="tab-history" hidden>
-          <section class="panel">
-            <div class="panel-head">
-              <h2>Trading Journal — Closed PnL</h2>
-              <div class="panel-head-actions">
-                <select id="history-range" aria-label="History time range">
+          <section class="panel jn-panel">
+            <div class="panel-head jn-head">
+              <h2>Trading Journal</h2>
+              <span id="jn-synced" class="muted"></span>
+              <div class="panel-head-actions jn-head-actions">
+                <div class="segment jn-viewseg" id="jn-views" role="group" aria-label="Journal view">
+                  <button class="seg-neutral active" data-jnview="overview" aria-pressed="true">Overview</button>
+                  <button class="seg-neutral" data-jnview="trades" aria-pressed="false">Trades</button>
+                  <button class="seg-neutral" data-jnview="calendar" aria-pressed="false">Calendar</button>
+                  <button class="seg-neutral" data-jnview="insights" aria-pressed="false">Insights</button>
+                  <button class="seg-neutral" data-jnview="fills" aria-pressed="false">Fills</button>
+                </div>
+                <select id="jn-range" aria-label="Journal time range">
                   <option value="1">Last day</option>
                   <option value="7">Last week</option>
                   <option value="30" selected>Last month</option>
                   <option value="all">Overall</option>
                   <option value="custom">Custom…</option>
                 </select>
-                <input type="date" id="history-from" aria-label="From date" hidden />
-                <input type="date" id="history-to" aria-label="To date" hidden />
-                <input id="history-filter" placeholder="Filter symbol…" aria-label="Filter history by symbol" />
-                <button id="history-refresh" class="btn-ghost sm">Refresh</button>
+                <input type="date" id="jn-from" aria-label="From date" hidden />
+                <input type="date" id="jn-to" aria-label="To date" hidden />
+                <input id="jn-search" placeholder="Search symbol, notes, tags…" aria-label="Search the journal" />
+                <button id="jn-labels" class="btn-ghost sm admin-only" title="Manage tags, strategies and mistake labels">Labels</button>
+                <button id="jn-refresh" class="btn-ghost sm">Refresh</button>
               </div>
             </div>
-            <div id="history-summary" class="explorer-summary" hidden></div>
-            <div id="history-analytics" class="analytics" hidden></div>
-            <div id="history-closed" class="explorer-result"><p class="muted" style="padding:14px">Open this tab to load history…</p></div>
-          </section>
-          <section class="panel">
-            <div class="panel-head"><h2>Recent Trades</h2></div>
-            <div id="history-exec" class="explorer-result"><p class="muted" style="padding:14px">—</p></div>
+            <div id="jn-filterbar" class="jn-filterbar" role="group" aria-label="Journal filters">
+              <select id="jn-f-result" aria-label="Filter by result">
+                <option value="all">All results</option>
+                <option value="win">Wins</option>
+                <option value="loss">Losses</option>
+              </select>
+              <select id="jn-f-side" aria-label="Filter by direction">
+                <option value="all">Both sides</option>
+                <option value="long">Longs</option>
+                <option value="short">Shorts</option>
+              </select>
+              <select id="jn-f-status" aria-label="Filter by review status">
+                <option value="all">Any status</option>
+                <option value="queue">Review queue</option>
+                <option value="pending">To review</option>
+                <option value="reviewed">Reviewed</option>
+                <option value="needs_attention">Needs attention</option>
+                <option value="excellent">Excellent</option>
+                <option value="follow_up">Follow-up</option>
+                <option value="noted">Has notes</option>
+                <option value="unjournaled">Unjournaled</option>
+              </select>
+              <select id="jn-f-strategy" aria-label="Filter by strategy"><option value="">Any strategy</option></select>
+              <select id="jn-f-mistake" aria-label="Filter by mistake"><option value="">Any mistake</option></select>
+              <select id="jn-f-conf" aria-label="Minimum confidence">
+                <option value="0">Any confidence</option>
+                <option value="1">Confidence ≥ 1★</option>
+                <option value="2">Confidence ≥ 2★</option>
+                <option value="3">Confidence ≥ 3★</option>
+                <option value="4">Confidence ≥ 4★</option>
+                <option value="5">Confidence 5★</option>
+              </select>
+              <select id="jn-f-rating" aria-label="Minimum rating">
+                <option value="0">Any rating</option>
+                <option value="1">Rating ≥ 1★</option>
+                <option value="2">Rating ≥ 2★</option>
+                <option value="3">Rating ≥ 3★</option>
+                <option value="4">Rating ≥ 4★</option>
+                <option value="5">Rating 5★</option>
+              </select>
+              <select id="jn-sort" aria-label="Sort trades">
+                <option value="time:desc">Newest first</option>
+                <option value="time:asc">Oldest first</option>
+                <option value="pnl:desc">Biggest win</option>
+                <option value="pnl:asc">Biggest loss</option>
+                <option value="rating:desc">Top rated</option>
+                <option value="confidence:desc">Highest confidence</option>
+                <option value="duration:desc">Longest hold</option>
+              </select>
+              <div id="jn-tagbar" class="jn-tagbar" aria-label="Tag filters"></div>
+              <button id="jn-clear" class="btn-ghost sm" hidden>Clear filters</button>
+            </div>
+            <div id="jn-summary" class="explorer-summary" hidden></div>
+            <div id="jn-content" class="jn-content"><p class="muted" style="padding:14px">Open this tab to load your journal…</p></div>
           </section>
         </div>
 
@@ -855,10 +911,24 @@
     </div>
   </div>
 
-  <!-- Module scripts first (charts.js = multi-chart, risk.js = risk system);
-       app.js boots them and feeds risk.js every live snapshot. -->
+  <!-- Journal label manager (tags / strategies / mistakes — admin only) -->
+  <div id="jn-meta-overlay" class="modal-overlay" hidden>
+    <div class="modal jn-meta-modal" role="dialog" aria-modal="true" aria-labelledby="jn-meta-title">
+      <h3 id="jn-meta-title">Journal labels</h3>
+      <div id="jn-meta-body" class="jn-meta-body"></div>
+      <div class="modal-actions">
+        <button id="jn-meta-close" class="btn-ghost" type="button">Cancel</button>
+        <button id="jn-meta-save" class="btn-primary" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Module scripts first (charts.js = multi-chart, risk.js = risk system,
+       journal.js = trading journal); app.js boots them and feeds risk.js
+       every live snapshot. -->
   <script src="/static/charts.js"></script>
   <script src="/static/risk.js"></script>
+  <script src="/static/journal.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

@@ -2584,7 +2584,9 @@ function wireTabs() {
     // is managed separately by scEnsureAlertTimer).
     if (name !== "scanner") clearInterval(_scTimer);
     if (name === "scanner") onScannerActive();
-    if (name === "history") onHistoryActive();
+    // The "history" pane is the Trading Journal (journal.js) — the pane id is
+    // kept for workspace-state continuity with saved layouts.
+    if (name === "history") onJournalActive();
     if (name === "account") onAccountActive();
     // Risk tab: refresh the daily history context while visible (the live
     // metrics themselves ride the shared WS snapshot, no extra polling).
@@ -3616,40 +3618,13 @@ function focusWlRow(sym) {
   if (row && row.isConnected) { try { row.focus(); } catch (e) {} }
 }
 
-let _historyLoaded = false;
+// (The old fetch/render plumbing of this tab now lives in journal.js — the
+// Trading Journal owns its own range/filter model, fetch sequencing and cache.
+// toDateInputValue and fmtSynced stay here: both predate the journal and are
+// part of the shared formatting vocabulary it consumes.)
 function toDateInputValue(d) {
   const p = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
-function historyQuery() {
-  // Presets ride the server's `days` param (1 = last 24h, 7 = 168h, 30 = 720h);
-  // Custom sends explicit epoch-ms bounds — From at local midnight, To at local
-  // end-of-day, so a single-day pick covers that whole day. Returns null when
-  // the custom range is missing/inverted (caller shows the error).
-  const filter = (document.getElementById("history-filter").value || "").trim().toUpperCase();
-  const rangeEl = document.getElementById("history-range");
-  const params = new URLSearchParams();
-  if (rangeEl && rangeEl.value === "all") {
-    // Overall = everything the mirror holds (epoch 0 → now); the server's
-    // 10k row cap + `truncated` flag still bound the response.
-    params.set("startTime", "0");
-    params.set("endTime", String(Date.now()));
-  } else if (rangeEl && rangeEl.value === "custom") {
-    const fromEl = document.getElementById("history-from");
-    const toEl = document.getElementById("history-to");
-    const from = fromEl && fromEl.value ? new Date(fromEl.value + "T00:00:00") : null;
-    const to = toEl && toEl.value ? new Date(toEl.value + "T23:59:59.999") : null;
-    if (!from || !to || !isFinite(from.getTime()) || !isFinite(to.getTime()) ||
-        from.getTime() > to.getTime()) {
-      return null;
-    }
-    params.set("startTime", String(from.getTime()));
-    params.set("endTime", String(to.getTime()));
-  } else {
-    params.set("days", rangeEl ? rangeEl.value : "30");
-  }
-  if (filter) params.set("symbol", filter);
-  return "?" + params.toString();
 }
 function fmtSynced(ms, serverNowMs) {
   // History is served from the server's MongoDB mirror (synced ~every minute).
@@ -3661,148 +3636,9 @@ function fmtSynced(ms, serverNowMs) {
   const stale = now - ms > 15 * 60 * 1000;
   return fmtTime(ms) + (stale ? " ⚠ stale" : "");
 }
-// Monotonic token: a newer refresh (range/filter change, Refresh click) makes
-// every still-in-flight older fetch drop its results, so two overlapping loads
-// can never interleave rows from different windows on screen.
-let _historySeq = 0;
-// Last fetched payloads — the currency toggle re-renders from here instead of
-// refetching (an "Overall" read can be ~10k rows per collection).
-let _historyCache = null;
-let _historyLoadedAt = 0; // when the on-screen history window was last fetched
-
-async function fetchHistory() {
-  const closedEl = document.getElementById("history-closed");
-  const execEl = document.getElementById("history-exec");
-  const sumEl = document.getElementById("history-summary");
-  // Both fetches share ONE window (a preset or the custom From/To range) so
-  // the fee tally lines up with the PnL period; the symbol filter narrows both.
-  const histQuery = historyQuery();
-  if (!histQuery) {
-    sumEl.hidden = false;
-    sumEl.textContent = "Pick a valid From/To range (From must not be after To).";
-    return;
-  }
-  const seq = ++_historySeq;
-  _historyLoadedAt = Date.now();
-  closedEl.innerHTML = loadingMsg();
-  execEl.innerHTML = loadingMsg();
-  // Parallel: the two reads are independent Mongo queries, so waiting for one
-  // before starting the other only added latency.
-  const [closed, exec] = await Promise.allSettled([
-    api("/api/closed-pnl" + histQuery),
-    api("/api/executions" + histQuery),
-  ]);
-  if (seq !== _historySeq) return; // superseded — a newer load owns the screen
-  _historyCache = {
-    closed: closed.status === "fulfilled" ? closed.value : null,
-    closedErr: closed.status === "rejected" ? closed.reason : null,
-    exec: exec.status === "fulfilled" ? exec.value : null,
-    execErr: exec.status === "rejected" ? exec.reason : null,
-  };
-  renderHistoryResults(_historyCache);
-}
-
-// Pure render of already-fetched history payloads (fetchHistory + the currency
-// toggle both come through here so the two views can never diverge).
-function renderHistoryResults(res) {
-  const closedEl = document.getElementById("history-closed");
-  const execEl = document.getElementById("history-exec");
-  const sumEl = document.getElementById("history-summary");
-  const analyticsEl = document.getElementById("history-analytics");
-
-  let closedList = [];
-  let closedSyncedMs = NaN;
-  let serverNowMs = NaN;
-  let fees = null, maker = null, taker = null;
-
-  if (res.exec) {
-    listOf(res.exec).forEach((r) => {
-      const f = Number(r.execFee);
-      if (isFinite(f)) fees = (fees || 0) + f;
-      if (r.isMaker === true || r.isMaker === "true") maker = (maker || 0) + 1;
-      else if (r.isMaker === false || r.isMaker === "false") taker = (taker || 0) + 1;
-    });
-    if (fees == null) fees = 0;
-    maker = maker || 0;
-    taker = taker || 0;
-  }
-
-  if (res.closed) {
-    closedList = listOf(res.closed);
-    const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
-    const todayMs = startOfDay.getTime();
-    let total = 0, today = 0, wins = 0;
-    closedList.forEach((r) => {
-      const v = Number(r.closedPnl) || 0;
-      total += v;
-      if (v > 0) wins++;
-      const t = Number(r.updatedTime ?? r.createdTime);
-      if (isFinite(t) && t >= todayMs) today += v;
-    });
-    closedSyncedMs = Number(res.closed.result && res.closed.result.lastSyncedMs);
-    serverNowMs = Number(res.closed.result && res.closed.result.nowMs);
-    // The tab renders BOTH mirrors (closed-PnL rows + trade fee analytics), so
-    // show the OLDER of the two sync stamps — the label must never claim more
-    // freshness than the stalest data on screen.
-    let syncedLabel = fmtSynced(closedSyncedMs, serverNowMs);
-    if (res.exec) {
-      const execSyncedMs = Number(res.exec.result && res.exec.result.lastSyncedMs);
-      const execNowMs = Number(res.exec.result && res.exec.result.nowMs);
-      if (isFinite(execNowMs) && execNowMs > 0) serverNowMs = execNowMs;
-      const stamps = [closedSyncedMs, execSyncedMs].filter((v) => isFinite(v) && v > 0);
-      syncedLabel = stamps.length === 2 ? fmtSynced(Math.min(...stamps), serverNowMs) : "syncing…";
-    }
-    sumEl.hidden = false;
-    sumEl.innerHTML =
-      `Realized today: <span class="${pnlClass(today)} priv">${fmtMoneySigned(today)} ${esc(curUnit())}</span> · ` +
-      `Total (recent ${closedList.length}): <span class="${pnlClass(total)} priv">${fmtMoneySigned(total)}</span> · ` +
-      `Win rate: <span class="priv">${closedList.length ? Math.round((wins / closedList.length) * 100) : 0}%</span> · ` +
-      `Last synced: <span id="history-synced" class="muted">${syncedLabel}</span> · times local`;
-    renderHistoryAnalytics(closedList, fees, maker, taker);
-    closedEl.innerHTML = renderClosedPnl(res.closed);
-  } else {
-    sumEl.hidden = true;
-    if (analyticsEl) { analyticsEl.hidden = true; analyticsEl.innerHTML = ""; }
-    closedEl.innerHTML = errorMsg(res.closedErr && res.closedErr.message);
-  }
-
-  if (res.exec) {
-    execEl.innerHTML = renderExecutions(res.exec);
-  } else {
-    execEl.innerHTML = errorMsg(res.execErr && res.execErr.message);
-  }
-}
-function onHistoryActive() {
-  if (!_historyLoaded) { _historyLoaded = true; fetchHistory(); return; }
-  // Re-entering the tab later: the mirror syncs every minute, so a view older
-  // than that is quietly stale — refresh it (a cheap Mongo read), instead of
-  // presenting hours-old rows under a frozen "Last synced" stamp.
-  if (Date.now() - _historyLoadedAt > 60_000) fetchHistory();
-}
-
 function wireMarketsHistory() {
-  // (The Markets tab is now the Watchlist — wired in wireWatchlist().)
-  const hr = document.getElementById("history-refresh");
-  if (hr) hr.addEventListener("click", fetchHistory);
-  const hf = document.getElementById("history-filter");
-  if (hf) hf.addEventListener("keydown", (e) => { if (e.key === "Enter") fetchHistory(); });
-  const hrange = document.getElementById("history-range");
-  const hfrom = document.getElementById("history-from");
-  const hto = document.getElementById("history-to");
-  if (hrange) hrange.addEventListener("change", () => {
-    const custom = hrange.value === "custom";
-    if (hfrom && hto) {
-      hfrom.hidden = hto.hidden = !custom;
-      if (custom && !hfrom.value && !hto.value) {
-        // Prefill the last 30 days so the pickers open on a valid range.
-        const now = new Date();
-        hto.value = toDateInputValue(now);
-        hfrom.value = toDateInputValue(new Date(now.getTime() - 30 * 86400000));
-      }
-    }
-    fetchHistory();
-  });
-  [hfrom, hto].forEach((el) => { if (el) el.addEventListener("change", fetchHistory); });
+  // (The Markets tab is now the Watchlist — wired in wireWatchlist(); the
+  // History tab is now the Trading Journal — wired in wireJournal().)
   const ar = document.getElementById("account-refresh");
   if (ar) ar.addEventListener("click", loadAccountOverview);
 }
@@ -4464,12 +4300,9 @@ function rerenderForCurrency() {
   if (state.lastDashboard) renderDashboard(state.lastDashboard);
   if (_marketsData) renderMarkets();
   if (_scData) scRerender();
-  // Re-render history from the cached payloads — a currency flip is a pure
+  // Re-render the journal from its cached payloads — a currency flip is a pure
   // display change and must not refetch (an "Overall" read is ~10k rows/mirror).
-  if (_historyLoaded) {
-    if (_historyCache) renderHistoryResults(_historyCache);
-    else fetchHistory();
-  }
+  jnRerenderCurrency();
   if (_accountLoaded) loadAccountOverview();
   if (state.lastExplorer) {
     const out = document.getElementById("explorer-result");
@@ -5702,9 +5535,10 @@ function scCtxAction(act, sym, el) {
       break;
     case "journal": {
       const t = document.querySelector('#tabs .tab[data-tab="history"]');
-      const filter = document.getElementById("history-filter");
-      if (filter) { filter.value = sym; filter.dispatchEvent(new Event("input", { bubbles: true })); }
+      const search = document.getElementById("jn-search");
+      if (search) { search.value = sym; search.dispatchEvent(new Event("input", { bubbles: true })); }
       if (t) t.click();
+      if (typeof jnSwitchView === "function") jnSwitchView("trades");
       break;
     }
     case "watch": {
@@ -6289,6 +6123,10 @@ function wsSanitizeState(raw) {
     // same contract; the alert-armed switch is account-level and lives in
     // its own store, not the workspace.
     risk: rkSanitizeViewState(src.risk),
+    // Journal VIEW (sub-view, range, search, filters, sort, calendar month) —
+    // same contract; the entries/catalogs themselves live in MongoDB, the
+    // workspace only remembers how the journal was being looked at.
+    journal: jnSanitizeViewState(src.journal),
   };
 }
 
@@ -6466,6 +6304,7 @@ function wsCaptureState() {
   };
   st.scanner = scCaptureViewState();
   st.risk = rkCaptureViewState();
+  st.journal = jnCaptureViewState();
   return wsSanitizeState(st);
 }
 
@@ -6509,6 +6348,8 @@ function wsApplyState(rawState, opts = {}) {
   scApplyViewState(st.scanner);
   // Restore this workspace's risk view (allocation/sort/history metric).
   rkApplyViewState(st.risk);
+  // Restore this workspace's journal view (sub-view/range/filters/sort).
+  jnApplyViewState(st.journal);
   wsUpdateEmptyState();
   if (!opts.noAnim) {
     const pane = document.querySelector("main .pane:not([hidden])");
@@ -7025,11 +6866,27 @@ function wireCommandPalette() {
     });
     const expand = document.getElementById("chart-expand");
     if (expand) acts.push({ label: "Expand / collapse charts panel", hint: "esc exits", run: () => { gotoDash(); expand.click(); } });
-    [["history-refresh", "Refresh journal"],
+    [["jn-refresh", "Refresh journal"],
      ["account-refresh", "Refresh account"]].forEach(([id, label]) => {
       const b = document.getElementById(id);
       if (b) acts.push({ label, hint: "read-only", run: () => b.click() });
     });
+    // Journal actions — annotations only; nothing here can reach a trade write.
+    const gotoJournal = () => {
+      const pane = document.querySelector('[data-pane="history"]');
+      const tab = document.querySelector('#tabs .tab[data-tab="history"]');
+      if (pane && pane.hidden && tab) tab.click();
+    };
+    JN_VIEWS.forEach((v) => {
+      if (_jnView.view !== v) {
+        acts.push({ label: `Journal: ${JN_VIEW_LABELS[v]}`, hint: "journal", run: () => { gotoJournal(); jnSwitchView(v); } });
+      }
+    });
+    acts.push({ label: "Journal: review next trade", hint: "queue", run: () => { gotoJournal(); setTimeout(jnReviewNext, 0); } });
+    acts.push({ label: "Journal: search trades", hint: "notes/tags", run: () => { gotoJournal(); const s = document.getElementById("jn-search"); if (s) setTimeout(() => s.focus(), 0); } });
+    acts.push({ label: "Journal: jump to today", hint: "calendar", run: () => { gotoJournal(); jnGotoDay(jnDayKey(Date.now())); } });
+    const jl = document.getElementById("jn-labels");
+    if (jl && !jl.hidden) acts.push({ label: "Journal: manage labels", hint: "tags", run: () => { gotoJournal(); setTimeout(jnOpenLabels, 0); } });
     // Watchlist actions — display/navigation only; none can reach a write.
     const gotoWatch = () => {
       const pane = document.querySelector('[data-pane="markets"]');
@@ -7268,6 +7125,7 @@ document.addEventListener("keydown", (e) => {
   wireScanner(); // Market scanner (loads _scDoc BEFORE workspaces apply their saved view)
   wireCharts(); // live candlestick charts (read-only; polls while dashboard visible)
   wireRisk(); // risk command center (feeds off the shared dashboard snapshot)
+  wireJournal(); // trading journal (loads on tab entry; BEFORE workspaces apply their saved view)
   wireWorkspaces(); // multi-workspace system: load/migrate, apply active layout
   wireCommandPalette(); // Ctrl/Cmd+K — navigation & display actions only
   wireNotifCenter(); // session notification log (every toast, recoverable)
