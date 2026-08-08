@@ -171,6 +171,10 @@ class Settings:
         # executions to scan each poll.
         self.NOTIFY_POLL_INTERVAL: float = max(5.0, _float_env("NOTIFY_POLL_INTERVAL", 10.0))
         self.NOTIFY_EXEC_LIMIT: int = max(1, _int_env("NOTIFY_EXEC_LIMIT", 50))
+        # Realized-PnL alerts show an INR figure alongside the settle-coin value
+        # using this FIXED conversion rate (INR = value * rate). Display-only —
+        # nothing trades or settles in INR. Set to 0 to hide the INR figure.
+        self.USDT_INR_RATE: float = _float_env("USDT_INR_RATE", 94.0)
 
         # --- MongoDB history store (trades & closed PnL) ---
         # A background sync (app/history_sync.py, every SYNC_INTERVAL_SECONDS —

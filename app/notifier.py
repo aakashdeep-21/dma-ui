@@ -5,7 +5,9 @@ WebSocket — so alerts fire even when no dashboard tab is open (the whole point
 
 Design / safety:
   * READ-ONLY on the exchange: it only polls dma_client.get_executions (the same
-    signed read the History tab uses). It has NO write capability whatsoever.
+    signed read the History tab uses), plus a best-effort dma_client.get_closed_pnl
+    read to attach realized PnL to closing fills. It has NO write capability
+    whatsoever.
   * Outbound only, to a FIXED Telegram chat (api.telegram.org). The bot token and
     chat id are secrets read from the environment; nothing here is user-supplied.
   * Opt-in: if TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are unset the watcher logs
@@ -137,7 +139,66 @@ def _label(ex: dict) -> str | None:
     return "✅ Order filled"
 
 
-def _fmt(ex: dict, label: str) -> str:
+def _is_closing(ex: dict) -> bool:
+    """True when this fill reduced a position (Bybit sets closedSize > 0)."""
+    try:
+        return float(ex.get("closedSize") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+async def _resolve_pnl(ex: dict) -> str | None:
+    """Realized PnL for this fill, best-effort. Prefer the fill's own
+    execPnl/closedPnl when the envelope carries it; otherwise, for closing fills
+    only, look up the closing order's closed-pnl record (a signed READ, same data
+    the History tab shows). Any lookup failure — including the record not being
+    written yet — just means no PnL line; the alert itself is never delayed or
+    dropped over it."""
+    pnl = ex.get("execPnl")
+    if pnl in (None, ""):
+        pnl = ex.get("closedPnl")
+    if pnl not in (None, ""):
+        return pnl
+    order_id = ex.get("orderId")
+    if not _is_closing(ex) or not order_id:
+        return None
+    try:
+        data = await dma_client.get_closed_pnl(symbol=ex.get("symbol"), days=1)
+        records = [r for r in dma_client.extract_list(data) if r.get("orderId") == order_id]
+    except Exception as exc:
+        logger.warning("closed-pnl lookup for alert failed: %s", type(exc).__name__)
+        return None
+    if not records:
+        return None
+    if len(records) == 1:
+        return records[0].get("closedPnl")
+    # One closing order can (rarely) produce several closed-pnl records; sum them.
+    try:
+        total = sum(float(r.get("closedPnl") or 0) for r in records)
+    except (TypeError, ValueError):
+        return records[0].get("closedPnl")
+    return f"{total:.8f}".rstrip("0").rstrip(".")
+
+
+def _fmt_pnl(pnl) -> str | None:
+    """PnL line in the settle coin AND INR at the fixed USDT_INR_RATE, e.g.
+    "PnL -12.34 USDT (₹-1,159.96)". The exchange's own string is kept for the
+    settle-coin figure so no precision is invented; the INR figure is omitted if
+    the value doesn't parse or the rate is disabled (<= 0)."""
+    if pnl in (None, ""):
+        return None
+    line = f"PnL {pnl} {settings.SETTLE_COIN}"
+    rate = settings.USDT_INR_RATE
+    if rate <= 0:
+        return line
+    try:
+        inr = float(pnl) * rate
+    except (TypeError, ValueError):
+        return line
+    return f"{line} (₹{inr:,.2f})"
+
+
+def _fmt(ex: dict, label: str, pnl=None) -> str:
     coin = settings.SETTLE_COIN
     sym = ex.get("symbol", "?")
     side = ex.get("side", "")
@@ -147,11 +208,9 @@ def _fmt(ex: dict, label: str) -> str:
     val = ex.get("execValue")
     if val not in (None, ""):
         lines.append(f"Value {val} {coin}")
-    # Realized PnL is present on closing fills in some envelopes; show if available.
-    ep = ex.get("execPnl")
-    pnl = ep if ep not in (None, "") else ex.get("closedPnl")
-    if pnl not in (None, ""):
-        lines.append(f"PnL {pnl} {coin}")
+    pnl_line = _fmt_pnl(pnl)
+    if pnl_line:
+        lines.append(pnl_line)
     try:
         ts = datetime.fromtimestamp(int(ex.get("execTime")) / 1000, tz=timezone.utc)
         lines.append(ts.strftime("%Y-%m-%d %H:%M:%S UTC"))
@@ -188,7 +247,7 @@ async def _poll_once(baseline: bool) -> None:
             continue
         # Remember ONLY on confirmed delivery; an undelivered alert stays unseen
         # and is retried next poll (no permanent loss on a transient 429/outage).
-        result = await _send(_fmt(ex, label))
+        result = await _send(_fmt(ex, label, await _resolve_pnl(ex)))
         if result == "sent":
             _remember(exec_id)
         elif result == "rate_limited":
